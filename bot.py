@@ -2,8 +2,11 @@ import re
 import asyncio
 import os
 import httpx
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 CHOWDECK_TOKEN = os.getenv("CHOWDECK_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
 
 async def process_incoming_message(raw_text: str):
@@ -44,13 +47,25 @@ async def claim_voucher(code: str):
         except Exception as e:
             print(f"Request failed: {e}")
 
-async def background_worker():
-    print("🤖 Chowdeck Auto-Claim Worker is active and listening...")
+# This handles incoming messages real-time from Telegram
+async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_text = update.message.text or update.message.caption
+    if message_text:
+        await process_incoming_message(message_text)
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        print("Error: TELEGRAM_BOT_TOKEN environment variable is missing!")
+        return
+
+    print("🤖 Starting Telegram Listener Worker...")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # This loop keeps your Railway worker alive 24/7
-    while True:
-        # Here is where your live text listener or polling check will feed new strings into process_incoming_message()
-        await asyncio.sleep(10)
+    # Listen to all messages passing through chats the bot has access to
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_telegram_message))
+    
+    # Run the bot continuously
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(background_worker())
+    main()
