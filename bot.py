@@ -22,7 +22,6 @@ seen_ids = set()
 async def process_incoming_message(raw_text: str):
     print(f"Scanning text: {raw_text}")
     
-    # Regex to catch uppercase codes (5 to 12 chars)
     pattern = r'\b[A-Z0-9]{5,12}\b'
     found_codes = re.findall(pattern, raw_text)
     
@@ -56,7 +55,6 @@ async def claim_voucher(code: str):
         except Exception as e:
             print(f"Request failed: {e}")
 
-# Webhook endpoint to receive external text pushes instantly
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     data = await request.json()
@@ -95,23 +93,18 @@ def run_rss_sniper():
                     tweet_text = entry.get("title", "") or entry.get("description", "")
                     
                     print(f"New tweet detected: {tweet_text}")
-                    
-                    # Pass the tweet text right into your regex processor so codes get auto-claimed instantly!
                     asyncio.run(process_incoming_message(tweet_text))
                     
         except Exception as e:
             print(f"Error checking RSS feed: {e}")
             
-        time.sleep(60)  # Checks the feed every 60 seconds
+        time.sleep(60)
 
 def run_telegram_bot():
     if not TELEGRAM_BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN is missing!")
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
     tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🤖 Webhook, Telegram & RSS Sniper Worker active!")))
     tg_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
@@ -120,14 +113,14 @@ def run_telegram_bot():
     tg_app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    # Start Telegram bot in a background thread
-    t = threading.Thread(target=run_telegram_bot, daemon=True)
-    t.start()
+    def run_fastapi():
+        port = int(os.environ.get("PORT", 8080))
+        uvicorn.run(app, host="0.0.0.0", port=port)
+
+    web_thread = threading.Thread(target=run_fastapi, daemon=True)
+    web_thread.start()
     
-    # Start RSS sniper in a background thread so it polls LordBinary_'s feed continuously
     rss_thread = threading.Thread(target=run_rss_sniper, daemon=True)
     rss_thread.start()
     
-    # Run FastAPI web server for webhooks on Railway port
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    run_telegram_bot()
