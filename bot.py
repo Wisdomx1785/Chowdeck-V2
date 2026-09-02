@@ -10,9 +10,9 @@ import time
 
 app = FastAPI()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
-X_CT0_TOKEN = os.getenv("X_CT0_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
+X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
 
 TARGET_SCREEN_NAME = "LordBinary_"
@@ -126,7 +126,6 @@ def home():
 def run_authenticated_x_sniper():
     print(f"🚀 GraphQL background sniper started, monitoring @{TARGET_SCREEN_NAME}...", flush=True)
     
-    # We use X's public search endpoint filtered by user to get real-time results reliably
     search_url = f"https://x.com/i/api/2/search/adaptive.json?q=from:{TARGET_SCREEN_NAME}&tweet_mode=extended"
     
     cookies = {
@@ -136,7 +135,7 @@ def run_authenticated_x_sniper():
     
     headers = {
         "Authorization": X_BEARER,
-        "x-csrf-token": X_CT0_TOKEN or "",
+        "x-csrf-token": X_CT0_TOKEN,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": f"https://x.com/{TARGET_SCREEN_NAME}"
     }
