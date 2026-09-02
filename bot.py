@@ -15,6 +15,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_incoming_message(raw_text: str):
     print(f"Scanning text: {raw_text}")
     
+    # Regex to catch uppercase codes (5 to 12 chars)
     pattern = r'\b[A-Z0-9]{5,12}\b'
     found_codes = re.findall(pattern, raw_text)
     
@@ -24,11 +25,11 @@ async def process_incoming_message(raw_text: str):
     if valid_codes:
         for code in valid_codes:
             print(f"🚨 Target Code Isolated: {code}")
-            await claim_voucher(code)
+            asyncio.create_task(claim_voucher(code))
 
 async def claim_voucher(code: str):
     if not CHOWDECK_TOKEN:
-        print("Error: CHOWDECK_TOKEN is missing in environment variables!")
+        print("Error: CHOWDECK_TOKEN is missing!")
         return
 
     url = f"{API_BASE_URL}/{code}"
@@ -39,13 +40,12 @@ async def claim_voucher(code: str):
         "Referer": "https://chowdeck.com/"
     }
 
-    print(f"Firing auto-claim request for code: {code}...")
+    print(f"⚡ Firing auto-claim request for code: {code}...")
     
-    async with httpx.AsyncClient() as client:
+    async httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, timeout=5.0)
-            print(f"Response Status: {response.status_code}")
-            print(f"Response Body: {response.text}")
+            print(f"Response Status: {response.status_code} | Body: {response.text}")
         except Exception as e:
             print(f"Request failed: {e}")
 
@@ -58,19 +58,17 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN environment variable is missing!")
+        print("Error: TELEGRAM_BOT_TOKEN is missing!")
         return
 
     print("🤖 Starting Telegram Listener Worker...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Add handler for the /start command
     app.add_handler(CommandHandler("start", start_command))
-    
-    # Listen to text from all chats and channel posts
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
     
-    app.run_polling()
+    # Drop pending updates on startup to prevent conflict loops
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
