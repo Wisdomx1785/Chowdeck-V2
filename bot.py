@@ -92,7 +92,9 @@ def run_rss_sniper():
                     seen_ids.add(tweet_id)
                     tweet_text = entry.get("title", "") or entry.get("description", "")
                     
-                    print(f"New tweet detected: {tweet_text}")
+                    print(f"New tweet detected from LordBinary_: {tweet_text}")
+                    
+                    # Wires the tweet text straight into your auto-claim processor!
                     asyncio.run(process_incoming_message(tweet_text))
                     
         except Exception as e:
