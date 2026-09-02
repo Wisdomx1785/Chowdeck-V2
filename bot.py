@@ -2,15 +2,17 @@ import re
 import asyncio
 import os
 import httpx
+from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+import uvicorn
+import threading
+
+app = FastAPI()
 
 CHOWDECK_TOKEN = os.getenv("CHOWDECK_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Chow Sniper Bot is active and locked onto the channel!")
 
 async def process_incoming_message(raw_text: str):
     print(f"Scanning text: {raw_text}")
@@ -42,12 +44,21 @@ async def claim_voucher(code: str):
 
     print(f"⚡ Firing auto-claim request for code: {code}...")
     
-    async httpx.AsyncClient() as client:
+    async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, timeout=5.0)
             print(f"Response Status: {response.status_code} | Body: {response.text}")
         except Exception as e:
             print(f"Request failed: {e}")
+
+# Webhook endpoint to receive external text pushes instantly
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    data = await request.json()
+    text = data.get("text", "")
+    if text:
+        await process_incoming_message(text)
+    return {"status": "received"}
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.channel_post
@@ -56,19 +67,26 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         if message_text:
             await process_incoming_message(message_text)
 
-def main():
+def run_telegram_bot():
     if not TELEGRAM_BOT_TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN is missing!")
         return
 
-    print("🤖 Starting Telegram Listener Worker...")
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
+    tg_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🤖 Webhook & Telegram Sniping Worker active!")))
+    tg_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
     
-    # Drop pending updates on startup to prevent conflict loops
-    app.run_polling(drop_pending_updates=True)
+    print("🤖 Starting Telegram Polling Loop...")
+    tg_app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    # Start Telegram bot in a background thread so FastAPI can run concurrently
+    t = threading.Thread(target=run_telegram_bot, daemon=True)
+    t.start()
+    
+    # Run FastAPI web server for webhooks on Railway port
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
