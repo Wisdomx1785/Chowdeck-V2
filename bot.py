@@ -19,20 +19,6 @@ RSS_URL = "https://rsshub.app/twitter/user/LordBinary_"
 
 seen_ids = set()
 
-async def process_incoming_message(raw_text: str):
-    print(f"Scanning text: {raw_text}")
-    
-    pattern = r'\b[A-Z0-9]{5,12}\b'
-    found_codes = re.findall(pattern, raw_text)
-    
-    ignore_words = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
-    valid_codes = [code for code in found_codes if code not in ignore_words]
-    
-    if valid_codes:
-        for code in valid_codes:
-            print(f"🚨 Target Code Isolated: {code}")
-            asyncio.create_task(claim_voucher(code))
-
 async def claim_voucher(code: str):
     if not CHOWDECK_TOKEN:
         print("Error: CHOWDECK_TOKEN is missing!")
@@ -54,6 +40,20 @@ async def claim_voucher(code: str):
             print(f"Response Status: {response.status_code} | Body: {response.text}")
         except Exception as e:
             print(f"Request failed: {e}")
+
+async def process_incoming_message(raw_text: str):
+    print(f"Scanning text: {raw_text}")
+    
+    pattern = r'\b[A-Z0-9]{5,12}\b'
+    found_codes = re.findall(pattern, raw_text)
+    
+    ignore_words = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
+    valid_codes = [code for code in found_codes if code not in ignore_words]
+    
+    if valid_codes:
+        for code in valid_codes:
+            print(f"🚨 Target Code Isolated: {code}")
+            await claim_voucher(code)
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
@@ -93,8 +93,6 @@ def run_rss_sniper():
                     tweet_text = entry.get("title", "") or entry.get("description", "")
                     
                     print(f"New tweet detected from LordBinary_: {tweet_text}")
-                    
-                    # Wires the tweet text straight into your auto-claim processor!
                     asyncio.run(process_incoming_message(tweet_text))
                     
         except Exception as e:
