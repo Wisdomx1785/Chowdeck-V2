@@ -16,6 +16,7 @@ TARGET_SCREEN_NAME = "LordBinary_"
 
 seen_ids = set()
 user_tokens = {}  # Maps Telegram chat_id -> User's Chowdeck Bearer Token
+active_chats = set()
 
 async def broadcast_result_to_users(code: str, results: dict):
     if not TELEGRAM_BOT_TOKEN:
@@ -78,6 +79,7 @@ async def telegram_webhook(request: Request):
     
     if message:
         chat_id = message["chat"]["id"]
+        active_chats.add(chat_id)
         text = message.get("text") or message.get("caption", "")
         
         if text:
@@ -118,7 +120,6 @@ def home():
     return {"status": "Authenticated X-Cookie Sniper Engine online."}
 
 def run_authenticated_x_sniper():
-    """Polls target profile using authenticated spare account session headers."""
     url = f"https://syndication.twitter.com/service/iframe/profile?screen_name={TARGET_SCREEN_NAME}"
     cookies = {"auth_token": X_AUTH_TOKEN} if X_AUTH_TOKEN else {}
     
