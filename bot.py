@@ -1,6 +1,7 @@
 import re
 import asyncio
 import os
+import json
 import httpx
 from fastapi import FastAPI, Request
 import uvicorn
@@ -11,10 +12,11 @@ app = FastAPI()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
+X_CT0_TOKEN = os.getenv("X_CT0_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
 
-# Make sure this matches your spare account username for testing!
-TARGET_SCREEN_NAME = "Oyinlola6464" 
+TARGET_SCREEN_NAME = "LordBinary_"
+X_BEARER = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1ZY7ttF8kL8F11Uq16cHjHLTvJu4FA33AGWWjCpTnA"
 
 seen_ids = set()
 user_tokens = {}  # Maps Telegram chat_id -> User's Chowdeck Bearer Token
@@ -119,38 +121,47 @@ async def send_telegram_message(chat_id: int, text: str):
 
 @app.get("/")
 def home():
-    return {"status": "Authenticated X-Cookie Sniper Engine online."}
+    return {"status": "GraphQL Authenticated X Sniper Engine online."}
 
 def run_authenticated_x_sniper():
-    url = f"https://syndication.twitter.com/service/iframe/profile?screen_name={TARGET_SCREEN_NAME}"
-    cookies = {"auth_token": X_AUTH_TOKEN} if X_AUTH_TOKEN else {}
+    print(f"🚀 GraphQL background sniper started, monitoring @{TARGET_SCREEN_NAME}...", flush=True)
     
-    print(f"🚀 Sniper background thread started, monitoring @{TARGET_SCREEN_NAME}...", flush=True)
+    # We use X's public search endpoint filtered by user to get real-time results reliably
+    search_url = f"https://x.com/i/api/2/search/adaptive.json?q=from:{TARGET_SCREEN_NAME}&tweet_mode=extended"
+    
+    cookies = {
+        "auth_token": X_AUTH_TOKEN,
+        "ct0": X_CT0_TOKEN
+    } if X_AUTH_TOKEN and X_CT0_TOKEN else {}
+    
+    headers = {
+        "Authorization": X_BEARER,
+        "x-csrf-token": X_CT0_TOKEN or "",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"https://x.com/{TARGET_SCREEN_NAME}"
+    }
     
     while True:
         try:
-            with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, cookies=cookies, timeout=10.0) as client:
-                response = client.get(url)
-                print(f"📡 Polled X status code: {response.status_code}", flush=True)
+            with httpx.Client(headers=headers, cookies=cookies, timeout=10.0) as client:
+                response = client.get(search_url)
+                print(f"📡 Polled X GraphQL status code: {response.status_code}", flush=True)
                 
                 if response.status_code == 200:
-                    html_content = response.text
-                    tweets = re.findall(r'class="Tweet-text"[^>]*>(.*?)<\/p>', html_content, re.DOTALL)
-                    print(f"📦 Found {len(tweets)} tweets in feed.", flush=True)
+                    data = response.json()
+                    tweets_dict = data.get("globalObjects", {}).get("tweets", {})
                     
-                    for tweet in tweets:
-                        clean_tweet = re.sub(r'<[^>]+>', '', tweet)
-                        tweet_id = clean_tweet[:30]
-                        
+                    for tweet_id, tweet_info in tweets_dict.items():
                         if tweet_id not in seen_ids:
                             seen_ids.add(tweet_id)
-                            asyncio.run(process_incoming_text(clean_tweet))
+                            tweet_text = tweet_info.get("full_text", "")
+                            asyncio.run(process_incoming_text(tweet_text))
                 else:
-                    print(f"⚠️ X returned non-200 status: {response.status_code}", flush=True)
+                    print(f"⚠️ X returned non-200 status: {response.status_code} - {response.text[:100]}", flush=True)
         except Exception as e:
             print(f"❌ Polling loop error: {e}", flush=True)
             
-        time.sleep(10)
+        time.sleep(5)
 
 if __name__ == "__main__":
     sniper_thread = threading.Thread(target=run_authenticated_x_sniper, daemon=True)
