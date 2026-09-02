@@ -11,6 +11,7 @@ import time
 app = FastAPI()
 
 CHOWDECK_TOKEN = os.getenv("CHOWDECK_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
 RSS_URL = "https://rsshub.app/twitter/user/Oyinlola6464"
 
@@ -38,7 +39,7 @@ async def claim_voucher(code: str):
         except Exception as e:
             print(f"Request failed: {e}")
 
-async def process_incoming_message(raw_text: str):
+async def process_incoming_text(raw_text: str):
     print(f"Scanning text: {raw_text}")
     
     pattern = r'\b[A-Z0-9]{5,12}\b'
@@ -52,17 +53,48 @@ async def process_incoming_message(raw_text: str):
             print(f"🚨 Target Code Isolated: {code}")
             await claim_voucher(code)
 
+# Endpoint for generic external webhooks
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     data = await request.json()
     text = data.get("text", "")
     if text:
-        await process_incoming_message(text)
+        await process_incoming_text(text)
     return {"status": "received"}
+
+# Native Telegram Webhook endpoint (handles multi-user inputs instantly)
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    
+    # Extract message or channel post from incoming Telegram payload
+    message = data.get("message") or data.get("channel_post")
+    if message:
+        text = message.get("text") or message.get("caption")
+        if text:
+            # Handle start command for multi-user onboarding
+            if text.startswith("/start"):
+                chat_id = message["chat"]["id"]
+                await send_telegram_reply(chat_id, "🤖 Multi-user Chowdeck Sniper active! Send or forward codes here to auto-claim them.")
+            else:
+                await process_incoming_text(text)
+                
+    return {"status": "ok"}
+
+async def send_telegram_reply(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, json=payload)
+        except Exception as e:
+            print(f"Failed to reply to Telegram user: {e}")
 
 @app.get("/")
 def home():
-    return {"status": "Sniper is live and running!"}
+    return {"status": "Multi-user Sniper & Telegram Webhook are live!"}
 
 def initialize_rss_cache():
     try:
@@ -87,7 +119,7 @@ def run_rss_sniper():
                     tweet_text = entry.get("title", "") or entry.get("description", "")
                     
                     print(f"New tweet detected: {tweet_text}")
-                    asyncio.run(process_incoming_message(tweet_text))
+                    asyncio.run(process_incoming_text(tweet_text))
                     
         except Exception as e:
             print(f"Error checking RSS feed: {e}")
