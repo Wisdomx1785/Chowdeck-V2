@@ -92,7 +92,7 @@ def run_rss_sniper():
                     seen_ids.add(tweet_id)
                     tweet_text = entry.get("title", "") or entry.get("description", "")
                     
-                    print(f"New tweet detected from LordBinary_: {tweet_text}")
+                    print(f"New tweet detected: {tweet_text}")
                     asyncio.run(process_incoming_message(tweet_text))
                     
         except Exception as e:
@@ -110,9 +110,14 @@ def run_telegram_bot():
     tg_app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
     
     print("🤖 Starting Telegram Polling Loop...")
-    tg_app.run_polling(drop_pending_updates=True)
+    tg_app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # Start RSS sniper in background thread
+    rss_thread = threading.Thread(target=run_rss_sniper, daemon=True)
+    rss_thread.start()
+
+    # Start FastAPI in background thread so main thread can safely handle Telegram polling without signal collision
     def run_fastapi():
         port = int(os.environ.get("PORT", 8080))
         uvicorn.run(app, host="0.0.0.0", port=port)
@@ -120,7 +125,5 @@ if __name__ == "__main__":
     web_thread = threading.Thread(target=run_fastapi, daemon=True)
     web_thread.start()
     
-    rss_thread = threading.Thread(target=run_rss_sniper, daemon=True)
-    rss_thread.start()
-    
+    # Run Telegram bot in the main thread
     run_telegram_bot()
