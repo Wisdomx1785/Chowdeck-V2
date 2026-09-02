@@ -12,7 +12,9 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
-TARGET_SCREEN_NAME = "Oyinlola6464"
+
+# Make sure this matches your spare account username for testing!
+TARGET_SCREEN_NAME = "Oyinlola6464" 
 
 seen_ids = set()
 user_tokens = {}  # Maps Telegram chat_id -> User's Chowdeck Bearer Token
@@ -30,14 +32,14 @@ async def broadcast_result_to_users(code: str, results: dict):
             try:
                 await client.post(url, json=payload, timeout=3.0)
             except Exception as e:
-                print(f"Failed to notify user {chat_id}: {e}")
+                print(f"Failed to notify user {chat_id}: {e}", flush=True)
 
 async def claim_voucher_for_all_users(code: str):
     if not user_tokens:
-        print("No user tokens registered yet!")
+        print("⚠️ No user tokens registered yet! Send /settoken in Telegram.", flush=True)
         return
 
-    print(f"⚡ Firing multi-user claims for code: {code}...")
+    print(f"⚡ Firing multi-user claims for code: {code}...", flush=True)
     headers_template = {
         "Content-Type": "application/json",
         "Origin": "https://chowdeck.com",
@@ -60,7 +62,7 @@ async def claim_voucher_for_all_users(code: str):
     await broadcast_result_to_users(code, claim_results)
 
 async def process_incoming_text(raw_text: str):
-    print(f"Scanning tweet: {raw_text}")
+    print(f"🔍 Scanning tweet: {raw_text}", flush=True)
     pattern = r'\b[A-Z0-9]{5,12}\b'
     found_codes = re.findall(pattern, raw_text)
     
@@ -69,7 +71,7 @@ async def process_incoming_text(raw_text: str):
     
     if valid_codes:
         for code in valid_codes:
-            print(f"🚨 Target Code Isolated: {code}")
+            print(f"🚨 Target Code Isolated: {code}", flush=True)
             await claim_voucher_for_all_users(code)
 
 @app.post("/telegram-webhook")
@@ -113,7 +115,7 @@ async def send_telegram_message(chat_id: int, text: str):
         try:
             await client.post(url, json=payload)
         except Exception as e:
-            print(f"Telegram reply failed: {e}")
+            print(f"Telegram reply failed: {e}", flush=True)
 
 @app.get("/")
 def home():
@@ -123,13 +125,19 @@ def run_authenticated_x_sniper():
     url = f"https://syndication.twitter.com/service/iframe/profile?screen_name={TARGET_SCREEN_NAME}"
     cookies = {"auth_token": X_AUTH_TOKEN} if X_AUTH_TOKEN else {}
     
+    print(f"🚀 Sniper background thread started, monitoring @{TARGET_SCREEN_NAME}...", flush=True)
+    
     while True:
         try:
             with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, cookies=cookies, timeout=10.0) as client:
                 response = client.get(url)
+                print(f"📡 Polled X status code: {response.status_code}", flush=True)
+                
                 if response.status_code == 200:
                     html_content = response.text
                     tweets = re.findall(r'class="Tweet-text"[^>]*>(.*?)<\/p>', html_content, re.DOTALL)
+                    print(f"📦 Found {len(tweets)} tweets in feed.", flush=True)
+                    
                     for tweet in tweets:
                         clean_tweet = re.sub(r'<[^>]+>', '', tweet)
                         tweet_id = clean_tweet[:30]
@@ -137,10 +145,12 @@ def run_authenticated_x_sniper():
                         if tweet_id not in seen_ids:
                             seen_ids.add(tweet_id)
                             asyncio.run(process_incoming_text(clean_tweet))
+                else:
+                    print(f"⚠️ X returned non-200 status: {response.status_code}", flush=True)
         except Exception as e:
-            print(f"Polling error: {e}")
+            print(f"❌ Polling loop error: {e}", flush=True)
             
-        time.sleep(5)
+        time.sleep(10)
 
 if __name__ == "__main__":
     sniper_thread = threading.Thread(target=run_authenticated_x_sniper, daemon=True)
