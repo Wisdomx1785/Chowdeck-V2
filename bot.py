@@ -12,7 +12,7 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
-TARGET_SCREEN_NAME = "LordBinary_"
+TARGET_SCREEN_NAME = "Oyinlola6464"
 
 seen_ids = set()
 user_tokens = {}  # Maps Telegram chat_id -> User's Chowdeck Bearer Token
