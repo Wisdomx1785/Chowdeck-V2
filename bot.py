@@ -15,7 +15,7 @@ app = FastAPI()
 CHOWDECK_TOKEN = os.getenv("CHOWDECK_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
-RSS_URL = "https://rsshub.app/twitter/user/LordBinary_"
+RSS_URL = "https://rsshub.app/twitter/user/Oyinlola6464"
 
 seen_ids = set()
 
