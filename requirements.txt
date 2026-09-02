@@ -3,3 +3,4 @@ asyncio
 python-telegram-bot
 fastapi
 uvicorn
+feedparser
