@@ -3,16 +3,18 @@ import asyncio
 import os
 import httpx
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
 CHOWDECK_TOKEN = os.getenv("CHOWDECK_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Chow Sniper Bot is active and locked onto the channel!")
+
 async def process_incoming_message(raw_text: str):
     print(f"Scanning text: {raw_text}")
     
-    # Regex pattern to match uppercase alphanumeric codes (5 to 12 characters)
     pattern = r'\b[A-Z0-9]{5,12}\b'
     found_codes = re.findall(pattern, raw_text)
     
@@ -47,11 +49,12 @@ async def claim_voucher(code: str):
         except Exception as e:
             print(f"Request failed: {e}")
 
-# This handles incoming messages real-time from Telegram
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_text = update.message.text or update.message.caption
-    if message_text:
-        await process_incoming_message(message_text)
+    msg = update.message or update.channel_post
+    if msg:
+        message_text = msg.text or msg.caption
+        if message_text:
+            await process_incoming_message(message_text)
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -61,10 +64,12 @@ def main():
     print("🤖 Starting Telegram Listener Worker...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Listen to all messages passing through chats the bot has access to
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_telegram_message))
+    # Add handler for the /start command
+    app.add_handler(CommandHandler("start", start_command))
     
-    # Run the bot continuously
+    # Listen to text from all chats and channel posts
+    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & (~filters.COMMAND), handle_telegram_message))
+    
     app.run_polling()
 
 if __name__ == "__main__":
