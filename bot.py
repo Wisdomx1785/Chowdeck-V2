@@ -15,7 +15,6 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.js
 CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
 CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
-COOKIES_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.json")
 
 seen_tweet_ids = set()
 last_update_id = 0
@@ -237,36 +236,16 @@ async def telegram_poller():
 
 async def x_poller():
     client = Client('en-US')
-    cookie_payload = [
-        {
-            "domain": ".x.com",
-            "expirationDate": 1850000000,
-            "hostOnly": False,
-            "httpOnly": True,
-            "name": "auth_token",
-            "path": "/",
-            "sameSite": "no_restriction",
-            "secure": True,
-            "session": False,
-            "value": X_AUTH_TOKEN
-        },
-        {
-            "domain": ".x.com",
-            "expirationDate": 1850000000,
-            "hostOnly": False,
-            "httpOnly": False,
-            "name": "ct0",
-            "path": "/",
-            "sameSite": "lax",
-            "secure": True,
-            "session": False,
-            "value": X_CT0_TOKEN
-        }
-    ]
-    with open(COOKIES_JSON_PATH, "w") as f:
-        json.dump(cookie_payload, f, indent=4)
+    try:
+        client.http.cookies.clear()
+    except Exception:
+        pass
+        
+    client.set_cookies({
+        "auth_token": X_AUTH_TOKEN,
+        "ct0": X_CT0_TOKEN
+    })
     
-    client.load_cookies(COOKIES_JSON_PATH)
     print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
 
     while True:
