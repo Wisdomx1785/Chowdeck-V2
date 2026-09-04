@@ -79,6 +79,61 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
 
+async def claim_for_single_user(chat_id, token, code, user_cookies, carts):
+    clean_token = sanitize_token(token)
+    headers = {
+        "Authorization": f"Bearer {clean_token}",
+        "Content-Type": "application/json",
+        "Origin": "https://chowdeck.com",
+        "Referer": "https://chowdeck.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty"
+    }
+    
+    claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+    print(f"📤 Firing parallel request for {code} (User {chat_id})...")
+    
+    try:
+        claim_res = await asyncio.to_thread(
+            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
+        )
+        
+        if claim_res.status_code != 200:
+            CANDIDATE_ANSWERS = ["Ismail", "Chowstore", "Chowpass", "Chowstar", "Relay", "Chowmart"]
+            for ans in CANDIDATE_ANSWERS:
+                claim_res = await asyncio.to_thread(
+                    execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
+                )
+                if claim_res.status_code == 200:
+                    print(f"✅ User {chat_id} cleared security with answer: '{ans}'!")
+                    break
+                await asyncio.sleep(0.05)
+
+        print(f"📥 User {chat_id} Claim status [{claim_res.status_code}]: {claim_res.text}")
+        
+        msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
+        
+        user_cart = carts.get(str(chat_id))
+        if user_cart and user_cart.get("cart_id") and claim_res.status_code == 200:
+            payload = {
+                "cart_id": user_cart.get("cart_id"),
+                "promo_codes": [code]
+            }
+            apply_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, payload
+            )
+            msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
+        
+        await send_telegram(chat_id, msg)
+        return claim_res.status_code
+    except Exception as e:
+        print(f"❌ Error for user {chat_id}: {e}")
+        return 500
+
 async def claim_code(raw_code):
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
@@ -97,78 +152,18 @@ async def claim_code(raw_code):
         print("❌ Database check: No user tokens registered yet.")
         return
     
-    CANDIDATE_ANSWERS = ["Chowstore", "Chowpass", "Chowstar", "Relay", "Chowmart", "Ismail"]
+    print(f"🚀 Executing parallel broadcast for code '{code}' across {len(tokens)} user(s)...")
     
-    print(f"🚀 Processing code '{code}' for {len(tokens)} registered user(s)...")
-    for chat_id, token in tokens.items():
-        clean_token = sanitize_token(token)
-
-        headers = {
-            "Authorization": f"Bearer {clean_token}",
-            "Content-Type": "application/json",
-            "Origin": "https://chowdeck.com",
-            "Referer": "https://chowdeck.com/",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-            "Sec-Fetch-Site": "same-site",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty"
-        }
-        
-        user_cookies = cookie_db.get(str(chat_id), {})
-        
-        try:
-            claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-            print(f"📤 Executing isolated request for {code} (User {chat_id})...")
-            
-            # Step 1: Try standard claim without answer first
-            claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
-            )
-            
-            # Step 2: If failed, brute-force security answers
-            if claim_res.status_code != 200:
-                print(f"⚠️ Standard claim failed [{claim_res.status_code}]. Testing security answers...")
-                for ans in CANDIDATE_ANSWERS:
-                    print(f"🔑 Trying answer: '{ans}' for {code}...")
-                    claim_res = await asyncio.to_thread(
-                        execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
-                    )
-                    print(f"📥 Answer [{ans}] status [{claim_res.status_code}]: {claim_res.text}")
-                    if claim_res.status_code == 200:
-                        print(f"✅ Success with answer: '{ans}'!")
-                        break
-                    await asyncio.sleep(0.3)
-
-            print(f"📥 Final Claim status [{claim_res.status_code}]: {claim_res.text}")
-            
-            if claim_res.status_code in [200, 400]:
-                claimed_history[code] = claim_res.status_code
-                save_json(CLAIMED_FILE, claimed_history)
-            
-            msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
-            
-            user_cart = carts.get(str(chat_id))
-            if user_cart and user_cart.get("cart_id") and claim_res.status_code == 200:
-                payload = {
-                    "cart_id": user_cart.get("cart_id"),
-                    "promo_codes": [code]
-                }
-                apply_res = await asyncio.to_thread(
-                    execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, payload
-                )
-                print(f"📥 Apply result [{apply_res.status_code}]: {apply_res.text}")
-                msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
-            
-            await send_telegram(chat_id, msg)
-            await asyncio.sleep(1.0)
-        except Exception as e:
-            print(f"❌ Error processing code {code} for user {chat_id}: {e}")
-            try:
-                await send_telegram(chat_id, f"🎯 *Code Target:* `{code}`\nError: `{e}`")
-            except:
-                pass
+    tasks = [
+        claim_for_single_user(chat_id, token, code, cookie_db.get(str(chat_id), {}), carts)
+        for chat_id, token in tokens.items()
+    ]
+    
+    results = await asyncio.gather(*tasks)
+    
+    if results:
+        claimed_history[code] = max(results)
+        save_json(CLAIMED_FILE, claimed_history)
 
 async def worker():
     while True:
