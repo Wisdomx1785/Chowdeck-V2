@@ -166,12 +166,18 @@ def poll_twitter_feed():
         time.sleep(15)
 
 if __name__ == "__main__":
-    print("🤖 Waiting 5 seconds for old container session to drop...", flush=True)
-    time.sleep(5)
+    print("🤖 Container started. Waiting 35 seconds for Telegram old session to drop...", flush=True)
+    time.sleep(35)
     
     poller_thread = threading.Thread(target=poll_twitter_feed, daemon=True)
     poller_thread.start()
     
     print("🤖 Telegram Bot polling started...", flush=True)
     bot.remove_webhook()
-    bot.infinity_polling(skip_pending=True)
+    
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"⚠️ Telegram Polling Error: {e}. Retrying in 10 seconds...", flush=True)
+            time.sleep(10)
