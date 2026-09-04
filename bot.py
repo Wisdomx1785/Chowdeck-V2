@@ -3,21 +3,21 @@ import asyncio
 import os
 import json
 import unicodedata
-import xml.etree.ElementTree as ET
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
-TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
 CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
 
-seen_tweet_ids = set()
 last_update_id = 0
 code_queue = asyncio.Queue()
+loop_ref = None
 
 def load_json(file_path):
     if os.path.exists(file_path):
@@ -178,6 +178,31 @@ async def process_text(text):
         print(f"🚨 Queued Code: {code}")
         await code_queue.put(code)
 
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8')
+        try:
+            data = json.loads(body)
+            text = data.get("text", "")
+            if text and loop_ref:
+                asyncio.run_coroutine_threadsafe(process_text(text), loop_ref)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        except Exception as e:
+            print(f"Webhook error: {e}")
+            self.send_response(400)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def run_http_server():
+    server = HTTPServer(('0.0.0.0', 8080), WebhookHandler)
+    print("🌐 Railway HTTP webhook server running on port 8080...")
+    server.serve_forever()
+
 async def telegram_poller():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -236,71 +261,15 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def rss_poller():
-    rss_urls = [
-        f"https://nitter.poast.org/{TARGET_SCREEN_NAME}/rss",
-        f"https://nitter.privacydev.net/{TARGET_SCREEN_NAME}/rss"
-    ]
-    
-    print(f"🚀 RSS XML poller active for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...", flush=True)
-    
-    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, follow_redirects=True) as client:
-        # Initial baseline
-        for rss_url in rss_urls:
-            try:
-                res = await client.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
-                if res.status_code == 200:
-                    root = ET.fromstring(res.text)
-                    for item in root.findall(".//item"):
-                        guid = item.find("guid")
-                        link = item.find("link")
-                        tid = guid.text if guid is not None and guid.text else (link.text if link is not None else "")
-                        if tid:
-                            seen_tweet_ids.add(tid)
-                    print(f"✅ Baseline locked via RSS. Absorbed {len(seen_tweet_ids)} tweets.")
-                    break
-            except Exception:
-                continue
-
-        while True:
-            success = False
-            for rss_url in rss_urls:
-                try:
-                    res = await client.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
-                    if res.status_code == 200:
-                        root = ET.fromstring(res.text)
-                        for item in root.findall(".//item"):
-                            guid = item.find("guid")
-                            link = item.find("link")
-                            title = item.find("title")
-                            description = item.find("description")
-                            
-                            tid = guid.text if guid is not None and guid.text else (link.text if link is not None else "")
-                            text = (title.text if title is not None else "") + " " + (description.text if description is not None else "")
-                            
-                            if tid and text and tid not in seen_tweet_ids:
-                                seen_tweet_ids.add(tid)
-                                print(f"🚨 Live Tweet Detected via RSS!")
-                                await process_text(text)
-                        success = True
-                        break
-                except Exception:
-                    continue
-            
-            if not success:
-                print("⚠️ RSS endpoints unreachable this cycle. Retrying...")
-
-            await asyncio.sleep(15)
-
 async def main():
-    print("🤖 Waiting 30 seconds for old session to expire...", flush=True)
-    await asyncio.sleep(30)
+    global loop_ref
+    loop_ref = asyncio.get_running_loop()
+    
+    threading.Thread(target=run_http_server, daemon=True).start()
     
     worker_task = asyncio.create_task(worker())
     try:
-        asyncio.gather(telegram_poller(), rss_poller())
-        while True:
-            await asyncio.sleep(3600)
+        await telegram_poller()
     finally:
         worker_task.cancel()
 
