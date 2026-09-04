@@ -3,13 +3,9 @@ import asyncio
 import os
 import json
 import unicodedata
-from twikit import Client
 import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
-X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
@@ -238,51 +234,50 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def x_poller():
-    client = Client('en-US', proxy=PROXY_URL if PROXY_URL else None)
+async def syndication_poller():
+    url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={TARGET_SCREEN_NAME}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://platform.twitter.com",
+        "Referer": "https://platform.twitter.com/"
+    }
     
-    # Directly pass a dictionary to set_cookies to prevent file unpacking errors in httpx
-    client.set_cookies({
-        "auth_token": X_AUTH_TOKEN,
-        "ct0": X_CT0_TOKEN
-    })
+    print(f"🚀 Syndication poller active for @{TARGET_SCREEN_NAME} (No cookies required)...")
     
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...", flush=True)
-
-    while True:
+    async with httpx.AsyncClient() as client:
+        # Establish baseline history on startup
         try:
-            user = await client.get_user_by_screen_name(TARGET_SCREEN_NAME)
-            break
+            res = await client.get(url, headers=headers, timeout=10.0)
+            if res.status_code == 200:
+                data = res.json()
+                for tweet in data.get("tweets", []):
+                    tid = str(tweet.get("id_str") or tweet.get("id"))
+                    if tid:
+                        seen_tweet_ids.add(tid)
+                print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing tweets.")
         except Exception as e:
-            print(f"Error fetching user profile: {e}. Retrying in 10s...")
-            await asyncio.sleep(10)
+            print(f"⚠️ Baseline fetch warning: {e}")
 
-    print("📥 Establishing timeline baseline (ignoring old history)...")
-    try:
-        initial_tweets = await user.get_tweets('Tweets', count=10)
-        for tweet in initial_tweets:
-            if tweet.id:
-                seen_tweet_ids.add(tweet.id)
-        print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets. Sniper is now armed for live drops!")
-    except Exception as e:
-        print(f"⚠️ Baseline warning: {e}")
-
-    while True:
-        try:
-            tweets = await user.get_tweets('Tweets', count=5)
-            for tweet in tweets:
-                tid = tweet.id
-                text = tweet.text
-                if tid and tid not in seen_tweet_ids:
-                    seen_tweet_ids.add(tid)
-                    print(f"🚨 Live Tweet Detected!")
-                    await process_text(text)
+        while True:
+            try:
+                res = await client.get(url, headers=headers, timeout=10.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    tweets = data.get("tweets", [])
+                    for tweet in tweets:
+                        tid = str(tweet.get("id_str") or tweet.get("id"))
+                        text = tweet.get("text", "")
+                        if tid and tid not in seen_tweet_ids:
+                            seen_tweet_ids.add(tid)
+                            print(f"🚨 Live Tweet Detected via Syndication!")
+                            await process_text(text)
+                else:
+                    print(f"⚠️ Syndication status {res.status_code}, retrying...")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"Syndication network error: {e}")
             await asyncio.sleep(15)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"X poll network error: {e}. Cooling down for 30s...")
-            await asyncio.sleep(30)
 
 async def main():
     print("🤖 Waiting 30 seconds for old session to expire...", flush=True)
@@ -290,7 +285,7 @@ async def main():
     
     worker_task = asyncio.create_task(worker())
     try:
-        await asyncio.gather(telegram_poller(), x_poller())
+        await asyncio.gather(telegram_poller(), syndication_poller())
     finally:
         worker_task.cancel()
 
