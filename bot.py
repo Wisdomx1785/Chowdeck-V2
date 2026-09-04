@@ -3,18 +3,14 @@ import asyncio
 import os
 import json
 import unicodedata
-from twikit import Client
 import httpx
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8653538998:AAF5JNF5_qbyKqQBu9A7WT7d4aynQFIXaOo").strip()
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "1b20b6eaac52876de1f0902de55181c44e386641").strip()
-X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "9b96714228586caf375904b4beedf2e094161936fb93a01c64e9190823995af94d22414632135fye6112eaff4adbd80846447a87de7df0e5e51b21a5dc2d2b75fec1176c85a510bf0ae1263bd86efc2").strip()
-PROXY_URL = os.getenv("PROXY_URL", "http://KYRHMJQddE0iES4:FWCnRw4tlVPeLcC@109.203.167.117:46267").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
 CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
 
 seen_tweet_ids = set()
@@ -84,7 +80,6 @@ async def claim_code(raw_code):
 
     tokens = load_json(TOKEN_FILE)
     carts = load_json(CART_FILE)
-    cookie_db = load_json(COOKIE_FILE)
     
     if not tokens:
         print("❌ Database check: No user tokens registered yet.")
@@ -101,17 +96,12 @@ async def claim_code(raw_code):
             "Referer": "https://chowdeck.com/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
         }
-        
-        user_cookies = cookie_db.get(str(chat_id), {})
         
         try:
             claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-            print(f"📤 Executing isolated request for {code} (User {chat_id})...")
-            
             claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
+                execute_chowdeck_request, "POST", claim_url, headers, {}, {"code": code}
             )
             print(f"📥 Claim status [{claim_res.status_code}]: {claim_res.text}")
             
@@ -128,19 +118,14 @@ async def claim_code(raw_code):
                     "promo_codes": [code]
                 }
                 apply_res = await asyncio.to_thread(
-                    execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, payload
+                    execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, {}, payload
                 )
-                print(f"📥 Apply result [{apply_res.status_code}]: {apply_res.text}")
                 msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
             
             await send_telegram(chat_id, msg)
             await asyncio.sleep(1.0)
         except Exception as e:
             print(f"❌ Error processing code {code} for user {chat_id}: {e}")
-            try:
-                await send_telegram(chat_id, f"🎯 *Code Target:* `{code}`\nError: `{e}`")
-            except:
-                pass
 
 async def worker():
     while True:
@@ -236,60 +221,44 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def x_poller():
-    client = Client('en-US', impersonate='chrome124', proxy=PROXY_URL)
-    
-    try:
-        client.http.cookies.clear()
-    except Exception:
-        pass
-        
-    client.set_cookies({
-        "auth_token": X_AUTH_TOKEN,
-        "ct0": X_CT0_TOKEN
-    })
-    
-    try:
-        client.http.headers['x-csrf-token'] = X_CT0_TOKEN
-        client.http.headers['authorization'] = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4l33AGWDiozxUAIcaJjNXHo'
-    except Exception as e:
-        print(f"Header injection note: {e}")
-    
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} via proxy with explicit CSRF sync...")
+    url = f"https://cdn.syndication.twimg.com/timeline-profile?screen_name={TARGET_SCREEN_NAME}"
+    print(f"🚀 X poller started via public syndication feed for @{TARGET_SCREEN_NAME}...")
 
-    while True:
+    async with httpx.AsyncClient(proxy=PROXY_URL, timeout=20.0) as client:
         try:
-            user = await client.get_user_by_screen_name(TARGET_SCREEN_NAME)
-            break
+            res = await client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                tweets = data.get("timeline", [])
+                for item in tweets:
+                    tweet = item.get("tweet", {})
+                    tid = tweet.get("id_str")
+                    if tid:
+                        seen_tweet_ids.add(tid)
+                print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets.")
         except Exception as e:
-            print(f"Error fetching user profile: {e}. Retrying in 10s...")
-            await asyncio.sleep(10)
+            print(f"⚠️ Baseline warning: {e}")
 
-    print("📥 Establishing timeline baseline (ignoring old history)...")
-    try:
-        initial_tweets = await user.get_tweets('Tweets', count=10)
-        for tweet in initial_tweets:
-            if tweet.id:
-                seen_tweet_ids.add(tweet.id)
-        print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets. Sniper is now armed for live drops!")
-    except Exception as e:
-        print(f"⚠️ Baseline warning: {e}")
-
-    while True:
-        try:
-            tweets = await user.get_tweets('Tweets', count=5)
-            for tweet in tweets:
-                tid = tweet.id
-                text = tweet.text
-                if tid and tid not in seen_tweet_ids:
-                    seen_tweet_ids.add(tid)
-                    print(f"🚨 Live Tweet Detected!")
-                    await process_text(text)
-            await asyncio.sleep(15)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"X poll network error: {e}. Cooling down for 30s...")
-            await asyncio.sleep(30)
+        while True:
+            try:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    data = res.json()
+                    tweets = data.get("timeline", [])
+                    for item in tweets:
+                        tweet = item.get("tweet", {})
+                        tid = tweet.get("id_str")
+                        text = tweet.get("text")
+                        if tid and tid not in seen_tweet_ids:
+                            seen_tweet_ids.add(tid)
+                            print(f"🚨 Live Tweet Detected!")
+                            await process_text(text)
+                await asyncio.sleep(15)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"X poll network error: {e}. Cooling down for 30s...")
+                await asyncio.sleep(30)
 
 async def main():
     worker_task = asyncio.create_task(worker())
