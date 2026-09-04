@@ -235,7 +235,7 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def x_poller():
-    client = Client('en-US')
+    client = Client('en-US', impersonate='chrome124')
     try:
         client.http.cookies.clear()
     except Exception:
