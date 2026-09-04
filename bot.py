@@ -235,6 +235,7 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def x_poller():
+    # Enable browser impersonation to evade Twitter's data center blocks
     client = Client('en-US', impersonate='chrome124')
     try:
         client.http.cookies.clear()
@@ -245,12 +246,6 @@ async def x_poller():
         "auth_token": X_AUTH_TOKEN,
         "ct0": X_CT0_TOKEN
     })
-    
-    # Explicitly map the ct0 token to the required x-csrf-token header
-    try:
-        client.http.headers['x-csrf-token'] = X_CT0_TOKEN
-    except Exception:
-        pass
     
     print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
 
