@@ -238,19 +238,23 @@ async def telegram_poller():
 async def x_poller():
     client = Client('en-US', impersonate='chrome124', proxy=PROXY_URL)
     
-    # Generate native twikit cookie schema so ct0 matches x-csrf-token automatically
-    cookies_data = [
-        {"domain": ".twitter.com", "name": "auth_token", "value": X_AUTH_TOKEN, "path": "/", "secure": True, "httpOnly": True},
-        {"domain": ".twitter.com", "name": "ct0", "value": X_CT0_TOKEN, "path": "/", "secure": True, "httpOnly": False},
-        {"domain": ".x.com", "name": "auth_token", "value": X_AUTH_TOKEN, "path": "/", "secure": True, "httpOnly": True},
-        {"domain": ".x.com", "name": "ct0", "value": X_CT0_TOKEN, "path": "/", "secure": True, "httpOnly": False}
-    ]
-    with open("cookies.json", "w") as f:
-        json.dump(cookies_data, f)
+    try:
+        client.http.cookies.clear()
+    except Exception:
+        pass
+        
+    client.set_cookies({
+        "auth_token": X_AUTH_TOKEN,
+        "ct0": X_CT0_TOKEN
+    })
     
-    client.load_cookies("cookies.json")
+    try:
+        client.http.headers['x-csrf-token'] = X_CT0_TOKEN
+        client.http.headers['authorization'] = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4l33AGWDiozxUAIcaJjNXHo'
+    except Exception as e:
+        print(f"Header injection note: {e}")
     
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} via proxy with native cookie binding...")
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} via proxy with explicit CSRF sync...")
 
     while True:
         try:
