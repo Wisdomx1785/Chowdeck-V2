@@ -65,7 +65,7 @@ async def send_telegram(chat_id, text):
         print(f"Telegram send error to {chat_id}: {e}")
 
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
-    with httpx.Client(timeout=15.0, proxies=PROXY_URL if PROXY_URL else None) as client:
+    with httpx.Client(timeout=15.0, proxy=PROXY_URL if PROXY_URL else None) as client:
         if method == "POST":
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
