@@ -6,6 +6,7 @@ import unicodedata
 import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
@@ -57,13 +58,13 @@ def robust_clean_code(raw):
 async def send_telegram(chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        async with httpx.AsyncClient() as temp_client:
+        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
             await temp_client.post(url, json={"chat_id": int(chat_id), "text": text, "parse_mode": "Markdown"}, timeout=15.0)
     except Exception as e:
         print(f"Telegram send error to {chat_id}: {e}")
 
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=15.0, proxies=PROXY_URL if PROXY_URL else None) as client:
         if method == "POST":
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
@@ -179,7 +180,7 @@ async def process_text(text):
 async def telegram_poller():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    async with httpx.AsyncClient() as tg_client:
+    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as tg_client:
         while True:
             try:
                 res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 30}, timeout=35.0)
@@ -234,23 +235,23 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def syndication_poller():
+async def syndication_json_poller():
     url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={TARGET_SCREEN_NAME}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": "https://platform.twitter.com",
         "Referer": "https://platform.twitter.com/"
     }
     
-    print(f"🚀 Syndication poller active for @{TARGET_SCREEN_NAME} (No cookies required)...")
+    print(f"🚀 Syndication JSON poller active for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...")
     
-    async with httpx.AsyncClient() as client:
-        # Establish baseline history on startup
+    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, follow_redirects=True) as client:
         try:
-            res = await client.get(url, headers=headers, timeout=10.0)
+            res = await client.get(url, headers=headers, timeout=12.0)
             if res.status_code == 200:
                 data = res.json()
-                for tweet in data.get("tweets", []):
+                tweets = data.get("tweets", [])
+                for tweet in tweets:
                     tid = str(tweet.get("id_str") or tweet.get("id"))
                     if tid:
                         seen_tweet_ids.add(tid)
@@ -260,23 +261,23 @@ async def syndication_poller():
 
         while True:
             try:
-                res = await client.get(url, headers=headers, timeout=10.0)
+                res = await client.get(url, headers=headers, timeout=12.0)
                 if res.status_code == 200:
                     data = res.json()
                     tweets = data.get("tweets", [])
                     for tweet in tweets:
                         tid = str(tweet.get("id_str") or tweet.get("id"))
                         text = tweet.get("text", "")
-                        if tid and tid not in seen_tweet_ids:
+                        if tid and text and tid not in seen_tweet_ids:
                             seen_tweet_ids.add(tid)
-                            print(f"🚨 Live Tweet Detected via Syndication!")
+                            print(f"🚨 Live Tweet Detected via Syndication JSON!")
                             await process_text(text)
                 else:
                     print(f"⚠️ Syndication status {res.status_code}, retrying...")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"Syndication network error: {e}")
+                print(f"Syndication fetch error: {e}")
             await asyncio.sleep(15)
 
 async def main():
@@ -285,7 +286,7 @@ async def main():
     
     worker_task = asyncio.create_task(worker())
     try:
-        await asyncio.gather(telegram_poller(), syndication_poller())
+        await asyncio.gather(telegram_poller(), syndication_json_poller())
     finally:
         worker_task.cancel()
 
