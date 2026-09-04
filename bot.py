@@ -2,169 +2,317 @@ import re
 import asyncio
 import os
 import json
+import unicodedata
+from twikit import Client
 import httpx
-from fastapi import FastAPI, Request
-import uvicorn
-import threading
-import time
-
-app = FastAPI()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
-API_BASE_URL = "https://api.chowdeck.com/customer/promo-code"
+TARGET_SCREEN_NAME = "Oyinlola6464"
 
-TARGET_SCREEN_NAME = "LordBinary_"
-X_BEARER = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1ZY7ttF8kL8F11Uq16cHjHLTvJu4FA33AGWWjCpTnA"
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
+CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
+CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
+COOKIES_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.json")
 
-seen_ids = set()
-user_tokens = {}  # Maps Telegram chat_id -> User's Chowdeck Bearer Token
-active_chats = set()
+seen_tweet_ids = set()
+last_update_id = 0
+code_queue = asyncio.Queue()
 
-async def broadcast_result_to_users(code: str, results: dict):
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    
-    async with httpx.AsyncClient() as client:
-        for chat_id, (status_code, response_text) in results.items():
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            msg = f"🎯 *Code Target:* `{code}`\nStatus: `{status_code}`\nResponse: `{response_text}`"
-            payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}
-            try:
-                await client.post(url, json=payload, timeout=3.0)
-            except Exception as e:
-                print(f"Failed to notify user {chat_id}: {e}", flush=True)
-
-async def claim_voucher_for_all_users(code: str):
-    if not user_tokens:
-        print("⚠️ No user tokens registered yet! Send /settoken in Telegram.", flush=True)
-        return
-
-    print(f"⚡ Firing multi-user claims for code: {code}...", flush=True)
-    headers_template = {
-        "Content-Type": "application/json",
-        "Origin": "https://chowdeck.com",
-        "Referer": "https://chowdeck.com/"
-    }
-
-    claim_results = {}
-    async with httpx.AsyncClient() as client:
-        for chat_id, token in user_tokens.items():
-            headers = headers_template.copy()
-            headers["Authorization"] = f"Bearer {token}"
-            url = f"{API_BASE_URL}/{code}"
-            
-            try:
-                response = await client.post(url, headers=headers, timeout=5.0)
-                claim_results[chat_id] = (response.status_code, response.text)
-            except Exception as e:
-                claim_results[chat_id] = (500, str(e))
-
-    await broadcast_result_to_users(code, claim_results)
-
-async def process_incoming_text(raw_text: str):
-    print(f"🔍 Scanning tweet: {raw_text}", flush=True)
-    pattern = r'\b[A-Z0-9]{5,12}\b'
-    found_codes = re.findall(pattern, raw_text)
-    
-    ignore_words = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
-    valid_codes = [code for code in found_codes if code not in ignore_words]
-    
-    if valid_codes:
-        for code in valid_codes:
-            print(f"🚨 Target Code Isolated: {code}", flush=True)
-            await claim_voucher_for_all_users(code)
-
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    message = data.get("message") or data.get("channel_post")
-    
-    if message:
-        chat_id = message["chat"]["id"]
-        active_chats.add(chat_id)
-        text = message.get("text") or message.get("caption", "")
-        
-        if text:
-            if text.startswith("/start"):
-                reply = (
-                    "🤖 *Multi-User Chowdeck Sniper Active!*\n\n"
-                    "To link your personal Chowdeck account, send your Bearer token like this:\n"
-                    "`/settoken YOUR_BEARER_TOKEN_HERE`"
-                )
-                await send_telegram_message(chat_id, reply)
-                
-            elif text.startswith("/settoken"):
-                parts = text.split(" ", 1)
-                if len(parts) > 1:
-                    token = parts[1].strip()
-                    user_tokens[chat_id] = token
-                    await send_telegram_message(chat_id, "✅ Your Chowdeck token has been securely mapped to your chat session!")
-                else:
-                    await send_telegram_message(chat_id, "⚠️ Please provide your token: `/settoken <token>`")
-            else:
-                await process_incoming_text(text)
-                
-    return {"status": "ok"}
-
-async def send_telegram_message(chat_id: int, text: str):
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    async with httpx.AsyncClient() as client:
+def load_json(file_path):
+    if os.path.exists(file_path):
         try:
-            await client.post(url, json=payload)
+            with open(file_path, "r") as f:
+                return json.load(f)
         except Exception as e:
-            print(f"Telegram reply failed: {e}", flush=True)
+            print(f"⚠️ Error reading {file_path}: {e}")
+            return {}
+    return {}
 
-@app.get("/")
-def home():
-    return {"status": "GraphQL Authenticated X Sniper Engine online."}
+def save_json(file_path, data):
+    try:
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"❌ Failed to save {file_path}: {e}")
 
-def run_authenticated_x_sniper():
-    print(f"🚀 GraphQL background sniper started, monitoring @{TARGET_SCREEN_NAME}...", flush=True)
+def sanitize_token(raw_input):
+    cleaned = raw_input.strip()
+    if cleaned.startswith("{") and "token" in cleaned:
+        try:
+            data = json.loads(cleaned)
+            if "token" in data:
+                cleaned = data["token"]
+        except Exception:
+            pass
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    return cleaned
+
+def robust_clean_code(raw):
+    if not raw:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(raw))
+    cleaned = "".join(c for c in normalized if c.isalnum()).upper()
+    return cleaned
+
+async def send_telegram(chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient() as temp_client:
+            await temp_client.post(url, json={"chat_id": int(chat_id), "text": text, "parse_mode": "Markdown"}, timeout=15.0)
+    except Exception as e:
+        print(f"Telegram send error to {chat_id}: {e}")
+
+def execute_chowdeck_request(method, url, headers, cookies, json_data):
+    with httpx.Client(timeout=15.0) as client:
+        if method == "POST":
+            return client.post(url, json=json_data, headers=headers, cookies=cookies)
+        return client.get(url, headers=headers, cookies=cookies)
+
+async def claim_code(raw_code):
+    code = robust_clean_code(raw_code)
+    if not code or len(code) < 4:
+        return
+
+    claimed_history = load_json(CLAIMED_FILE)
+    if code in claimed_history:
+        print(f"⏩ Skipping '{code}': Already attempted/claimed previously.")
+        return
+
+    tokens = load_json(TOKEN_FILE)
+    carts = load_json(CART_FILE)
+    cookie_db = load_json(COOKIE_FILE)
     
-    search_url = f"https://x.com/i/api/2/search/adaptive.json?q=from:{TARGET_SCREEN_NAME}&tweet_mode=extended"
+    if not tokens:
+        print("❌ Database check: No user tokens registered yet.")
+        return
     
-    cookies = {
-        "auth_token": X_AUTH_TOKEN,
-        "ct0": X_CT0_TOKEN
-    } if X_AUTH_TOKEN and X_CT0_TOKEN else {}
-    
-    headers = {
-        "Authorization": X_BEARER,
-        "x-csrf-token": X_CT0_TOKEN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": f"https://x.com/{TARGET_SCREEN_NAME}"
-    }
-    
+    print(f"🚀 Processing code '{code}' for {len(tokens)} registered user(s)...")
+    for chat_id, token in tokens.items():
+        clean_token = sanitize_token(token)
+
+        headers = {
+            "Authorization": f"Bearer {clean_token}",
+            "Content-Type": "application/json",
+            "Origin": "https://chowdeck.com",
+            "Referer": "https://chowdeck.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+        }
+        
+        user_cookies = cookie_db.get(str(chat_id), {})
+        
+        try:
+            claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+            print(f"📤 Executing isolated request for {code} (User {chat_id})...")
+            
+            claim_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
+            )
+            print(f"📥 Claim status [{claim_res.status_code}]: {claim_res.text}")
+            
+            if claim_res.status_code in [200, 400]:
+                claimed_history[code] = claim_res.status_code
+                save_json(CLAIMED_FILE, claimed_history)
+            
+            msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
+            
+            user_cart = carts.get(str(chat_id))
+            if user_cart and user_cart.get("cart_id") and claim_res.status_code == 200:
+                payload = {
+                    "cart_id": user_cart.get("cart_id"),
+                    "promo_codes": [code]
+                }
+                apply_res = await asyncio.to_thread(
+                    execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, payload
+                )
+                print(f"📥 Apply result [{apply_res.status_code}]: {apply_res.text}")
+                msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
+            
+            await send_telegram(chat_id, msg)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            print(f"❌ Error processing code {code} for user {chat_id}: {e}")
+            try:
+                await send_telegram(chat_id, f"🎯 *Code Target:* `{code}`\nError: `{e}`")
+            except:
+                pass
+
+async def worker():
     while True:
         try:
-            with httpx.Client(headers=headers, cookies=cookies, timeout=10.0) as client:
-                response = client.get(search_url)
-                print(f"📡 Polled X GraphQL status code: {response.status_code}", flush=True)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    tweets_dict = data.get("globalObjects", {}).get("tweets", {})
-                    
-                    for tweet_id, tweet_info in tweets_dict.items():
-                        if tweet_id not in seen_ids:
-                            seen_ids.add(tweet_id)
-                            tweet_text = tweet_info.get("full_text", "")
-                            asyncio.run(process_incoming_text(tweet_text))
-                else:
-                    print(f"⚠️ X returned non-200 status: {response.status_code} - {response.text[:100]}", flush=True)
+            code = await code_queue.get()
+            try:
+                await claim_code(code)
+            except Exception as e:
+                print(f"Worker execution error for {code}: {e}")
+            finally:
+                code_queue.task_done()
+                await asyncio.sleep(2.5)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print(f"❌ Polling loop error: {e}", flush=True)
+            print(f"Worker loop error: {e}")
+            await asyncio.sleep(2)
+
+async def process_text(text):
+    if not text:
+        return
+    print(f"Scanning text: {text}")
+    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,12}\b'
+    codes = re.findall(pattern, text)
+    ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
+    
+    valid = []
+    for c in codes:
+        cleaned = robust_clean_code(c)
+        if cleaned and cleaned not in ignore and not cleaned.startswith("TEST"):
+            valid.append(cleaned)
             
-        time.sleep(5)
+    for code in list(dict.fromkeys(valid)):
+        print(f"🚨 Queued Code: {code}")
+        await code_queue.put(code)
+
+async def telegram_poller():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    async with httpx.AsyncClient() as tg_client:
+        while True:
+            try:
+                res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 30}, timeout=35.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    for update in data.get("result", []):
+                        last_update_id = update["update_id"]
+                        msg = update.get("message", {})
+                        chat_id = msg.get("chat", {}).get("id")
+                        text = msg.get("text", "")
+                        if not chat_id or not text:
+                            continue
+                        
+                        if text.startswith("/start"):
+                            tokens = load_json(TOKEN_FILE)
+                            carts = load_json(CART_FILE)
+                            has_token = "✅ Configured" if str(chat_id) in tokens else "❌ Not Set"
+                            has_cart = "✅ Configured" if str(chat_id) in carts else "❌ Not Set"
+                            
+                            help_text = (
+                                "🤖 *Chowdeck Sniper Active!*\n\n"
+                                f"Your Status:\n• Token: {has_token}\n• Cart: {has_cart}\n\n"
+                                "1️⃣ Link token:\n`/settoken <token_or_json>`\n\n"
+                                "2️⃣ Set cart ID:\n`/setcart YOUR_CART_ID`"
+                            )
+                            await send_telegram(chat_id, help_text)
+                        elif text.startswith("/settoken"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                clean_val = sanitize_token(parts[1])
+                                tokens = load_json(TOKEN_FILE)
+                                tokens[str(chat_id)] = clean_val
+                                save_json(TOKEN_FILE, tokens)
+                                await send_telegram(chat_id, "✅ *Success!* Token saved and sanitized.")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/settoken <token>`")
+                        elif text.startswith("/setcart"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                cart_id = parts[1].strip()
+                                carts = load_json(CART_FILE)
+                                carts[str(chat_id)] = {"cart_id": cart_id}
+                                save_json(CART_FILE, carts)
+                                await send_telegram(chat_id, f"✅ *Cart ID Saved:* `{cart_id}`")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/setcart <cart_id>`")
+                        else:
+                            await process_text(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"Telegram poller error: {e}")
+            await asyncio.sleep(2)
+
+async def x_poller():
+    client = Client('en-US')
+    cookie_payload = [
+        {
+            "domain": ".x.com",
+            "expirationDate": 1850000000,
+            "hostOnly": False,
+            "httpOnly": True,
+            "name": "auth_token",
+            "path": "/",
+            "sameSite": "no_restriction",
+            "secure": True,
+            "session": False,
+            "value": X_AUTH_TOKEN
+        },
+        {
+            "domain": ".x.com",
+            "expirationDate": 1850000000,
+            "hostOnly": False,
+            "httpOnly": False,
+            "name": "ct0",
+            "path": "/",
+            "sameSite": "lax",
+            "secure": True,
+            "session": False,
+            "value": X_CT0_TOKEN
+        }
+    ]
+    with open(COOKIES_JSON_PATH, "w") as f:
+        json.dump(cookie_payload, f, indent=4)
+    
+    client.load_cookies(COOKIES_JSON_PATH)
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
+
+    while True:
+        try:
+            user = await client.get_user_by_screen_name(TARGET_SCREEN_NAME)
+            break
+        except Exception as e:
+            print(f"Error fetching user profile: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
+
+    print("📥 Establishing timeline baseline (ignoring old history)...")
+    try:
+        initial_tweets = await user.get_tweets('Tweets', count=10)
+        for tweet in initial_tweets:
+            if tweet.id:
+                seen_tweet_ids.add(tweet.id)
+        print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets. Sniper is now armed for live drops!")
+    except Exception as e:
+        print(f"⚠️ Baseline warning: {e}")
+
+    while True:
+        try:
+            tweets = await user.get_tweets('Tweets', count=5)
+            for tweet in tweets:
+                tid = tweet.id
+                text = tweet.text
+                if tid and tid not in seen_tweet_ids:
+                    seen_tweet_ids.add(tid)
+                    print(f"🚨 Live Tweet Detected!")
+                    await process_text(text)
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"X poll network error: {e}. Cooling down for 30s...")
+            await asyncio.sleep(30)
+
+async def main():
+    worker_task = asyncio.create_task(worker())
+    try:
+        await asyncio.gather(telegram_poller(), x_poller())
+    finally:
+        worker_task.cancel()
 
 if __name__ == "__main__":
-    sniper_thread = threading.Thread(target=run_authenticated_x_sniper, daemon=True)
-    sniper_thread.start()
-    
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped gracefully.")
