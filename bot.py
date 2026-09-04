@@ -235,49 +235,94 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def syndication_json_poller():
-    url = f"https://cdn.syndication.twimg.com/timeline/profile?screen-name={TARGET_SCREEN_NAME}&suppress_response_codes=true"
+async def robust_poller():
+    syndication_url = f"https://cdn.syndication.twimg.com/timeline/profile?screen-name={TARGET_SCREEN_NAME}&suppress_response_codes=true"
+    rss_bridges = [
+        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{TARGET_SCREEN_NAME}%2Frss",
+        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.privacydev.net%2F{TARGET_SCREEN_NAME}%2Frss"
+    ]
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": "https://platform.twitter.com",
         "Referer": "https://platform.twitter.com/"
     }
     
-    print(f"🚀 Syndication JSON poller active for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...")
+    print(f"🚀 Robust multi-source poller active for @{TARGET_SCREEN_NAME}...", flush=True)
     
     async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, follow_redirects=True) as client:
+        # Initial baseline
+        baseline_set = False
         try:
-            res = await client.get(url, headers=headers, timeout=12.0)
-            if res.status_code == 200:
+            res = await client.get(syndication_url, headers=headers, timeout=12.0)
+            if res.status_code == 200 and "application/json" in res.headers.get("content-type", ""):
                 data = res.json()
-                tweets = data.get("tweets", [])
-                for tweet in tweets:
+                for tweet in data.get("tweets", []):
                     tid = str(tweet.get("id_str") or tweet.get("id"))
                     if tid:
                         seen_tweet_ids.add(tid)
-                print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing tweets.")
-        except Exception as e:
-            print(f"⚠️ Baseline fetch warning: {e}")
+                baseline_set = True
+                print(f"✅ Baseline locked via Syndication. Absorbed {len(seen_tweet_ids)} tweets.")
+        except Exception:
+            pass
+
+        if not baseline_set:
+            for bridge in rss_bridges:
+                try:
+                    res = await client.get(bridge, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("status") == "ok":
+                            for item in data.get("items", []):
+                                tid = str(item.get("guid") or item.get("link"))
+                                if tid:
+                                    seen_tweet_ids.add(tid)
+                            print(f"✅ Baseline locked via RSS Fallback. Absorbed {len(seen_tweet_ids)} tweets.")
+                            break
+                except Exception:
+                    continue
 
         while True:
+            success = False
+            # Try Syndication JSON first
             try:
-                res = await client.get(url, headers=headers, timeout=12.0)
-                if res.status_code == 200:
+                res = await client.get(syndication_url, headers=headers, timeout=10.0)
+                if res.status_code == 200 and "application/json" in res.headers.get("content-type", ""):
                     data = res.json()
-                    tweets = data.get("tweets", [])
-                    for tweet in tweets:
+                    for tweet in data.get("tweets", []):
                         tid = str(tweet.get("id_str") or tweet.get("id"))
                         text = tweet.get("text", "")
                         if tid and text and tid not in seen_tweet_ids:
                             seen_tweet_ids.add(tid)
-                            print(f"🚨 Live Tweet Detected via Syndication JSON!")
+                            print(f"🚨 Live Tweet Detected via Syndication!")
                             await process_text(text)
-                else:
-                    print(f"⚠️ Syndication status {res.status_code}, retrying...")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"Syndication fetch error: {e}")
+                    success = True
+            except Exception:
+                pass
+
+            # Fallback to RSS bridges if syndication failed
+            if not success:
+                for bridge in rss_bridges:
+                    try:
+                        res = await client.get(bridge, headers={"User-Agent": "Mozilla/5.0"}, timeout=8.0)
+                        if res.status_code == 200:
+                            data = res.json()
+                            if data.get("status") == "ok":
+                                for item in data.get("items", []):
+                                    tid = str(item.get("guid") or item.get("link"))
+                                    text = item.get("title", "").strip()
+                                    if tid and text and tid not in seen_tweet_ids:
+                                        seen_tweet_ids.add(tid)
+                                        print(f"🚨 Live Tweet Detected via RSS Fallback!")
+                                        await process_text(text)
+                                success = True
+                                break
+                    except Exception:
+                        continue
+
+            if not success:
+                print("⚠️ All tweet fetch channels returned errors this cycle. Retrying...")
+
             await asyncio.sleep(15)
 
 async def main():
@@ -286,7 +331,9 @@ async def main():
     
     worker_task = asyncio.create_task(worker())
     try:
-        await asyncio.gather(telegram_poller(), syndication_json_poller())
+        asyncio.gather(telegram_poller(), robust_poller())
+        while True:
+            await asyncio.sleep(3600)
     finally:
         worker_task.cancel()
 
