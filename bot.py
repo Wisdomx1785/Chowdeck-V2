@@ -73,34 +73,31 @@ def set_cart(message):
 
 def poll_twitter_feed():
     target_user = "Oyinlola6464"
-    url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={target_user}"
-    last_tweet_id = None
+    # Using a reliable public RSS-to-JSON bridge to avoid cloud datacenter blocks
+    url = f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fv2.nitter.net%2F{target_user}%2Frss"
+    last_guid = None
     
-    print(f"🚀 X poller started via public syndication feed for @{target_user}...", flush=True)
+    print(f"🚀 X poller started via public bridge for @{target_user}...", flush=True)
     
     while True:
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-                "Accept": "application/json",
-                "Referer": "https://twitter.com/"
-            }
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
             response = requests.get(url, headers=headers, timeout=10)
-            print(f"📡 Twitter Polling Status Code: {response.status_code}", flush=True)
+            print(f"📡 Polling Status Code: {response.status_code}", flush=True)
             
             if response.status_code == 200:
                 data = response.json()
-                tweets = data.get("tweets", [])
-                if tweets:
-                    latest = tweets[0]
-                    tweet_id = latest.get("id_str") or latest.get("id")
-                    tweet_text = latest.get("text", "").strip()
+                items = data.get("items", [])
+                if items:
+                    latest = items[0]
+                    guid = latest.get("guid") or latest.get("link")
+                    tweet_text = latest.get("title", "").strip()
                     
-                    if last_tweet_id is None:
-                        last_tweet_id = tweet_id
-                        print(f"📌 Initialized with latest tweet ID: {tweet_id}", flush=True)
-                    elif tweet_id != last_tweet_id:
-                        last_tweet_id = tweet_id
+                    if last_guid is None:
+                        last_guid = guid
+                        print(f"📌 Initialized with latest tweet GUID: {guid}", flush=True)
+                    elif guid != last_guid:
+                        last_guid = guid
                         print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
                         
                         promo_code = tweet_text.split()[0] if tweet_text else ""
