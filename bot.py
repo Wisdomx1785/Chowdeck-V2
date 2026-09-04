@@ -3,6 +3,7 @@ import asyncio
 import os
 import json
 import unicodedata
+import urllib.parse
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
@@ -47,6 +48,23 @@ def set_bot_active(val):
 
 def sanitize_token(raw_input):
     cleaned = raw_input.strip()
+    
+    # Handle raw document.cookie strings containing 'user='
+    if "user=" in cleaned:
+        try:
+            parts = cleaned.split(";")
+            for p in parts:
+                p = p.strip()
+                if p.startswith("user="):
+                    val = p[5:]
+                    decoded = urllib.parse.unquote(val)
+                    data = json.loads(decoded)
+                    if "token" in data:
+                        return data["token"]
+        except Exception as e:
+            print(f"Cookie string parse error: {e}")
+
+    # Handle standard JSON input with a "token" key
     if cleaned.startswith("{") and "token" in cleaned:
         try:
             data = json.loads(cleaned)
@@ -54,8 +72,10 @@ def sanitize_token(raw_input):
                 cleaned = data["token"]
         except Exception:
             pass
+            
     if cleaned.lower().startswith("bearer "):
         cleaned = cleaned[7:].strip()
+        
     return cleaned
 
 def robust_clean_code(raw):
@@ -186,7 +206,7 @@ async def process_text(text):
     if not text:
         return
     print(f"Scanning text: {text}")
-    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,12}\b'
+    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
     codes = re.findall(pattern, text)
     ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
     
