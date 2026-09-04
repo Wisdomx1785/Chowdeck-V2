@@ -236,7 +236,7 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def syndication_json_poller():
-    url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={TARGET_SCREEN_NAME}"
+    url = f"https://cdn.syndication.twimg.com/timeline/profile?screen-name={TARGET_SCREEN_NAME}&suppress_response_codes=true"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": "https://platform.twitter.com",
