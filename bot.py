@@ -6,9 +6,10 @@ import unicodedata
 from twikit import Client
 import httpx
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
-X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8653538998:AAF5JNF5_qbyKqQBu9A7WT7d4aynQFIXaOo").strip()
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "1b20b6eaac52876de1f0902de55181c44e386641").strip()
+X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "9b96714228586caf375904b4beedf2e094161936fb93a01c64e9190823995af94d22414632135fye6112eaff4adbd80846447a87de7df0e5e51b21a5dc2d2b75fec1176c85a510bf0ae1263bd86efc2").strip()
+PROXY_URL = os.getenv("PROXY_URL", "http://KYRHMJQddE0iES4:FWCnRw4tlVPeLcC@109.203.167.117:46267").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
@@ -235,7 +236,7 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def x_poller():
-    client = Client('en-US', impersonate='chrome124')
+    client = Client('en-US', impersonate='chrome124', proxy=PROXY_URL)
     try:
         client.http.cookies.clear()
     except Exception:
@@ -246,14 +247,13 @@ async def x_poller():
         "ct0": X_CT0_TOKEN
     })
     
-    # Force the exact matching headers required by Twitter's 353 gatekeeper
     try:
         client.http.headers['x-csrf-token'] = X_CT0_TOKEN
         client.http.headers['authorization'] = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4l33AGWDiozxUAIcaJjNXHo'
     except Exception:
         pass
     
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} via proxy...")
 
     while True:
         try:
