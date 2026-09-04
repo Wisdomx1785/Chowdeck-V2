@@ -1,2 +1,2 @@
 httpx
-git+https://github.com/unclecode/twikit.git
+
