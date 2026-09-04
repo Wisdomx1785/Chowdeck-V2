@@ -97,6 +97,8 @@ async def claim_code(raw_code):
         print("❌ Database check: No user tokens registered yet.")
         return
     
+    CANDIDATE_ANSWERS = ["Chowstore", "Chowpass", "Chowstar", "Relay", "Chowmart", "Ismail"]
+    
     print(f"🚀 Processing code '{code}' for {len(tokens)} registered user(s)...")
     for chat_id, token in tokens.items():
         clean_token = sanitize_token(token)
@@ -120,10 +122,26 @@ async def claim_code(raw_code):
             claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
             print(f"📤 Executing isolated request for {code} (User {chat_id})...")
             
+            # Step 1: Try standard claim without answer first
             claim_res = await asyncio.to_thread(
                 execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
             )
-            print(f"📥 Claim status [{claim_res.status_code}]: {claim_res.text}")
+            
+            # Step 2: If failed, brute-force security answers
+            if claim_res.status_code != 200:
+                print(f"⚠️ Standard claim failed [{claim_res.status_code}]. Testing security answers...")
+                for ans in CANDIDATE_ANSWERS:
+                    print(f"🔑 Trying answer: '{ans}' for {code}...")
+                    claim_res = await asyncio.to_thread(
+                        execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
+                    )
+                    print(f"📥 Answer [{ans}] status [{claim_res.status_code}]: {claim_res.text}")
+                    if claim_res.status_code == 200:
+                        print(f"✅ Success with answer: '{ans}'!")
+                        break
+                    await asyncio.sleep(0.3)
+
+            print(f"📥 Final Claim status [{claim_res.status_code}]: {claim_res.text}")
             
             if claim_res.status_code in [200, 400]:
                 claimed_history[code] = claim_res.status_code
