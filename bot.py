@@ -246,6 +246,11 @@ async def x_poller():
         "ct0": X_CT0_TOKEN
     })
     
+    try:
+        client.http.headers['x-csrf-token'] = X_CT0_TOKEN
+    except Exception:
+        pass
+    
     print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
 
     while True:
@@ -271,11 +276,11 @@ async def x_poller():
             tweets = await user.get_tweets('Tweets', count=5)
             for tweet in tweets:
                 tid = tweet.id
-                text = tweet.text
-                if tid and tid not in seen_tweet_ids:
-                    seen_tweet_ids.add(tid)
-                    print(f"🚨 Live Tweet Detected!")
-                    await process_text(text)
+            text = tweet.text
+            if tid and tid not in seen_tweet_ids:
+                seen_tweet_ids.add(tid)
+                print(f"🚨 Live Tweet Detected!")
+                await process_text(text)
             await asyncio.sleep(15)
         except asyncio.CancelledError:
             raise
