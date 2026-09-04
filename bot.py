@@ -73,64 +73,68 @@ def set_cart(message):
 
 def poll_twitter_feed():
     target_user = "Oyinlola6464"
-    # Using a reliable public RSS-to-JSON bridge to avoid cloud datacenter blocks
-    url = f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fv2.nitter.net%2F{target_user}%2Frss"
+    # Using a reliable public RSS bridge instance
+    url = f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.privacydev.net%2F{target_user}%2Frss"
     last_guid = None
     
-    print(f"🚀 X poller started via public bridge for @{target_user}...", flush=True)
+    print(f"🚀 X poller started for @{target_user}...", flush=True)
     
     while True:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
             response = requests.get(url, headers=headers, timeout=10)
-            print(f"📡 Polling Status Code: {response.status_code}", flush=True)
             
             if response.status_code == 200:
                 data = response.json()
-                items = data.get("items", [])
-                if items:
-                    latest = items[0]
-                    guid = latest.get("guid") or latest.get("link")
-                    tweet_text = latest.get("title", "").strip()
-                    
-                    if last_guid is None:
-                        last_guid = guid
-                        print(f"📌 Initialized with latest tweet GUID: {guid}", flush=True)
-                    elif guid != last_guid:
-                        last_guid = guid
-                        print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
+                if data.get("status") == "ok":
+                    items = data.get("items", [])
+                    if items:
+                        latest = items[0]
+                        guid = latest.get("guid") or latest.get("link")
+                        tweet_text = latest.get("title", "").strip()
                         
-                        promo_code = tweet_text.split()[0] if tweet_text else ""
-                        
-                        for chat_id, creds in user_data.items():
-                            token = creds.get("token")
-                            cart_id = creds.get("cart_id")
-                            if token and cart_id and promo_code:
-                                print(f"🛒 Applying code '{promo_code}' to cart {cart_id}...", flush=True)
-                                
-                                api_url = "https://api.chowdeck.com/customer/cart/promo-code"
-                                api_headers = {
-                                    "Authorization": f"Bearer {token}",
-                                    "Content-Type": "application/json",
-                                    "Accept": "application/json",
-                                    "Origin": "https://chowdeck.com",
-                                    "Referer": "https://chowdeck.com/"
-                                }
-                                payload = {
-                                    "code": promo_code,
-                                    "cart_id": int(cart_id)
-                                }
-                                
-                                try:
-                                    api_res = requests.post(api_url, headers=api_headers, json=payload, timeout=10)
-                                    print(f"📡 Chowdeck Response [{api_res.status_code}]: {api_res.text}", flush=True)
-                                    bot.send_message(
-                                        chat_id, 
-                                        f"🎯 Code: `{promo_code}`\nStatus: `{api_res.status_code}`\nResponse: `{api_res.text}`", 
-                                        parse_mode="Markdown"
-                                    )
-                                except Exception as api_err:
-                                    print(f"❌ API Request Failed: {api_err}", flush=True)
+                        if last_guid is None:
+                            last_guid = guid
+                            print(f"📌 Initialized with latest tweet GUID: {guid}", flush=True)
+                        elif guid != last_guid:
+                            last_guid = guid
+                            print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
+                            
+                            promo_code = tweet_text.split()[0] if tweet_text else ""
+                            
+                            for chat_id, creds in user_data.items():
+                                token = creds.get("token")
+                                cart_id = creds.get("cart_id")
+                                if token and cart_id and promo_code:
+                                    print(f"🛒 Applying code '{promo_code}' to cart {cart_id}...", flush=True)
+                                    
+                                    api_url = "https://api.chowdeck.com/customer/cart/promo-code"
+                                    api_headers = {
+                                        "Authorization": f"Bearer {token}",
+                                        "Content-Type": "application/json",
+                                        "Accept": "application/json",
+                                        "Origin": "https://chowdeck.com",
+                                        "Referer": "https://chowdeck.com/"
+                                    }
+                                    payload = {
+                                        "code": promo_code,
+                                        "cart_id": int(cart_id)
+                                    }
+                                    
+                                    try:
+                                        api_res = requests.post(api_url, headers=api_headers, json=payload, timeout=10)
+                                        print(f"📡 Chowdeck Response [{api_res.status_code}]: {api_res.text}", flush=True)
+                                        bot.send_message(
+                                            chat_id, 
+                                            f"🎯 Code: `{promo_code}`\nStatus: `{api_res.status_code}`\nResponse: `{api_res.text}`", 
+                                            parse_mode="Markdown"
+                                        )
+                                    except Exception as api_err:
+                                        print(f"❌ API Request Failed: {api_err}", flush=True)
+                else:
+                    print(f"⚠️ RSS Bridge returned non-ok status: {data}", flush=True)
+            else:
+                print(f"⚠️ Polling Status Code: {response.status_code}", flush=True)
         except Exception as e:
             print(f"⚠️ Poller Error: {e}", flush=True)
             
