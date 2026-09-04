@@ -3,9 +3,12 @@ import asyncio
 import os
 import json
 import unicodedata
+from twikit import Client
 import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
+X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
@@ -235,95 +238,64 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def robust_poller():
-    syndication_url = f"https://cdn.syndication.twimg.com/timeline/profile?screen-name={TARGET_SCREEN_NAME}&suppress_response_codes=true"
-    rss_bridges = [
-        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{TARGET_SCREEN_NAME}%2Frss",
-        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.privacydev.net%2F{TARGET_SCREEN_NAME}%2Frss"
+async def x_poller():
+    client = Client('en-US', proxy=PROXY_URL if PROXY_URL else None)
+    
+    formatted_cookies = [
+        {
+            "name": "auth_token",
+            "value": X_AUTH_TOKEN,
+            "domain": ".twitter.com",
+            "path": "/"
+        },
+        {
+            "name": "ct0",
+            "value": X_CT0_TOKEN,
+            "domain": ".twitter.com",
+            "path": "/"
+        }
     ]
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://platform.twitter.com",
-        "Referer": "https://platform.twitter.com/"
-    }
+    with open("cookies.json", "w") as f:
+        json.dump(formatted_cookies, f)
     
-    print(f"🚀 Robust multi-source poller active for @{TARGET_SCREEN_NAME}...", flush=True)
-    
-    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, follow_redirects=True) as client:
-        # Initial baseline
-        baseline_set = False
+    client.load_cookies("cookies.json")
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...")
+
+    while True:
         try:
-            res = await client.get(syndication_url, headers=headers, timeout=12.0)
-            if res.status_code == 200 and "application/json" in res.headers.get("content-type", ""):
-                data = res.json()
-                for tweet in data.get("tweets", []):
-                    tid = str(tweet.get("id_str") or tweet.get("id"))
-                    if tid:
-                        seen_tweet_ids.add(tid)
-                baseline_set = True
-                print(f"✅ Baseline locked via Syndication. Absorbed {len(seen_tweet_ids)} tweets.")
-        except Exception:
-            pass
+            user = await client.get_user_by_screen_name(TARGET_SCREEN_NAME)
+            break
+        except Exception as e:
+            print(f"Error fetching user profile: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
 
-        if not baseline_set:
-            for bridge in rss_bridges:
-                try:
-                    res = await client.get(bridge, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
-                    if res.status_code == 200:
-                        data = res.json()
-                        if data.get("status") == "ok":
-                            for item in data.get("items", []):
-                                tid = str(item.get("guid") or item.get("link"))
-                                if tid:
-                                    seen_tweet_ids.add(tid)
-                            print(f"✅ Baseline locked via RSS Fallback. Absorbed {len(seen_tweet_ids)} tweets.")
-                            break
-                except Exception:
-                    continue
+    print("📥 Establishing timeline baseline (ignoring old history)...")
+    try:
+        initial_tweets = await user.get_tweets('Tweets', count=10)
+        for tweet in initial_tweets:
+            if tweet.id:
+                seen_tweet_ids.add(tweet.id)
+        print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets. Sniper is now armed for live drops!")
+    except Exception as e:
+        print(f"⚠️ Baseline warning: {e}")
 
-        while True:
-            success = False
-            # Try Syndication JSON first
-            try:
-                res = await client.get(syndication_url, headers=headers, timeout=10.0)
-                if res.status_code == 200 and "application/json" in res.headers.get("content-type", ""):
-                    data = res.json()
-                    for tweet in data.get("tweets", []):
-                        tid = str(tweet.get("id_str") or tweet.get("id"))
-                        text = tweet.get("text", "")
-                        if tid and text and tid not in seen_tweet_ids:
-                            seen_tweet_ids.add(tid)
-                            print(f"🚨 Live Tweet Detected via Syndication!")
-                            await process_text(text)
-                    success = True
-            except Exception:
-                pass
-
-            # Fallback to RSS bridges if syndication failed
-            if not success:
-                for bridge in rss_bridges:
-                    try:
-                        res = await client.get(bridge, headers={"User-Agent": "Mozilla/5.0"}, timeout=8.0)
-                        if res.status_code == 200:
-                            data = res.json()
-                            if data.get("status") == "ok":
-                                for item in data.get("items", []):
-                                    tid = str(item.get("guid") or item.get("link"))
-                                    text = item.get("title", "").strip()
-                                    if tid and text and tid not in seen_tweet_ids:
-                                        seen_tweet_ids.add(tid)
-                                        print(f"🚨 Live Tweet Detected via RSS Fallback!")
-                                        await process_text(text)
-                                success = True
-                                break
-                    except Exception:
-                        continue
-
-            if not success:
-                print("⚠️ All tweet fetch channels returned errors this cycle. Retrying...")
-
+    while True:
+        try:
+            tweets = await user.get_tweets('Tweets', count=5)
+            for tweet in tweets:
+                tid = tweet.id
+                text = tweet.text
+                if tid and tid not in seen_tweet_ids:
+                    seen_tweet_ids.add(tid)
+                    print(f"🚨 Live Tweet Detected!")
+                    await process_text(text)
             await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"X poll network error: {e}. Cooling down for 30s...")
+            await asyncio.sleep(30)
 
 async def main():
     print("🤖 Waiting 30 seconds for old session to expire...", flush=True)
@@ -331,9 +303,7 @@ async def main():
     
     worker_task = asyncio.create_task(worker())
     try:
-        asyncio.gather(telegram_poller(), robust_poller())
-        while True:
-            await asyncio.sleep(3600)
+        await asyncio.gather(telegram_poller(), x_poller())
     finally:
         worker_task.cancel()
 
