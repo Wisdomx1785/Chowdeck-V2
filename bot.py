@@ -241,26 +241,13 @@ async def telegram_poller():
 async def x_poller():
     client = Client('en-US', proxy=PROXY_URL if PROXY_URL else None)
     
-    formatted_cookies = [
-        {
-            "name": "auth_token",
-            "value": X_AUTH_TOKEN,
-            "domain": ".twitter.com",
-            "path": "/"
-        },
-        {
-            "name": "ct0",
-            "value": X_CT0_TOKEN,
-            "domain": ".twitter.com",
-            "path": "/"
-        }
-    ]
+    # Directly pass dictionary to bypass file unpacking bugs
+    client.set_cookies({
+        "auth_token": X_AUTH_TOKEN,
+        "ct0": X_CT0_TOKEN
+    })
     
-    with open("cookies.json", "w") as f:
-        json.dump(formatted_cookies, f)
-    
-    client.load_cookies("cookies.json")
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...")
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...", flush=True)
 
     while True:
         try:
