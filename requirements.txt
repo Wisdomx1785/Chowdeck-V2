@@ -1,2 +1,2 @@
-twikit
+twifork[impersonate]
 httpx
