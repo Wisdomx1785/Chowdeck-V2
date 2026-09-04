@@ -8,7 +8,6 @@ import telebot
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-# Persistent file storage so restarts don't wipe your tokens & cart IDs
 USER_DATA_FILE = "users.json"
 
 def load_users():
@@ -93,7 +92,6 @@ def set_cart(message):
 
 def poll_twitter_feed():
     target_user = "Oyinlola6464"
-    # Using a robust fallback list of public RSS bridges
     bridges = [
         f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{target_user}%2Frss",
         f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.itscat.gay%2F{target_user}%2Frss"
