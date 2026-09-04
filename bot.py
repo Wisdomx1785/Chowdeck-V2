@@ -3,12 +3,10 @@ import asyncio
 import os
 import json
 import unicodedata
-from twikit import Client
+import xml.etree.ElementTree as ET
 import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
-X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
@@ -238,51 +236,61 @@ async def telegram_poller():
                 print(f"Telegram poller error: {e}")
             await asyncio.sleep(2)
 
-async def x_poller():
-    client = Client('en-US', proxy=PROXY_URL if PROXY_URL else None)
+async def rss_poller():
+    rss_urls = [
+        f"https://nitter.poast.org/{TARGET_SCREEN_NAME}/rss",
+        f"https://nitter.privacydev.net/{TARGET_SCREEN_NAME}/rss"
+    ]
     
-    # Directly pass dictionary to bypass file unpacking bugs
-    client.set_cookies({
-        "auth_token": X_AUTH_TOKEN,
-        "ct0": X_CT0_TOKEN
-    })
+    print(f"🚀 RSS XML poller active for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...", flush=True)
     
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...", flush=True)
+    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, follow_redirects=True) as client:
+        # Initial baseline
+        for rss_url in rss_urls:
+            try:
+                res = await client.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
+                if res.status_code == 200:
+                    root = ET.fromstring(res.text)
+                    for item in root.findall(".//item"):
+                        guid = item.find("guid")
+                        link = item.find("link")
+                        tid = guid.text if guid is not None and guid.text else (link.text if link is not None else "")
+                        if tid:
+                            seen_tweet_ids.add(tid)
+                    print(f"✅ Baseline locked via RSS. Absorbed {len(seen_tweet_ids)} tweets.")
+                    break
+            except Exception:
+                continue
 
-    while True:
-        try:
-            user = await client.get_user_by_screen_name(TARGET_SCREEN_NAME)
-            break
-        except Exception as e:
-            print(f"Error fetching user profile: {e}. Retrying in 10s...")
-            await asyncio.sleep(10)
+        while True:
+            success = False
+            for rss_url in rss_urls:
+                try:
+                    res = await client.get(rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
+                    if res.status_code == 200:
+                        root = ET.fromstring(res.text)
+                        for item in root.findall(".//item"):
+                            guid = item.find("guid")
+                            link = item.find("link")
+                            title = item.find("title")
+                            description = item.find("description")
+                            
+                            tid = guid.text if guid is not None and guid.text else (link.text if link is not None else "")
+                            text = (title.text if title is not None else "") + " " + (description.text if description is not None else "")
+                            
+                            if tid and text and tid not in seen_tweet_ids:
+                                seen_tweet_ids.add(tid)
+                                print(f"🚨 Live Tweet Detected via RSS!")
+                                await process_text(text)
+                        success = True
+                        break
+                except Exception:
+                    continue
+            
+            if not success:
+                print("⚠️ RSS endpoints unreachable this cycle. Retrying...")
 
-    print("📥 Establishing timeline baseline (ignoring old history)...")
-    try:
-        initial_tweets = await user.get_tweets('Tweets', count=10)
-        for tweet in initial_tweets:
-            if tweet.id:
-                seen_tweet_ids.add(tweet.id)
-        print(f"✅ Baseline locked. Absorbed {len(seen_tweet_ids)} existing historical tweets. Sniper is now armed for live drops!")
-    except Exception as e:
-        print(f"⚠️ Baseline warning: {e}")
-
-    while True:
-        try:
-            tweets = await user.get_tweets('Tweets', count=5)
-            for tweet in tweets:
-                tid = tweet.id
-                text = tweet.text
-                if tid and tid not in seen_tweet_ids:
-                    seen_tweet_ids.add(tid)
-                    print(f"🚨 Live Tweet Detected!")
-                    await process_text(text)
             await asyncio.sleep(15)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"X poll network error: {e}. Cooling down for 30s...")
-            await asyncio.sleep(30)
 
 async def main():
     print("🤖 Waiting 30 seconds for old session to expire...", flush=True)
@@ -290,7 +298,9 @@ async def main():
     
     worker_task = asyncio.create_task(worker())
     try:
-        await asyncio.gather(telegram_poller(), x_poller())
+        asyncio.gather(telegram_poller(), rss_poller())
+        while True:
+            await asyncio.sleep(3600)
     finally:
         worker_task.cancel()
 
