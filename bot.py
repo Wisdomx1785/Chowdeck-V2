@@ -8,6 +8,7 @@ import telebot
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
+# Persistent file storage so restarts don't wipe tokens & cart IDs
 USER_DATA_FILE = "users.json"
 
 def load_users():
@@ -92,40 +93,24 @@ def set_cart(message):
 
 def poll_twitter_feed():
     target_user = "Oyinlola6464"
-    syndication_url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={target_user}"
-    rss_bridge_url = f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{target_user}%2Frss"
-    
-    last_tweet_id = None
+    bridges = [
+        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.privacydev.net%2F{target_user}%2Frss",
+        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{target_user}%2Frss",
+        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.net%2F{target_user}%2Frss"
+    ]
+    last_guid = None
     
     print(f"🚀 X poller active for @{target_user}...", flush=True)
     
     while True:
         tweet_text = None
         tweet_id = None
+        success = False
         
-        # Method 1: Try Twitter's native syndication feed with embed headers
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Origin": "https://platform.twitter.com",
-                "Referer": "https://platform.twitter.com/"
-            }
-            res = requests.get(syndication_url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                tweets = data.get("tweets", [])
-                if tweets:
-                    latest = tweets[0]
-                    tweet_id = str(latest.get("id_str") or latest.get("id"))
-                    tweet_text = latest.get("text", "").strip()
-        except Exception:
-            pass
-            
-        # Method 2: Fallback to RSS bridge if syndication failed
-        if not tweet_text:
+        for url in bridges:
             try:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                res = requests.get(rss_bridge_url, headers=headers, timeout=8)
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                res = requests.get(url, headers=headers, timeout=6)
                 if res.status_code == 200:
                     data = res.json()
                     if data.get("status") == "ok":
@@ -134,16 +119,17 @@ def poll_twitter_feed():
                             latest = items[0]
                             tweet_id = str(latest.get("guid") or latest.get("link"))
                             tweet_text = latest.get("title", "").strip()
+                            success = True
+                            break
             except Exception:
-                pass
-
-        # Process tweet if found and new
-        if tweet_text and tweet_id:
-            if last_tweet_id is None:
-                last_tweet_id = tweet_id
+                continue
+        
+        if success and tweet_text and tweet_id:
+            if last_guid is None:
+                last_guid = tweet_id
                 print(f"📌 Initialized with latest tweet ID: {tweet_id}", flush=True)
-            elif tweet_id != last_tweet_id:
-                last_tweet_id = tweet_id
+            elif tweet_id != last_guid:
+                last_guid = tweet_id
                 print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
                 
                 promo_code = tweet_text.split()[0] if tweet_text else ""
@@ -178,7 +164,7 @@ def poll_twitter_feed():
                         except Exception as api_err:
                             print(f"❌ API Request Failed: {api_err}", flush=True)
         else:
-            print("⚠️ All Twitter fetch methods timed out this cycle. Retrying...", flush=True)
+            print("⚠️ All RSS bridges failed or timed out this cycle. Retrying...", flush=True)
             
         time.sleep(15)
 
