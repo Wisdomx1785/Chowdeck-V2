@@ -9,11 +9,13 @@ import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
 CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -35,6 +37,13 @@ def save_json(file_path, data):
             json.dump(data, f, indent=4)
     except Exception as e:
         print(f"❌ Failed to save {file_path}: {e}")
+
+def get_bot_active():
+    state = load_json(STATE_FILE)
+    return state.get("active", True)
+
+def set_bot_active(val):
+    save_json(STATE_FILE, {"active": val})
 
 def sanitize_token(raw_input):
     cleaned = raw_input.strip()
@@ -179,6 +188,22 @@ async def process_text(text):
         await code_queue.put(code)
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status":
+            try:
+                active = get_bot_active()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"active": active}).encode('utf-8'))
+            except Exception as e:
+                print(f"Status check error: {e}")
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length).decode('utf-8')
@@ -225,13 +250,20 @@ async def telegram_poller():
                             carts = load_json(CART_FILE)
                             has_token = "✅ Configured" if str(chat_id) in tokens else "❌ Not Set"
                             has_cart = "✅ Configured" if str(chat_id) in carts else "❌ Not Set"
+                            bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
                             
                             help_text = (
                                 "🤖 *Chowdeck Sniper Active!*\n\n"
-                                f"Your Status:\n• Token: {has_token}\n• Cart: {has_cart}\n\n"
+                                f"Your Status:\n• Token: {has_token}\n• Cart: {has_cart}\n• Bridge State: {bot_status}\n\n"
                                 "1️⃣ Link token:\n`/settoken <token_or_json>`\n\n"
                                 "2️⃣ Set cart ID:\n`/setcart YOUR_CART_ID`"
                             )
+                            if not ADMIN_CHAT_ID or str(chat_id) == ADMIN_CHAT_ID:
+                                help_text += (
+                                    "\n\n3️⃣ Control Termux Bridge:\n"
+                                    "• `/pause` - Pause Termux polling\n"
+                                    "• `/resume` - Resume Termux polling"
+                                )
                             await send_telegram(chat_id, help_text)
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
@@ -253,6 +285,18 @@ async def telegram_poller():
                                 await send_telegram(chat_id, f"✅ *Cart ID Saved:* `{cart_id}`")
                             else:
                                 await send_telegram(chat_id, "⚠️ Usage: `/setcart <cart_id>`")
+                        elif text.startswith("/pause"):
+                            if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
+                                await send_telegram(chat_id, "⛔ *Unauthorized:* You do not have permission to control this bot.")
+                            else:
+                                set_bot_active(False)
+                                await send_telegram(chat_id, "⏸️ *Bridge Paused.* Termux polling is now sleeping to save credits.")
+                        elif text.startswith("/resume"):
+                            if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
+                                await send_telegram(chat_id, "⛔ *Unauthorized:* You do not have permission to control this bot.")
+                            else:
+                                set_bot_active(True)
+                                await send_telegram(chat_id, "▶️ *Bridge Resumed.* Termux polling is active and watching.")
                         else:
                             await process_text(text)
             except asyncio.CancelledError:
