@@ -8,6 +8,7 @@ import telebot
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
+# Persistent file storage so restarts don't wipe tokens & cart IDs
 USER_DATA_FILE = "users.json"
 
 def load_users():
@@ -165,6 +166,9 @@ def poll_twitter_feed():
         time.sleep(15)
 
 if __name__ == "__main__":
+    print("🤖 Waiting 5 seconds for old container session to drop...", flush=True)
+    time.sleep(5)
+    
     poller_thread = threading.Thread(target=poll_twitter_feed, daemon=True)
     poller_thread.start()
     
