@@ -80,7 +80,11 @@ def poll_twitter_feed():
     
     while True:
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+                "Accept": "application/json",
+                "Referer": "https://twitter.com/"
+            }
             response = requests.get(url, headers=headers, timeout=10)
             print(f"📡 Twitter Polling Status Code: {response.status_code}", flush=True)
             
@@ -90,7 +94,7 @@ def poll_twitter_feed():
                 if tweets:
                     latest = tweets[0]
                     tweet_id = latest.get("id_str") or latest.get("id")
-                    tweet_text = latest.get("text", "")
+                    tweet_text = latest.get("text", "").strip()
                     
                     if last_tweet_id is None:
                         last_tweet_id = tweet_id
@@ -99,11 +103,37 @@ def poll_twitter_feed():
                         last_tweet_id = tweet_id
                         print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
                         
+                        promo_code = tweet_text.split()[0] if tweet_text else ""
+                        
                         for chat_id, creds in user_data.items():
                             token = creds.get("token")
                             cart_id = creds.get("cart_id")
-                            if token and cart_id:
-                                print(f"🛒 Sending request for cart {cart_id}...", flush=True)
+                            if token and cart_id and promo_code:
+                                print(f"🛒 Applying code '{promo_code}' to cart {cart_id}...", flush=True)
+                                
+                                api_url = "https://api.chowdeck.com/customer/cart/promo-code"
+                                api_headers = {
+                                    "Authorization": f"Bearer {token}",
+                                    "Content-Type": "application/json",
+                                    "Accept": "application/json",
+                                    "Origin": "https://chowdeck.com",
+                                    "Referer": "https://chowdeck.com/"
+                                }
+                                payload = {
+                                    "code": promo_code,
+                                    "cart_id": int(cart_id)
+                                }
+                                
+                                try:
+                                    api_res = requests.post(api_url, headers=api_headers, json=payload, timeout=10)
+                                    print(f"📡 Chowdeck Response [{api_res.status_code}]: {api_res.text}", flush=True)
+                                    bot.send_message(
+                                        chat_id, 
+                                        f"🎯 Code: `{promo_code}`\nStatus: `{api_res.status_code}`\nResponse: `{api_res.text}`", 
+                                        parse_mode="Markdown"
+                                    )
+                                except Exception as api_err:
+                                    print(f"❌ API Request Failed: {api_err}", flush=True)
         except Exception as e:
             print(f"⚠️ Poller Error: {e}", flush=True)
             
