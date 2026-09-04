@@ -144,4 +144,5 @@ if __name__ == "__main__":
     poller_thread.start()
     
     print("🤖 Telegram Bot polling started...", flush=True)
+    bot.remove_webhook()
     bot.infinity_polling()
