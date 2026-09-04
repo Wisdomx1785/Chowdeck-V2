@@ -239,14 +239,12 @@ async def telegram_poller():
 
 async def x_poller():
     client = Client('en-US')
-    cookie_data = {
+    # Directly feed auth_token and ct0 into twikit without a broken file structure
+    client.set_cookies({
         "auth_token": X_AUTH_TOKEN,
         "ct0": X_CT0_TOKEN
-    }
-    with open("cookies.json", "w") as f:
-        json.dump(cookie_data, f)
+    })
     
-    client.load_cookies("cookies.json")
     print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
 
     while True:
