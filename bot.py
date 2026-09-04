@@ -9,6 +9,7 @@ import httpx
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 X_AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "").strip()
 X_CT0_TOKEN = os.getenv("X_CT0_TOKEN", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip()  # e.g., http://user:pass@host:port
 TARGET_SCREEN_NAME = "Oyinlola6464"
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
@@ -238,14 +239,30 @@ async def telegram_poller():
             await asyncio.sleep(2)
 
 async def x_poller():
-    client = Client('en-US')
-    # Directly feed auth_token and ct0 into twikit without a broken file structure
-    client.set_cookies({
-        "auth_token": X_AUTH_TOKEN,
-        "ct0": X_CT0_TOKEN
-    })
+    # Initialize client with proxy if provided
+    client = Client('en-US', proxy=PROXY_URL if PROXY_URL else None)
     
-    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME}...")
+    # Format cookies properly as a full browser-export list so twikit correctly maps ct0 to the CSRF header
+    formatted_cookies = [
+        {
+            "name": "auth_token",
+            "value": X_AUTH_TOKEN,
+            "domain": ".twitter.com",
+            "path": "/"
+        },
+        {
+            "name": "ct0",
+            "value": X_CT0_TOKEN,
+            "domain": ".twitter.com",
+            "path": "/"
+        }
+    ]
+    
+    with open("cookies.json", "w") as f:
+        json.dump(formatted_cookies, f)
+        
+    client.load_cookies("cookies.json")
+    print(f"🚀 X poller started for @{TARGET_SCREEN_NAME} (Proxy Enabled: {bool(PROXY_URL)})...")
 
     while True:
         try:
