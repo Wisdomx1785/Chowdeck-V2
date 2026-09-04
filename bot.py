@@ -8,7 +8,6 @@ import telebot
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-# Persistent file storage so restarts don't wipe tokens & cart IDs
 USER_DATA_FILE = "users.json"
 
 def load_users():
@@ -93,75 +92,93 @@ def set_cart(message):
 
 def poll_twitter_feed():
     target_user = "Oyinlola6464"
-    bridges = [
-        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{target_user}%2Frss",
-        f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.itscat.gay%2F{target_user}%2Frss"
-    ]
-    last_guid = None
+    syndication_url = f"https://cdn.syndication.twimg.com/timeline-profile?screen-name={target_user}"
+    rss_bridge_url = f"https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fnitter.poast.org%2F{target_user}%2Frss"
     
-    print(f"🚀 X poller started for @{target_user}...", flush=True)
+    last_tweet_id = None
+    
+    print(f"🚀 X poller active for @{target_user}...", flush=True)
     
     while True:
-        success = False
-        for url in bridges:
+        tweet_text = None
+        tweet_id = None
+        
+        # Method 1: Try Twitter's native syndication feed with embed headers
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Origin": "https://platform.twitter.com",
+                "Referer": "https://platform.twitter.com/"
+            }
+            res = requests.get(syndication_url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                tweets = data.get("tweets", [])
+                if tweets:
+                    latest = tweets[0]
+                    tweet_id = str(latest.get("id_str") or latest.get("id"))
+                    tweet_text = latest.get("text", "").strip()
+        except Exception:
+            pass
+            
+        # Method 2: Fallback to RSS bridge if syndication failed
+        if not tweet_text:
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                response = requests.get(url, headers=headers, timeout=10)
-                
-                if response.status_code == 200:
-                    data = response.json()
+                res = requests.get(rss_bridge_url, headers=headers, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
                     if data.get("status") == "ok":
                         items = data.get("items", [])
                         if items:
                             latest = items[0]
-                            guid = latest.get("guid") or latest.get("link")
+                            tweet_id = str(latest.get("guid") or latest.get("link"))
                             tweet_text = latest.get("title", "").strip()
-                            
-                            if last_guid is None:
-                                last_guid = guid
-                                print(f"📌 Initialized with latest tweet GUID: {guid}", flush=True)
-                            elif guid != last_guid:
-                                last_guid = guid
-                                print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
-                                
-                                promo_code = tweet_text.split()[0] if tweet_text else ""
-                                
-                                for chat_id, creds in user_data.items():
-                                    token = creds.get("token")
-                                    cart_id = creds.get("cart_id")
-                                    if token and cart_id and promo_code:
-                                        print(f"🛒 Applying code '{promo_code}' to cart {cart_id}...", flush=True)
-                                        
-                                        api_url = "https://api.chowdeck.com/customer/cart/promo-code"
-                                        api_headers = {
-                                            "Authorization": f"Bearer {token}",
-                                            "Content-Type": "application/json",
-                                            "Accept": "application/json",
-                                            "Origin": "https://chowdeck.com",
-                                            "Referer": "https://chowdeck.com/"
-                                        }
-                                        payload = {
-                                            "code": promo_code,
-                                            "cart_id": int(cart_id)
-                                        }
-                                        
-                                        try:
-                                            api_res = requests.post(api_url, headers=api_headers, json=payload, timeout=10)
-                                            print(f"📡 Chowdeck Response [{api_res.status_code}]: {api_res.text}", flush=True)
-                                            bot.send_message(
-                                                chat_id, 
-                                                f"🎯 Code: `{promo_code}`\nStatus: `{api_res.status_code}`\nResponse: `{api_res.text}`", 
-                                                parse_mode="Markdown"
-                                            )
-                                        except Exception as api_err:
-                                            print(f"❌ API Request Failed: {api_err}", flush=True)
-                        success = True
-                        break
             except Exception:
-                continue
-        
-        if not success:
-            print("⚠️ All RSS bridges failed or timed out this cycle.", flush=True)
+                pass
+
+        # Process tweet if found and new
+        if tweet_text and tweet_id:
+            if last_tweet_id is None:
+                last_tweet_id = tweet_id
+                print(f"📌 Initialized with latest tweet ID: {tweet_id}", flush=True)
+            elif tweet_id != last_tweet_id:
+                last_tweet_id = tweet_id
+                print(f"🚨 New Tweet Detected: {tweet_text}", flush=True)
+                
+                promo_code = tweet_text.split()[0] if tweet_text else ""
+                
+                for chat_id, creds in user_data.items():
+                    token = creds.get("token")
+                    cart_id = creds.get("cart_id")
+                    if token and cart_id and promo_code:
+                        print(f"🛒 Applying code '{promo_code}' to cart {cart_id}...", flush=True)
+                        
+                        api_url = "https://api.chowdeck.com/customer/cart/promo-code"
+                        api_headers = {
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                            "Origin": "https://chowdeck.com",
+                            "Referer": "https://chowdeck.com/"
+                        }
+                        payload = {
+                            "code": promo_code,
+                            "cart_id": int(cart_id)
+                        }
+                        
+                        try:
+                            api_res = requests.post(api_url, headers=api_headers, json=payload, timeout=10)
+                            print(f"📡 Chowdeck Response [{api_res.status_code}]: {api_res.text}", flush=True)
+                            bot.send_message(
+                                chat_id, 
+                                f"🎯 Code: `{promo_code}`\nStatus: `{api_res.status_code}`\nResponse: `{api_res.text}`", 
+                                parse_mode="Markdown"
+                            )
+                        except Exception as api_err:
+                            print(f"❌ API Request Failed: {api_err}", flush=True)
+        else:
+            print("⚠️ All Twitter fetch methods timed out this cycle. Retrying...", flush=True)
             
         time.sleep(15)
 
