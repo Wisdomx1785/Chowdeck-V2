@@ -15,18 +15,19 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.dirname(os.path.abspath(__file__)))
 
-TOKEN_FILE = os.path.join(DATA_DIR, "tokens.json")
-CART_FILE = os.path.join(DATA_DIR, "cart.json")
-COOKIE_FILE = os.path.join(DATA_DIR, "cookies_db.json")
-ANSWER_FILE = os.path.join(DATA_DIR, "answers.json")
+TOKENS_FILE = os.path.join(DATA_DIR, "tokens_multi.json")
+CARTS_FILE = os.path.join(DATA_DIR, "carts_multi.json")
+ANSWER_FILE = os.path.join(DATA_DIR, "answers_multi.json")
+MODE_FILE = os.path.join(DATA_DIR, "bot_modes.json")
 CLAIMED_FILE = os.path.join(DATA_DIR, "claimed.json")
 STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
-LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts.json")
+LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts_multi.json")
+ACTIVE_SLOT_FILE = os.path.join(DATA_DIR, "active_slots.json")
+PENDING_PROMPT_FILE = os.path.join(DATA_DIR, "pending_prompts.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
 loop_ref = None
-last_failed_code_map = {}
 
 def load_json(file_path):
     if os.path.exists(file_path):
@@ -53,7 +54,25 @@ def get_bot_active():
 def set_bot_active(val):
     save_json(STATE_FILE, {"active": val})
 
-def parse_and_store_credentials(raw_input, chat_str):
+def get_user_mode(chat_str):
+    modes = load_json(MODE_FILE)
+    return modes.get(chat_str, "auto") # Default to auto mode, can be 'auto' or 'prompt'
+
+def set_user_mode(chat_str, mode):
+    modes = load_json(MODE_FILE)
+    modes[chat_str] = mode
+    save_json(MODE_FILE, modes)
+
+def get_active_slot(chat_str):
+    slots = load_json(ACTIVE_SLOT_FILE)
+    return str(slots.get(chat_str, "1"))
+
+def set_active_slot(chat_str, slot):
+    slots = load_json(ACTIVE_SLOT_FILE)
+    slots[chat_str] = str(slot)
+    save_json(ACTIVE_SLOT_FILE, slots)
+
+def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = raw_input.strip()
     extracted_token = cleaned
     extracted_cookies = {}
@@ -72,7 +91,7 @@ def parse_and_store_credentials(raw_input, chat_str):
                         if "token" in data:
                             extracted_token = data["token"]
         except Exception as e:
-            print(f"Cookie string parse error: {e}", flush=True)
+            print(f"Cookie parse error: {e}", flush=True)
 
     if cleaned.startswith("{") and "token" in cleaned:
         try:
@@ -85,15 +104,16 @@ def parse_and_store_credentials(raw_input, chat_str):
     if extracted_token.lower().startswith("bearer "):
         extracted_token = extracted_token[7:].strip()
 
-    tokens = load_json(TOKEN_FILE)
-    tokens[chat_str] = extracted_token
-    save_json(TOKEN_FILE, tokens)
-
-    if extracted_cookies:
-        cookie_db = load_json(COOKIE_FILE)
-        cookie_db[chat_str] = extracted_cookies
-        save_json(COOKIE_FILE, cookie_db)
-
+    # Multi-account storage structure: chat_str -> { slot_id: { token, cookies } }
+    tokens_db = load_json(TOKENS_FILE)
+    if chat_str not in tokens_db:
+        tokens_db[chat_str] = {}
+    
+    tokens_db[chat_str][slot] = {
+        "token": extracted_token,
+        "cookies": extracted_cookies
+    }
+    save_json(TOKENS_FILE, tokens_db)
     return extracted_token
 
 def robust_clean_code(raw):
@@ -130,14 +150,18 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
 
-async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answers_db, lockouts, specific_answer=None):
+async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
     chat_str = str(chat_id)
+    slot_key = str(slot_id)
     
-    lockout_expiry = lockouts.get(chat_str, 0)
-    if time.time() < lockout_expiry and not specific_answer:
-        print(f"🔒 User {chat_id} is temporarily locked out. Skipping.", flush=True)
-        return 429
+    lockout_key = f"{chat_str}_{slot_key}"
+    if time.time() < lockouts_db.get(lockout_key, 0) and not specific_answer:
+        print(f"🔒 Account Slot {slot_key} for User {chat_id} is locked out. Skipping.", flush=True)
+        return {"slot": slot_key, "status": 429, "message": "locked out"}
 
+    token = token_data.get("token")
+    user_cookies = token_data.get("cookies", {})
+    
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -152,81 +176,94 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
     }
     
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    print(f"📤 Firing request for code '{code}' (User {chat_id})...", flush=True)
+    print(f"📤 Firing request for code '{code}' (Slot {slot_key}, User {chat_id})...", flush=True)
     
     try:
-        if specific_answer:
-            print(f"⚡ Instant retry override with answer: '{specific_answer}'", flush=True)
-            payload_data = {"code": code, "answer": specific_answer, "security_answer": specific_answer}
-            claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-            )
-        else:
-            user_answers = answers_db.get(chat_str, ["Ismail"])
-            if isinstance(user_answers, str):
-                user_answers = [user_answers]
+        user_answers = answers_db.get(chat_str, {}).get("master", ["Ismail"])
+        if isinstance(user_answers, str):
+            user_answers = [user_answers]
             
-            primary_ans = user_answers[0]
-            print(f"⚡ Trying claim with primary answer: '{primary_ans}'", flush=True)
-            payload_data = {"code": code, "answer": primary_ans, "security_answer": primary_ans}
-            claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-            )
-            
-            success_cleared = (claim_res.status_code == 200)
+        # Check for slot-specific override
+        slot_answers = answers_db.get(chat_str, {}).get(slot_key)
+        if slot_answers:
+            user_answers = slot_answers
 
-            if not success_cleared:
-                try:
-                    res_data = claim_res.json()
-                    msg_text = res_data.get("message", "").lower()
-                    print(f"⚠️ Primary answer rejected. Response: {res_data}", flush=True)
-                    
-                    if "too many failed" in msg_text:
-                        lockouts[chat_str] = time.time() + 900
-                        save_json(LOCKOUT_FILE, lockouts)
-                    elif not any(dead in msg_text for dead in ["does not exist", "expired", "already claimed"]):
-                        for ans in user_answers[1:3]:
-                            payload_data = {"code": code, "answer": ans, "security_answer": ans}
-                            claim_res = await asyncio.to_thread(
-                                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-                            )
-                            if claim_res.status_code == 200:
-                                success_cleared = True
-                                break
-                            await asyncio.sleep(0.05)
-                except Exception as e:
-                    print(f"⚠️ Challenge eval error: {e}", flush=True)
-
-        print(f"📥 User {chat_id} Status [{claim_res.status_code}]: {claim_res.text}", flush=True)
-        msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
+        ans_to_use = specific_answer if specific_answer else user_answers[0]
+        payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
         
-        user_cart = carts.get(chat_str)
-        if user_cart and user_cart.get("cart_id") and claim_res.status_code == 200:
-            payload = {
-                "cart_id": user_cart.get("cart_id"),
+        claim_res = await asyncio.to_thread(
+            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
+        )
+        
+        success_cleared = (claim_res.status_code == 200)
+        res_json = {}
+        try:
+            res_json = claim_res.json()
+        except Exception:
+            pass
+            
+        msg_text = res_json.get("message", "").lower()
+        
+        # Auto mode fallback through secondary answers if primary fails and not using specific override
+        if not success_cleared and not specific_answer:
+            if "too many failed" in msg_text:
+                lockouts_db[lockout_key] = time.time() + 900
+                save_json(LOCKOUT_FILE, lockouts_db)
+            elif "security question" in msg_text or claim_res.status_code == 400:
+                # Check if prompt mode is active
+                if get_user_mode(chat_str) == "prompt" and "security_question" in res_json.get("data", {}):
+                    q_text = res_json["data"]["security_question"]
+                    return {
+                        "slot": slot_key, 
+                        "status": claim_res.status_code, 
+                        "needs_prompt": True, 
+                        "question": q_text, 
+                        "response": res_json
+                    }
+                
+                # Otherwise cycle through pre-configured fallback answers
+                for ans in user_answers[1:3]:
+                    payload_data = {"code": code, "answer": ans, "security_answer": ans}
+                    claim_res = await asyncio.to_thread(
+                        execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
+                    )
+                    if claim_res.status_code == 200:
+                        success_cleared = True
+                        res_json = claim_res.json()
+                        break
+                    await asyncio.sleep(0.05)
+
+        print(f"📥 Slot {slot_key} Status [{claim_res.status_code}]: {claim_res.text}", flush=True)
+        
+        # Apply voucher to cart if successful
+        cart_info = carts_db.get(chat_str, {}).get(slot_key, {})
+        cart_id = cart_info.get("cart_id")
+        vendor_id = cart_info.get("vendor_id")
+        
+        cart_status_str = ""
+        if cart_id and claim_res.status_code == 200:
+            apply_payload = {
+                "cart_id": cart_id,
                 "promo_codes": [code]
             }
+            if vendor_id:
+                apply_payload["vendor_id"] = vendor_id
+                
             apply_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, payload
+                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, apply_payload
             )
-            msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
-        
-        if claim_res.status_code != 200 and not specific_answer:
-            last_failed_code_map[chat_str] = code
-            alert_text = (
-                f"🚨 *Security Failed for `{code}`!*\n"
-                f"Status: `{claim_res.status_code}`\n"
-                f"Response: `{claim_res.text}`\n\n"
-                f"⚠️ *Type the correct answer right here* to instantly save it and auto-retry!"
-            )
-            await send_telegram(chat_id, alert_text)
-        else:
-            await send_telegram(chat_id, msg)
-            
-        return claim_res.status_code
+            cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
+
+        return {
+            "slot": slot_key,
+            "status": claim_res.status_code,
+            "response": res_json,
+            "cart_str": cart_status_str,
+            "needs_prompt": False
+        }
     except Exception as e:
-        print(f"❌ Error for user {chat_id}: {e}", flush=True)
-        return 500
+        print(f"❌ Error in slot {slot_key} for user {chat_id}: {e}", flush=True)
+        return {"slot": slot_key, "status": 500, "message": str(e)}
 
 async def claim_code(raw_code):
     code = robust_clean_code(raw_code)
@@ -238,20 +275,50 @@ async def claim_code(raw_code):
         print(f"⏩ Skipping '{code}': Already attempted/claimed previously.", flush=True)
         return
 
-    tokens = load_json(TOKEN_FILE)
-    carts = load_json(CART_FILE)
-    cookie_db = load_json(COOKIE_FILE)
+    tokens_db = load_json(TOKENS_FILE)
+    carts_db = load_json(CARTS_FILE)
     answers_db = load_json(ANSWER_FILE)
-    lockouts = load_json(LOCKOUT_FILE)
+    lockouts_db = load_json(LOCKOUT_FILE)
     
-    if not tokens:
+    if not tokens_db:
         return
     
-    tasks = [
-        claim_for_single_user(chat_id, token, code, cookie_db.get(str(chat_id), {}), carts, answers_db, lockouts)
-        for chat_id, token in tokens.items()
-    ]
-    await asyncio.gather(*tasks)
+    for chat_str, user_slots in tokens_db.items():
+        if not user_slots:
+            continue
+            
+        print(f"🚀 Blasting code {code} across {len(user_slots)} accounts for user {chat_str}...", flush=True)
+        
+        tasks = [
+            claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
+                              carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
+            for slot_id, t_data in user_slots.items()
+        ]
+        
+        results = await asyncio.gather(*tasks)
+        
+        for res in results:
+            slot = res["slot"]
+            status = res["status"]
+            resp_data = res.get("response", {})
+            cart_suffix = res.get("cart_str", "")
+            
+            if res.get("needs_prompt"):
+                q_text = res["question"]
+                # Save pending prompt context
+                pending = load_json(PENDING_PROMPT_FILE)
+                pending[chat_str] = {"code": code, "slot": slot}
+                save_json(PENDING_PROMPT_FILE, pending)
+                
+                prompt_msg = (
+                    f"🔒 *Security Question Detected for `{code}` (Slot {slot})!*\n"
+                    f"Question: *\"{q_text}\"*\n\n"
+                    f"⚡ *Type the answer right here in chat* to instantly broadcast it to all your accounts!"
+                )
+                await send_telegram(chat_id=int(chat_str), text=prompt_msg)
+            else:
+                summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+                await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
 async def worker():
     while True:
@@ -349,28 +416,28 @@ async def telegram_poller():
                             is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                             
                             if data_action == "btn_status":
-                                tokens = load_json(TOKEN_FILE)
-                                carts = load_json(CART_FILE)
-                                answers = load_json(ANSWER_FILE)
-                                has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
-                                has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
-                                user_ans = answers.get(chat_str, ["Ismail"])
-                                bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                active_s = get_active_slot(chat_str)
+                                user_m = get_user_mode(chat_str)
+                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 
                                 status_msg = (
-                                    f"📊 *Live Status*\n\n"
-                                    f"• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n• State: {bot_status}"
+                                    f"📊 *Portfolio Status*\n\n"
+                                    f"• Active Slot: `Slot {active_s}`\n"
+                                    f"• Configured Accounts: `{len(tokens_db)} / 5`\n"
+                                    f"• Sniper Mode: `{user_m.upper()}`\n"
+                                    f"• Master Answer: `{', '.join(answers)}`"
                                 )
                                 await answer_callback_query(cq_id, "Status refreshed!")
                                 await send_telegram(chat_id, status_msg)
                             elif data_action == "btn_guide":
                                 guide_msg = (
-                                    "📖 *Quick User Guide*\n\n"
-                                    "1️⃣ *Link Token:*\n`/settoken <your_token>`\n\n"
-                                    "2️⃣ *Set Cart ID:*\n`/setcart YOUR_CART_ID`\n\n"
-                                    "3️⃣ *Security Answers (Up to 3):*\n`/setanswer word1, word2, word3`\n\n"
-                                    "🚨 *Emergency Override:*\n"
-                                    "If security fails on a drop, just type the answer directly!"
+                                    "📖 *Multi-Account Sniper Guide*\n\n"
+                                    "1️⃣ *Switch Slot (1-5):*\n`/acc <1-5>`\n\n"
+                                    "2️⃣ *Link Token to Active Slot:*\n`/settoken <token>`\n\n"
+                                    "3️⃣ *Set Cart ID & Vendor ID:*\n`/setcart <cart_id> <vendor_id>`\n\n"
+                                    "4️⃣ *Master Security Answer:*\n`/setanswer word1, word2, word3`\n\n"
+                                    "5️⃣ *Toggle Hybrid Mode:*\n`/mode auto` or `/mode prompt`"
                                 )
                                 await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
@@ -398,90 +465,118 @@ async def telegram_poller():
                         
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+                        active_slot = get_active_slot(chat_str)
 
-                        target_code = None
-                        reply_to = msg.get("reply_to_message")
-                        if reply_to and "Security Failed" in reply_to.get("text", ""):
-                            match_code = re.search(r'`([A-Z0-9]+)`', reply_to.get("text", ""))
-                            if match_code:
-                                target_code = match_code.group(1)
-                        elif chat_str in last_failed_code_map and not text.startswith("/"):
-                            target_code = last_failed_code_map.pop(chat_str, None)
-
-                        if target_code:
-                            new_ans = text
-                            if new_ans:
-                                answers = load_json(ANSWER_FILE)
-                                current_list = answers.get(chat_str, ["Ismail"])
-                                if isinstance(current_list, str):
-                                    current_list = [current_list]
-                                if new_ans not in current_list:
-                                    current_list.insert(0, new_ans)
-                                answers[chat_str] = current_list[:3]
-                                save_json(ANSWER_FILE, answers)
+                        # Check if user is replying to an interactive prompt
+                        pending_prompts = load_json(PENDING_PROMPT_FILE)
+                        if chat_str in pending_prompts and not text.startswith("/"):
+                            prompt_data = pending_prompts.pop(chat_str, None)
+                            save_json(PENDING_PROMPT_FILE, pending_prompts)
+                            
+                            if prompt_data:
+                                target_code = prompt_data["code"]
+                                user_ans = text
                                 
-                                await send_telegram(chat_id, f"⚡ *Override Saved!* Re-firing claim instantly for `{target_code}` with answer `{new_ans}`...")
+                                # Update master answer so it's remembered
+                                answers_db = load_json(ANSWER_FILE)
+                                if chat_str not in answers_db:
+                                    answers_db[chat_str] = {}
+                                answers_db[chat_str]["master"] = [user_ans]
+                                save_json(ANSWER_FILE, answers_db)
                                 
-                                tokens = load_json(TOKEN_FILE)
-                                carts = load_json(CART_FILE)
-                                cookie_db = load_json(COOKIE_FILE)
-                                lockouts = load_json(LOCKOUT_FILE)
+                                await send_telegram(chat_id, f"⚡ *Prompt Answer Captured!* Blasting `{user_ans}` across all accounts simultaneously for `{target_code}`...")
                                 
-                                if chat_str in tokens:
-                                    await claim_for_single_user(
-                                        chat_id, tokens[chat_str], target_code, 
-                                        cookie_db.get(chat_str, {}), carts, answers, lockouts, specific_answer=new_ans
-                                    )
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                carts_db = load_json(CARTS_FILE)
+                                lockouts_db = load_json(LOCKOUT_FILE)
+                                
+                                if tokens_db:
+                                    tasks = [
+                                        claim_slot_worker(chat_id=chat_id, slot_id=s_id, token_data=t_data, code=target_code,
+                                                          carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=user_ans)
+                                        for s_id, t_data in tokens_db.items()
+                                    ]
+                                    results = await asyncio.gather(*tasks)
+                                    for res in results:
+                                        s_id = res["slot"]
+                                        st = res["status"]
+                                        rp = res.get("response", {})
+                                        cs = res.get("cart_str", "")
+                                        await send_telegram(chat_id, f"🎯 *Slot {s_id} Broadcast Result*\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}")
                                 continue
 
                         if text.startswith("/start"):
-                            tokens = load_json(TOKEN_FILE)
-                            carts = load_json(CART_FILE)
-                            answers = load_json(ANSWER_FILE)
-                            has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
-                            has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
-                            user_ans = answers.get(chat_str, ["Ismail"])
+                            tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                            user_m = get_user_mode(chat_str)
+                            answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                             
                             help_text = (
-                                "🤖 *Chowdeck Sniper Pro Active!*\n\n"
-                                f"Status:\n• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n\n"
+                                "🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                f"• Active Slot: `Slot {active_slot}`\n"
+                                f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                f"• Mode: `{user_m.upper()}`\n"
+                                f"• Master Answer: `{', '.join(answers)}`\n\n"
                                 "Select an option below:"
                             )
                             
                             keyboard_buttons = [
                                 [
-                                    {"text": "🔄 Refresh Status", "callback_data": "btn_status"},
-                                    {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
+                                    {"text": "🔄 Status", "callback_data": "btn_status"},
+                                    {"text": "📖 Guide", "callback_data": "btn_guide"}
                                 ]
                             ]
                             if is_admin:
                                 keyboard_buttons.append([
-                                    {"text": "⏸️ Pause Bridge", "callback_data": "btn_pause"},
-                                    {"text": "▶️ Resume Bridge", "callback_data": "btn_resume"}
+                                    {"text": "⏸️ Pause", "callback_data": "btn_pause"},
+                                    {"text": "▶️ Resume", "callback_data": "btn_resume"}
                                 ])
                                 
                             reply_markup = {"inline_keyboard": keyboard_buttons}
                             await send_telegram(chat_id, help_text, reply_markup=reply_markup)
+                        elif text.startswith("/acc"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1 and parts[1].strip() in ["1", "2", "3", "4", "5"]:
+                                set_active_slot(chat_str, parts[1].strip())
+                                await send_telegram(chat_id, f"✅ Switched active configuration context to *Slot {parts[1].strip()}*.")
+                            else:
+                                await send_telegram(chat_id, f"📌 Current Active Slot: *Slot {active_slot}*\nUse `/acc <1-5>` to switch.")
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                parse_and_store_credentials(parts[1], chat_str)
-                                await send_telegram(chat_id, "✅ Token & session cookies saved.")
+                                parse_and_store_credentials(parts[1], chat_str, active_slot)
+                                await send_telegram(chat_id, f"✅ Token & session cookies saved to *Slot {active_slot}*.")
                         elif text.startswith("/setcart"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                carts = load_json(CART_FILE)
-                                carts[chat_str] = {"cart_id": parts[1].strip()}
-                                save_json(CART_FILE, carts)
-                                await send_telegram(chat_id, "✅ Cart ID saved.")
+                                subparts = parts[1].strip().split()
+                                c_id = subparts[0]
+                                v_id = subparts[1] if len(subparts) > 1 else None
+                                
+                                carts_db = load_json(CARTS_FILE)
+                                if chat_str not in carts_db:
+                                    carts_db[chat_str] = {}
+                                carts_db[chat_str][active_slot] = {"cart_id": c_id, "vendor_id": v_id}
+                                save_json(CARTS_FILE, carts_db)
+                                await send_telegram(chat_id, f"✅ Cart ID (`{c_id}`) & Vendor ID (`{v_id}`) saved to *Slot {active_slot}*.")
                         elif text.startswith("/setanswer"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
                                 ans_list = [a.strip() for a in re.split(r'[,|/]', parts[1]) if a.strip()][:3]
-                                answers = load_json(ANSWER_FILE)
-                                answers[chat_str] = ans_list
-                                save_json(ANSWER_FILE, answers)
-                                await send_telegram(chat_id, f"✅ Security Answers Saved: `{', '.join(ans_list)}`")
+                                answers_db = load_json(ANSWER_FILE)
+                                if chat_str not in answers_db:
+                                    answers_db[chat_str] = {}
+                                answers_db[chat_str]["master"] = ans_list
+                                save_json(ANSWER_FILE, answers_db)
+                                await send_telegram(chat_id, f"✅ Master Security Answers Saved (Applies to all 5 slots): `{', '.join(ans_list)}`")
+                        elif text.startswith("/mode"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1 and parts[1].strip().lower() in ["auto", "prompt"]:
+                                new_mode = parts[1].strip().lower()
+                                set_user_mode(chat_str, new_mode)
+                                await send_telegram(chat_id, f"✅ Sniper mode switched to: *{new_mode.upper()}*")
+                            else:
+                                current_m = get_user_mode(chat_str)
+                                await send_telegram(chat_id, f"📌 Current Mode: *{current_m.upper()}*\nUse `/mode auto` or `/mode prompt` to toggle.")
                         elif text.startswith("/pause") and is_admin:
                             set_bot_active(False)
                             await send_telegram(chat_id, "⏸️ Bridge Paused.")
