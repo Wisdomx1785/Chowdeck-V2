@@ -56,7 +56,7 @@ def set_bot_active(val):
 
 def get_user_mode(chat_str):
     modes = load_json(MODE_FILE)
-    return modes.get(chat_str, "auto") # Default to auto mode, can be 'auto' or 'prompt'
+    return modes.get(chat_str, "auto")
 
 def set_user_mode(chat_str, mode):
     modes = load_json(MODE_FILE)
@@ -104,7 +104,6 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     if extracted_token.lower().startswith("bearer "):
         extracted_token = extracted_token[7:].strip()
 
-    # Multi-account storage structure: chat_str -> { slot_id: { token, cookies } }
     tokens_db = load_json(TOKENS_FILE)
     if chat_str not in tokens_db:
         tokens_db[chat_str] = {}
@@ -150,13 +149,39 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
 
+def build_control_keyboard(chat_str, is_admin):
+    active_slot = get_active_slot(chat_str)
+    current_mode = get_user_mode(chat_str).upper()
+    
+    slot_row = []
+    for i in range(1, 6):
+        s_str = str(i)
+        label = f"📌 Slot {i}" if s_str == active_slot else f"{i}"
+        slot_row.append({"text": label, "callback_data": f"slot_{i}"})
+        
+    keyboard = [
+        slot_row,
+        [
+            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
+            {"text": "🔄 Refresh", "callback_data": "btn_status"}
+        ],
+        [
+            {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
+        ]
+    ]
+    if is_admin:
+        keyboard.append([
+            {"text": "⏸️ Pause", "callback_data": "btn_pause"},
+            {"text": "▶️ Resume", "callback_data": "btn_resume"}
+        ])
+    return {"inline_keyboard": keyboard}
+
 async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
     chat_str = str(chat_id)
     slot_key = str(slot_id)
     
     lockout_key = f"{chat_str}_{slot_key}"
     if time.time() < lockouts_db.get(lockout_key, 0) and not specific_answer:
-        print(f"🔒 Account Slot {slot_key} for User {chat_id} is locked out. Skipping.", flush=True)
         return {"slot": slot_key, "status": 429, "message": "locked out"}
 
     token = token_data.get("token")
@@ -176,14 +201,12 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
     }
     
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    print(f"📤 Firing request for code '{code}' (Slot {slot_key}, User {chat_id})...", flush=True)
     
     try:
         user_answers = answers_db.get(chat_str, {}).get("master", ["Ismail"])
         if isinstance(user_answers, str):
             user_answers = [user_answers]
             
-        # Check for slot-specific override
         slot_answers = answers_db.get(chat_str, {}).get(slot_key)
         if slot_answers:
             user_answers = slot_answers
@@ -204,13 +227,11 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             
         msg_text = res_json.get("message", "").lower()
         
-        # Auto mode fallback through secondary answers if primary fails and not using specific override
         if not success_cleared and not specific_answer:
             if "too many failed" in msg_text:
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
             elif "security question" in msg_text or claim_res.status_code == 400:
-                # Check if prompt mode is active
                 if get_user_mode(chat_str) == "prompt" and "security_question" in res_json.get("data", {}):
                     q_text = res_json["data"]["security_question"]
                     return {
@@ -221,7 +242,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
                         "response": res_json
                     }
                 
-                # Otherwise cycle through pre-configured fallback answers
                 for ans in user_answers[1:3]:
                     payload_data = {"code": code, "answer": ans, "security_answer": ans}
                     claim_res = await asyncio.to_thread(
@@ -233,9 +253,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
                         break
                     await asyncio.sleep(0.05)
 
-        print(f"📥 Slot {slot_key} Status [{claim_res.status_code}]: {claim_res.text}", flush=True)
-        
-        # Apply voucher to cart if successful
         cart_info = carts_db.get(chat_str, {}).get(slot_key, {})
         cart_id = cart_info.get("cart_id")
         vendor_id = cart_info.get("vendor_id")
@@ -262,7 +279,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             "needs_prompt": False
         }
     except Exception as e:
-        print(f"❌ Error in slot {slot_key} for user {chat_id}: {e}", flush=True)
         return {"slot": slot_key, "status": 500, "message": str(e)}
 
 async def claim_code(raw_code):
@@ -272,7 +288,6 @@ async def claim_code(raw_code):
 
     claimed_history = load_json(CLAIMED_FILE)
     if code in claimed_history:
-        print(f"⏩ Skipping '{code}': Already attempted/claimed previously.", flush=True)
         return
 
     tokens_db = load_json(TOKENS_FILE)
@@ -287,8 +302,6 @@ async def claim_code(raw_code):
         if not user_slots:
             continue
             
-        print(f"🚀 Blasting code {code} across {len(user_slots)} accounts for user {chat_str}...", flush=True)
-        
         tasks = [
             claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
                               carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
@@ -305,7 +318,6 @@ async def claim_code(raw_code):
             
             if res.get("needs_prompt"):
                 q_text = res["question"]
-                # Save pending prompt context
                 pending = load_json(PENDING_PROMPT_FILE)
                 pending[chat_str] = {"code": code, "slot": slot}
                 save_json(PENDING_PROMPT_FILE, pending)
@@ -334,13 +346,11 @@ async def worker():
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"Worker loop error: {e}", flush=True)
             await asyncio.sleep(2)
 
 async def process_text(text):
     if not text:
         return
-    print(f"Scanning text: {text}", flush=True)
     pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
     codes = re.findall(pattern, text)
     ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
@@ -352,7 +362,6 @@ async def process_text(text):
             valid.append(cleaned)
             
     for code in list(dict.fromkeys(valid)):
-        print(f"🚨 Queued Code: {code}", flush=True)
         await code_queue.put(code)
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -364,8 +373,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "online", "active": active}).encode('utf-8'))
-            except Exception as e:
-                print(f"Status check error: {e}", flush=True)
+            except Exception:
                 self.send_response(500)
                 self.end_headers()
         else:
@@ -383,8 +391,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
-        except Exception as e:
-            print(f"Webhook error: {e}", flush=True)
+        except Exception:
             self.send_response(400)
             self.end_headers()
 
@@ -411,11 +418,62 @@ async def telegram_poller():
                             cq = update["callback_query"]
                             cq_id = cq["id"]
                             chat_id = cq["message"]["chat"]["id"]
+                            msg_id = cq["message"]["message_id"]
                             data_action = cq["data"]
                             chat_str = str(chat_id)
                             is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                             
-                            if data_action == "btn_status":
+                            if data_action.startswith("slot_"):
+                                slot_num = data_action.split("_")[1]
+                                set_active_slot(chat_str, slot_num)
+                                await answer_callback_query(cq_id, f"Switched to Slot {slot_num}")
+                                
+                                # Refresh menu message inline
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                user_m = get_user_mode(chat_str)
+                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                updated_text = (
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"• Active Slot: `Slot {slot_num}`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                    f"• Mode: `{user_m.upper()}`\n"
+                                    f"• Master Answer: `{', '.join(answers)}`\n\n"
+                                    "Select an option below:"
+                                )
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": updated_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
+                            elif data_action == "btn_toggle_mode":
+                                current_m = get_user_mode(chat_str)
+                                new_m = "prompt" if current_m == "auto" else "auto"
+                                set_user_mode(chat_str, new_m)
+                                await answer_callback_query(cq_id, f"Mode switched to {new_m.upper()}")
+                                
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                active_s = get_active_slot(chat_str)
+                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                updated_text = (
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"• Active Slot: `Slot {active_s}`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                    f"• Mode: `{new_m.upper()}`\n"
+                                    f"• Master Answer: `{', '.join(answers)}`\n\n"
+                                    "Select an option below:"
+                                )
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": updated_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
+                            elif data_action == "btn_status":
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
                                 user_m = get_user_mode(chat_str)
@@ -433,25 +491,21 @@ async def telegram_poller():
                             elif data_action == "btn_guide":
                                 guide_msg = (
                                     "📖 *Multi-Account Sniper Guide*\n\n"
-                                    "1️⃣ *Switch Slot (1-5):*\n`/acc <1-5>`\n\n"
+                                    "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 5` on the keyboard below.\n\n"
                                     "2️⃣ *Link Token to Active Slot:*\n`/settoken <token>`\n\n"
                                     "3️⃣ *Set Cart ID & Vendor ID:*\n`/setcart <cart_id> <vendor_id>`\n\n"
                                     "4️⃣ *Master Security Answer:*\n`/setanswer word1, word2, word3`\n\n"
-                                    "5️⃣ *Toggle Hybrid Mode:*\n`/mode auto` or `/mode prompt`"
+                                    "5️⃣ *Toggle Mode:*\nTap the `⚙️ Mode` button on the keyboard!"
                                 )
                                 await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
                             elif data_action == "btn_pause":
-                                if not is_admin:
-                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
-                                else:
+                                if is_admin:
                                     set_bot_active(False)
                                     await answer_callback_query(cq_id, "Bridge Paused!")
                                     await send_telegram(chat_id, "⏸️ *Bridge Paused* via inline button.")
                             elif data_action == "btn_resume":
-                                if not is_admin:
-                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
-                                else:
+                                if is_admin:
                                     set_bot_active(True)
                                     await answer_callback_query(cq_id, "Bridge Resumed!")
                                     await send_telegram(chat_id, "▶️ *Bridge Resumed* via inline button.")
@@ -467,7 +521,6 @@ async def telegram_poller():
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                         active_slot = get_active_slot(chat_str)
 
-                        # Check if user is replying to an interactive prompt
                         pending_prompts = load_json(PENDING_PROMPT_FILE)
                         if chat_str in pending_prompts and not text.startswith("/"):
                             prompt_data = pending_prompts.pop(chat_str, None)
@@ -477,7 +530,6 @@ async def telegram_poller():
                                 target_code = prompt_data["code"]
                                 user_ans = text
                                 
-                                # Update master answer so it's remembered
                                 answers_db = load_json(ANSWER_FILE)
                                 if chat_str not in answers_db:
                                     answers_db[chat_str] = {}
@@ -518,28 +570,14 @@ async def telegram_poller():
                                 f"• Master Answer: `{', '.join(answers)}`\n\n"
                                 "Select an option below:"
                             )
-                            
-                            keyboard_buttons = [
-                                [
-                                    {"text": "🔄 Status", "callback_data": "btn_status"},
-                                    {"text": "📖 Guide", "callback_data": "btn_guide"}
-                                ]
-                            ]
-                            if is_admin:
-                                keyboard_buttons.append([
-                                    {"text": "⏸️ Pause", "callback_data": "btn_pause"},
-                                    {"text": "▶️ Resume", "callback_data": "btn_resume"}
-                                ])
-                                
-                            reply_markup = {"inline_keyboard": keyboard_buttons}
-                            await send_telegram(chat_id, help_text, reply_markup=reply_markup)
+                            await send_telegram(chat_id, help_text, reply_markup=build_control_keyboard(chat_str, is_admin))
                         elif text.startswith("/acc"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1 and parts[1].strip() in ["1", "2", "3", "4", "5"]:
                                 set_active_slot(chat_str, parts[1].strip())
-                                await send_telegram(chat_id, f"✅ Switched active configuration context to *Slot {parts[1].strip()}*.")
+                                await send_telegram(chat_id, f"✅ Switched to *Slot {parts[1].strip()}*.", reply_markup=build_control_keyboard(chat_str, is_admin))
                             else:
-                                await send_telegram(chat_id, f"📌 Current Active Slot: *Slot {active_slot}*\nUse `/acc <1-5>` to switch.")
+                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-5>` or tap buttons above.")
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
@@ -567,16 +605,16 @@ async def telegram_poller():
                                     answers_db[chat_str] = {}
                                 answers_db[chat_str]["master"] = ans_list
                                 save_json(ANSWER_FILE, answers_db)
-                                await send_telegram(chat_id, f"✅ Master Security Answers Saved (Applies to all 5 slots): `{', '.join(ans_list)}`")
+                                await send_telegram(chat_id, f"✅ Master Security Answers Saved (All 5 slots): `{', '.join(ans_list)}`")
                         elif text.startswith("/mode"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1 and parts[1].strip().lower() in ["auto", "prompt"]:
                                 new_mode = parts[1].strip().lower()
                                 set_user_mode(chat_str, new_mode)
-                                await send_telegram(chat_id, f"✅ Sniper mode switched to: *{new_mode.upper()}*")
+                                await send_telegram(chat_id, f"✅ Mode switched to: *{new_mode.upper()}*", reply_markup=build_control_keyboard(chat_str, is_admin))
                             else:
                                 current_m = get_user_mode(chat_str)
-                                await send_telegram(chat_id, f"📌 Current Mode: *{current_m.upper()}*\nUse `/mode auto` or `/mode prompt` to toggle.")
+                                await send_telegram(chat_id, f"📌 Current Mode: *{current_m.upper()}*")
                         elif text.startswith("/pause") and is_admin:
                             set_bot_active(False)
                             await send_telegram(chat_id, "⏸️ Bridge Paused.")
