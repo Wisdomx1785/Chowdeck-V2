@@ -13,13 +13,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
-CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
-ANSWER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "answers.json")
-CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
-LOCKOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lockouts.json")
+# Persistent Storage Directory (Supports Railway Volumes or Local Fallback)
+DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.dirname(os.path.abspath(__file__)))
+
+TOKEN_FILE = os.path.join(DATA_DIR, "tokens.json")
+CART_FILE = os.path.join(DATA_DIR, "cart.json")
+COOKIE_FILE = os.path.join(DATA_DIR, "cookies_db.json")
+ANSWER_FILE = os.path.join(DATA_DIR, "answers.json")
+CLAIMED_FILE = os.path.join(DATA_DIR, "claimed.json")
+STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
+LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -37,6 +40,7 @@ def load_json(file_path):
 
 def save_json(file_path, data):
     try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
@@ -325,7 +329,6 @@ async def telegram_poller():
                     for update in res.json().get("result", []):
                         last_update_id = update["update_id"]
                         
-                        # Handle Inline Keyboard Button Clicks (Callback Queries)
                         if "callback_query" in update:
                             cq = update["callback_query"]
                             cq_id = cq["id"]
@@ -349,6 +352,17 @@ async def telegram_poller():
                                 )
                                 await answer_callback_query(cq_id, "Status refreshed!")
                                 await send_telegram(chat_id, status_msg)
+                            elif data_action == "btn_guide":
+                                guide_msg = (
+                                    "📖 *Quick User Guide*\n\n"
+                                    "1️⃣ *Link Token:*\n`/settoken <your_token>`\n\n"
+                                    "2️⃣ *Set Cart ID:*\n`/setcart YOUR_CART_ID`\n\n"
+                                    "3️⃣ *Security Answers (Up to 3):*\n`/setanswer word1, word2, word3`\n\n"
+                                    "🚨 *Emergency Override:*\n"
+                                    "If security fails on a drop, **reply directly** to the failure alert with the correct word to instantly save & auto-retry!"
+                                )
+                                await answer_callback_query(cq_id, "Opening guide...")
+                                await send_telegram(chat_id, guide_msg)
                             elif data_action == "btn_pause":
                                 if not is_admin:
                                     await answer_callback_query(cq_id, "⛔ Unauthorized!")
@@ -374,7 +388,6 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
 
-                        # Handle Emergency Reply-to-Message Override + Immediate Retry
                         reply_to = msg.get("reply_to_message")
                         if reply_to and "Security Failed" in reply_to.get("text", ""):
                             new_ans = text
@@ -419,9 +432,11 @@ async def telegram_poller():
                                 "Select an option below:"
                             )
                             
-                            # Construct Inline Keyboard embedded inside the chat message bubble
                             keyboard_buttons = [
-                                [{"text": "🔄 Refresh Status", "callback_data": "btn_status"}]
+                                [
+                                    {"text": "🔄 Refresh Status", "callback_data": "btn_status"},
+                                    {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
+                                ]
                             ]
                             if is_admin:
                                 keyboard_buttons.append([
