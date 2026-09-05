@@ -72,6 +72,14 @@ def set_active_slot(chat_str, slot):
     slots[chat_str] = str(slot)
     save_json(ACTIVE_SLOT_FILE, slots)
 
+def get_admin_stats():
+    tokens_db = load_json(TOKENS_FILE)
+    carts_db = load_json(CARTS_FILE)
+    total_users = len(tokens_db)
+    total_slots_configured = sum(len(slots) for slots in tokens_db.values())
+    total_carts_configured = sum(len(carts) for carts in carts_db.values())
+    return total_users, total_slots_configured, total_carts_configured
+
 def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = raw_input.strip()
     extracted_token = cleaned
@@ -170,6 +178,7 @@ def build_control_keyboard(chat_str, is_admin):
         ]
     ]
     if is_admin:
+        keyboard.insert(2, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"}
@@ -428,7 +437,6 @@ async def telegram_poller():
                                 set_active_slot(chat_str, slot_num)
                                 await answer_callback_query(cq_id, f"Switched to Slot {slot_num}")
                                 
-                                # Refresh menu message inline
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 user_m = get_user_mode(chat_str)
                                 answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
@@ -473,6 +481,21 @@ async def telegram_poller():
                                     "parse_mode": "Markdown",
                                     "reply_markup": build_control_keyboard(chat_str, is_admin)
                                 })
+                            elif data_action == "btn_admin_stats":
+                                if not is_admin:
+                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
+                                else:
+                                    u_count, s_count, c_count = get_admin_stats()
+                                    bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
+                                    admin_text = (
+                                        f"🛡️ *Admin Control Panel*\n\n"
+                                        f"• Bot Status: {bot_status}\n"
+                                        f"• Total Unique Users: `{u_count}`\n"
+                                        f"• Total Configured Slots: `{s_count}`\n"
+                                        f"• Total Carts Linked: `{c_count}`"
+                                    )
+                                    await answer_callback_query(cq_id, "Admin stats loaded!")
+                                    await send_telegram(chat_id, admin_text)
                             elif data_action == "btn_status":
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
@@ -571,6 +594,17 @@ async def telegram_poller():
                                 "Select an option below:"
                             )
                             await send_telegram(chat_id, help_text, reply_markup=build_control_keyboard(chat_str, is_admin))
+                        elif text.startswith("/admin") and is_admin:
+                            u_count, s_count, c_count = get_admin_stats()
+                            bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
+                            admin_text = (
+                                f"🛡️ *Admin Control Panel*\n\n"
+                                f"• Bot Status: {bot_status}\n"
+                                f"• Total Unique Users: `{u_count}`\n"
+                                f"• Total Configured Slots: `{s_count}`\n"
+                                f"• Total Carts Linked: `{c_count}`"
+                            )
+                            await send_telegram(chat_id, admin_text, reply_markup=build_control_keyboard(chat_str, is_admin))
                         elif text.startswith("/acc"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1 and parts[1].strip() in ["1", "2", "3", "4", "5"]:
