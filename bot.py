@@ -13,7 +13,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# Persistent Storage Directory (Supports Railway Volumes or Local Fallback)
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.dirname(os.path.abspath(__file__)))
 
 TOKEN_FILE = os.path.join(DATA_DIR, "tokens.json")
@@ -27,6 +26,7 @@ LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts.json")
 last_update_id = 0
 code_queue = asyncio.Queue()
 loop_ref = None
+last_failed_code_map = {}
 
 def load_json(file_path):
     if os.path.exists(file_path):
@@ -53,19 +53,24 @@ def get_bot_active():
 def set_bot_active(val):
     save_json(STATE_FILE, {"active": val})
 
-def sanitize_token(raw_input):
+def parse_and_store_credentials(raw_input, chat_str):
     cleaned = raw_input.strip()
-    if "user=" in cleaned:
+    extracted_token = cleaned
+    extracted_cookies = {}
+
+    if "user=" in cleaned or ";" in cleaned:
         try:
             parts = cleaned.split(";")
             for p in parts:
                 p = p.strip()
-                if p.startswith("user="):
-                    val = p[5:]
-                    decoded = urllib.parse.unquote(val)
-                    data = json.loads(decoded)
-                    if "token" in data:
-                        return data["token"]
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    extracted_cookies[k.strip()] = v.strip()
+                    if k.strip() == "user":
+                        decoded = urllib.parse.unquote(v.strip())
+                        data = json.loads(decoded)
+                        if "token" in data:
+                            extracted_token = data["token"]
         except Exception as e:
             print(f"Cookie string parse error: {e}", flush=True)
 
@@ -73,14 +78,23 @@ def sanitize_token(raw_input):
         try:
             data = json.loads(cleaned)
             if "token" in data:
-                cleaned = data["token"]
+                extracted_token = data["token"]
         except Exception:
             pass
             
-    if cleaned.lower().startswith("bearer "):
-        cleaned = cleaned[7:].strip()
-        
-    return cleaned
+    if extracted_token.lower().startswith("bearer "):
+        extracted_token = extracted_token[7:].strip()
+
+    tokens = load_json(TOKEN_FILE)
+    tokens[chat_str] = extracted_token
+    save_json(TOKEN_FILE, tokens)
+
+    if extracted_cookies:
+        cookie_db = load_json(COOKIE_FILE)
+        cookie_db[chat_str] = extracted_cookies
+        save_json(COOKIE_FILE, cookie_db)
+
+    return extracted_token
 
 def robust_clean_code(raw):
     if not raw:
@@ -124,9 +138,8 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
         print(f"🔒 User {chat_id} is temporarily locked out. Skipping.", flush=True)
         return 429
 
-    clean_token = sanitize_token(token)
     headers = {
-        "Authorization": f"Bearer {clean_token}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Origin": "https://chowdeck.com",
         "Referer": "https://chowdeck.com/",
@@ -144,49 +157,45 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
     try:
         if specific_answer:
             print(f"⚡ Instant retry override with answer: '{specific_answer}'", flush=True)
+            payload_data = {"code": code, "answer": specific_answer, "security_answer": specific_answer}
             claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": specific_answer}
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
             )
         else:
+            user_answers = answers_db.get(chat_str, ["Ismail"])
+            if isinstance(user_answers, str):
+                user_answers = [user_answers]
+            
+            primary_ans = user_answers[0]
+            print(f"⚡ Trying claim with primary answer: '{primary_ans}'", flush=True)
+            payload_data = {"code": code, "answer": primary_ans, "security_answer": primary_ans}
             claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
             )
-        
-        success_cleared = (claim_res.status_code == 200)
-        tried_answers = []
+            
+            success_cleared = (claim_res.status_code == 200)
 
-        if not success_cleared and not specific_answer:
-            try:
-                res_data = claim_res.json()
-                msg_text = res_data.get("message", "").lower()
-                
-                if "too many failed" in msg_text:
-                    lockouts[chat_str] = time.time() + 900
-                    save_json(LOCKOUT_FILE, lockouts)
-                elif not any(dead in msg_text for dead in ["does not exist", "expired", "already claimed"]):
-                    user_answers = answers_db.get(chat_str, ["Ismail"])
-                    if isinstance(user_answers, str):
-                        user_answers = [user_answers]
+            if not success_cleared:
+                try:
+                    res_data = claim_res.json()
+                    msg_text = res_data.get("message", "").lower()
+                    print(f"⚠️ Primary answer rejected. Response: {res_data}", flush=True)
                     
-                    for ans in user_answers[:3]:
-                        tried_answers.append(ans)
-                        claim_res = await asyncio.to_thread(
-                            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
-                        )
-                        try:
-                            if "too many failed" in claim_res.json().get("message", "").lower():
-                                lockouts[chat_str] = time.time() + 900
-                                save_json(LOCKOUT_FILE, lockouts)
+                    if "too many failed" in msg_text:
+                        lockouts[chat_str] = time.time() + 900
+                        save_json(LOCKOUT_FILE, lockouts)
+                    elif not any(dead in msg_text for dead in ["does not exist", "expired", "already claimed"]):
+                        for ans in user_answers[1:3]:
+                            payload_data = {"code": code, "answer": ans, "security_answer": ans}
+                            claim_res = await asyncio.to_thread(
+                                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
+                            )
+                            if claim_res.status_code == 200:
+                                success_cleared = True
                                 break
-                        except Exception:
-                            pass
-
-                        if claim_res.status_code == 200:
-                            success_cleared = True
-                            break
-                        await asyncio.sleep(0.05)
-            except Exception as e:
-                print(f"⚠️ Challenge eval error: {e}", flush=True)
+                            await asyncio.sleep(0.05)
+                except Exception as e:
+                    print(f"⚠️ Challenge eval error: {e}", flush=True)
 
         print(f"📥 User {chat_id} Status [{claim_res.status_code}]: {claim_res.text}", flush=True)
         msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
@@ -202,11 +211,13 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
             )
             msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
         
-        if not success_cleared and not specific_answer and tried_answers:
+        if claim_res.status_code != 200 and not specific_answer:
+            last_failed_code_map[chat_str] = code
             alert_text = (
                 f"🚨 *Security Failed for `{code}`!*\n"
-                f"Tried: `{', '.join(tried_answers)}`\n\n"
-                f"⚠️ *Reply directly to this message with the correct answer* to instantly save it and auto-retry!"
+                f"Status: `{claim_res.status_code}`\n"
+                f"Response: `{claim_res.text}`\n\n"
+                f"⚠️ *Type the correct answer right here* to instantly save it and auto-retry!"
             )
             await send_telegram(chat_id, alert_text)
         else:
@@ -359,7 +370,7 @@ async def telegram_poller():
                                     "2️⃣ *Set Cart ID:*\n`/setcart YOUR_CART_ID`\n\n"
                                     "3️⃣ *Security Answers (Up to 3):*\n`/setanswer word1, word2, word3`\n\n"
                                     "🚨 *Emergency Override:*\n"
-                                    "If security fails on a drop, **reply directly** to the failure alert with the correct word to instantly save & auto-retry!"
+                                    "If security fails on a drop, just type the answer directly!"
                                 )
                                 await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
@@ -388,8 +399,16 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
 
+                        target_code = None
                         reply_to = msg.get("reply_to_message")
                         if reply_to and "Security Failed" in reply_to.get("text", ""):
+                            match_code = re.search(r'`([A-Z0-9]+)`', reply_to.get("text", ""))
+                            if match_code:
+                                target_code = match_code.group(1)
+                        elif chat_str in last_failed_code_map and not text.startswith("/"):
+                            target_code = last_failed_code_map.pop(chat_str, None)
+
+                        if target_code:
                             new_ans = text
                             if new_ans:
                                 answers = load_json(ANSWER_FILE)
@@ -401,21 +420,18 @@ async def telegram_poller():
                                 answers[chat_str] = current_list[:3]
                                 save_json(ANSWER_FILE, answers)
                                 
-                                match_code = re.search(r'`([A-Z0-9]+)`', reply_to.get("text", ""))
-                                if match_code:
-                                    target_code = match_code.group(1)
-                                    await send_telegram(chat_id, f"⚡ *Override Saved!* Re-firing claim instantly for `{target_code}` with answer `{new_ans}`...")
-                                    
-                                    tokens = load_json(TOKEN_FILE)
-                                    carts = load_json(CART_FILE)
-                                    cookie_db = load_json(COOKIE_FILE)
-                                    lockouts = load_json(LOCKOUT_FILE)
-                                    
-                                    if chat_str in tokens:
-                                        await claim_for_single_user(
-                                            chat_id, tokens[chat_str], target_code, 
-                                            cookie_db.get(chat_str, {}), carts, answers, lockouts, specific_answer=new_ans
-                                        )
+                                await send_telegram(chat_id, f"⚡ *Override Saved!* Re-firing claim instantly for `{target_code}` with answer `{new_ans}`...")
+                                
+                                tokens = load_json(TOKEN_FILE)
+                                carts = load_json(CART_FILE)
+                                cookie_db = load_json(COOKIE_FILE)
+                                lockouts = load_json(LOCKOUT_FILE)
+                                
+                                if chat_str in tokens:
+                                    await claim_for_single_user(
+                                        chat_id, tokens[chat_str], target_code, 
+                                        cookie_db.get(chat_str, {}), carts, answers, lockouts, specific_answer=new_ans
+                                    )
                                 continue
 
                         if text.startswith("/start"):
@@ -449,10 +465,8 @@ async def telegram_poller():
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                tokens = load_json(TOKEN_FILE)
-                                tokens[chat_str] = sanitize_token(parts[1])
-                                save_json(TOKEN_FILE, tokens)
-                                await send_telegram(chat_id, "✅ Token saved.")
+                                parse_and_store_credentials(parts[1], chat_str)
+                                await send_telegram(chat_id, "✅ Token & session cookies saved.")
                         elif text.startswith("/setcart"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
