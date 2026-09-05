@@ -7,6 +7,7 @@ import urllib.parse
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
+import time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
@@ -15,8 +16,10 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 CART_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cart.json")
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies_db.json")
+ANSWER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "answers.json")
 CLAIMED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claimed.json")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
+LOCKOUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lockouts.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -48,8 +51,6 @@ def set_bot_active(val):
 
 def sanitize_token(raw_input):
     cleaned = raw_input.strip()
-    
-    # Handle raw document.cookie strings containing 'user='
     if "user=" in cleaned:
         try:
             parts = cleaned.split(";")
@@ -64,7 +65,6 @@ def sanitize_token(raw_input):
         except Exception as e:
             print(f"Cookie string parse error: {e}")
 
-    # Handle standard JSON input with a "token" key
     if cleaned.startswith("{") and "token" in cleaned:
         try:
             data = json.loads(cleaned)
@@ -85,13 +85,18 @@ def robust_clean_code(raw):
     cleaned = "".join(c for c in normalized if c.isalnum()).upper()
     return cleaned
 
-async def send_telegram(chat_id, text):
+async def send_telegram(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": int(chat_id), "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            await temp_client.post(url, json={"chat_id": int(chat_id), "text": text, "parse_mode": "Markdown"}, timeout=15.0)
+            res = await temp_client.post(url, json=payload, timeout=15.0)
+            return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram send error to {chat_id}: {e}")
+        return None
 
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
     with httpx.Client(timeout=15.0, proxy=PROXY_URL if PROXY_URL else None) as client:
@@ -99,7 +104,14 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
 
-async def claim_for_single_user(chat_id, token, code, user_cookies, carts):
+async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answers_db, lockouts, specific_answer=None):
+    chat_str = str(chat_id)
+    
+    lockout_expiry = lockouts.get(chat_str, 0)
+    if time.time() < lockout_expiry and not specific_answer:
+        print(f"🔒 User {chat_id} is temporarily locked out. Skipping.")
+        return 429
+
     clean_token = sanitize_token(token)
     headers = {
         "Authorization": f"Bearer {clean_token}",
@@ -115,29 +127,60 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts):
     }
     
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    print(f"📤 Firing parallel request for {code} (User {chat_id})...")
+    print(f"📤 Firing request for code '{code}' (User {chat_id})...")
     
     try:
-        claim_res = await asyncio.to_thread(
-            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
-        )
+        # If an emergency override answer was passed directly, try it instantly!
+        if specific_answer:
+            print(f"⚡ Instant retry override with answer: '{specific_answer}'")
+            claim_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": specific_answer}
+            )
+        else:
+            claim_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code}
+            )
         
-        if claim_res.status_code != 200:
-            CANDIDATE_ANSWERS = ["Ismail", "Chowstore", "Chowpass", "Chowstar", "Relay", "Chowmart"]
-            for ans in CANDIDATE_ANSWERS:
-                claim_res = await asyncio.to_thread(
-                    execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
-                )
-                if claim_res.status_code == 200:
-                    print(f"✅ User {chat_id} cleared security with answer: '{ans}'!")
-                    break
-                await asyncio.sleep(0.05)
+        success_cleared = (claim_res.status_code == 200)
+        tried_answers = []
 
-        print(f"📥 User {chat_id} Claim status [{claim_res.status_code}]: {claim_res.text}")
-        
+        if not success_cleared and not specific_answer:
+            try:
+                res_data = claim_res.json()
+                msg_text = res_data.get("message", "").lower()
+                
+                if "too many failed" in msg_text:
+                    lockouts[chat_str] = time.time() + 900
+                    save_json(LOCKOUT_FILE, lockouts)
+                elif not any(dead in msg_text for dead in ["does not exist", "expired", "already claimed"]):
+                    user_answers = answers_db.get(chat_str, ["Ismail"])
+                    if isinstance(user_answers, str):
+                        user_answers = [user_answers]
+                    
+                    for ans in user_answers[:3]:
+                        tried_answers.append(ans)
+                        claim_res = await asyncio.to_thread(
+                            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": ans}
+                        )
+                        try:
+                            if "too many failed" in claim_res.json().get("message", "").lower():
+                                lockouts[chat_str] = time.time() + 900
+                                save_json(LOCKOUT_FILE, lockouts)
+                                break
+                        except Exception:
+                            pass
+
+                        if claim_res.status_code == 200:
+                            success_cleared = True
+                            break
+                        await asyncio.sleep(0.05)
+            except Exception as e:
+                print(f"⚠️ Challenge eval error: {e}")
+
+        print(f"📥 User {chat_id} Status [{claim_res.status_code}]: {claim_res.text}")
         msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
         
-        user_cart = carts.get(str(chat_id))
+        user_cart = carts.get(chat_str)
         if user_cart and user_cart.get("cart_id") and claim_res.status_code == 200:
             payload = {
                 "cart_id": user_cart.get("cart_id"),
@@ -148,7 +191,16 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts):
             )
             msg += f"\nCart Apply Status: `{apply_res.status_code}`\nResponse: `{apply_res.text}`"
         
-        await send_telegram(chat_id, msg)
+        if not success_cleared and not specific_answer and tried_answers:
+            alert_text = (
+                f"🚨 *Security Failed for `{code}`!*\n"
+                f"Tried: `{', '.join(tried_answers)}`\n\n"
+                f"⚠️ *Reply directly to this message with the correct answer* to instantly save it and auto-retry!"
+            )
+            await send_telegram(chat_id, alert_text)
+        else:
+            await send_telegram(chat_id, msg)
+            
         return claim_res.status_code
     except Exception as e:
         print(f"❌ Error for user {chat_id}: {e}")
@@ -167,23 +219,17 @@ async def claim_code(raw_code):
     tokens = load_json(TOKEN_FILE)
     carts = load_json(CART_FILE)
     cookie_db = load_json(COOKIE_FILE)
+    answers_db = load_json(ANSWER_FILE)
+    lockouts = load_json(LOCKOUT_FILE)
     
     if not tokens:
-        print("❌ Database check: No user tokens registered yet.")
         return
     
-    print(f"🚀 Executing parallel broadcast for code '{code}' across {len(tokens)} user(s)...")
-    
     tasks = [
-        claim_for_single_user(chat_id, token, code, cookie_db.get(str(chat_id), {}), carts)
+        claim_for_single_user(chat_id, token, code, cookie_db.get(str(chat_id), {}), carts, answers_db, lockouts)
         for chat_id, token in tokens.items()
     ]
-    
-    results = await asyncio.gather(*tasks)
-    
-    if results:
-        claimed_history[code] = max(results)
-        save_json(CLAIMED_FILE, claimed_history)
+    await asyncio.gather(*tasks)
 
 async def worker():
     while True:
@@ -192,7 +238,7 @@ async def worker():
             try:
                 await claim_code(code)
             except Exception as e:
-                print(f"Worker execution error for {code}: {e}")
+                print(f"Worker error: {e}")
             finally:
                 code_queue.task_done()
                 await asyncio.sleep(2.5)
@@ -205,7 +251,6 @@ async def worker():
 async def process_text(text):
     if not text:
         return
-    print(f"Scanning text: {text}")
     pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
     codes = re.findall(pattern, text)
     ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
@@ -217,20 +262,17 @@ async def process_text(text):
             valid.append(cleaned)
             
     for code in list(dict.fromkeys(valid)):
-        print(f"🚨 Queued Code: {code}")
         await code_queue.put(code)
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             try:
-                active = get_bot_active()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"active": active}).encode('utf-8'))
-            except Exception as e:
-                print(f"Status check error: {e}")
+                self.wfile.write(json.dumps({"active": get_bot_active()}).encode('utf-8'))
+            except Exception:
                 self.send_response(500)
                 self.end_headers()
         else:
@@ -248,8 +290,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
-        except Exception as e:
-            print(f"Webhook error: {e}")
+        except Exception:
             self.send_response(400)
             self.end_headers()
 
@@ -257,9 +298,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return
 
 def run_http_server():
-    server = HTTPServer(('0.0.0.0', 8080), WebhookHandler)
-    print("🌐 Railway HTTP webhook server running on port 8080...")
-    server.serve_forever()
+    HTTPServer(('0.0.0.0', 8080), WebhookHandler).serve_forever()
 
 async def telegram_poller():
     global last_update_id
@@ -269,81 +308,143 @@ async def telegram_poller():
             try:
                 res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 30}, timeout=35.0)
                 if res.status_code == 200:
-                    data = res.json()
-                    for update in data.get("result", []):
+                    for update in res.json().get("result", []):
                         last_update_id = update["update_id"]
                         msg = update.get("message", {})
                         chat_id = msg.get("chat", {}).get("id")
-                        text = msg.get("text", "")
+                        text = msg.get("text", "").strip()
                         if not chat_id or not text:
                             continue
                         
+                        chat_str = str(chat_id)
+                        is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+                        
+                        # Handle persistent Reply Keyboard Clicks
+                        if text == "🔄 Refresh Status":
+                            tokens = load_json(TOKEN_FILE)
+                            carts = load_json(CART_FILE)
+                            answers = load_json(ANSWER_FILE)
+                            has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
+                            has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
+                            user_ans = answers.get(chat_str, ["Ismail"])
+                            
+                            status_msg = (
+                                f"📊 *Live Status*\n\n"
+                                f"• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n• State: {'🟢 Active' if get_bot_active() else '⏸️ Paused'}"
+                            )
+                            await send_telegram(chat_id, status_msg)
+                            continue
+                        elif text == "⏸️ Pause Bridge":
+                            if not is_admin:
+                                await send_telegram(chat_id, "⛔ *Unauthorized.*")
+                            else:
+                                set_bot_active(False)
+                                await send_telegram(chat_id, "⏸️ *Bridge Paused*")
+                            continue
+                        elif text == "▶️ Resume Bridge":
+                            if not is_admin:
+                                await send_telegram(chat_id, "⛔ *Unauthorized.*")
+                            else:
+                                set_bot_active(True)
+                                await send_telegram(chat_id, "▶️ *Bridge Resumed*")
+                            continue
+
+                        # Handle Emergency Reply-to-Message Override + Immediate Retry
+                        reply_to = msg.get("reply_to_message")
+                        if reply_to and "Security Failed" in reply_to.get("text", ""):
+                            new_ans = text
+                            if new_ans:
+                                answers = load_json(ANSWER_FILE)
+                                current_list = answers.get(chat_str, ["Ismail"])
+                                if isinstance(current_list, str):
+                                    current_list = [current_list]
+                                if new_ans not in current_list:
+                                    current_list.insert(0, new_ans)
+                                answers[chat_str] = current_list[:3]
+                                save_json(ANSWER_FILE, answers)
+                                
+                                # Extract target code from the replied message using regex backticks
+                                match_code = re.search(r'`([A-Z0-9]+)`', reply_to.get("text", ""))
+                                if match_code:
+                                    target_code = match_code.group(1)
+                                    await send_telegram(chat_id, f"⚡ *Override Saved!* Re-firing claim instantly for `{target_code}` with answer `{new_ans}`...")
+                                    
+                                    tokens = load_json(TOKEN_FILE)
+                                    carts = load_json(CART_FILE)
+                                    cookie_db = load_json(COOKIE_FILE)
+                                    lockouts = load_json(LOCKOUT_FILE)
+                                    
+                                    if chat_str in tokens:
+                                        await claim_for_single_user(
+                                            chat_id, tokens[chat_str], target_code, 
+                                            cookie_db.get(chat_str, {}), carts, answers, lockouts, specific_answer=new_ans
+                                        )
+                                continue
+
+                        # Command and standard routing
                         if text.startswith("/start"):
                             tokens = load_json(TOKEN_FILE)
                             carts = load_json(CART_FILE)
-                            has_token = "✅ Configured" if str(chat_id) in tokens else "❌ Not Set"
-                            has_cart = "✅ Configured" if str(chat_id) in carts else "❌ Not Set"
-                            bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
+                            answers = load_json(ANSWER_FILE)
+                            has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
+                            has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
+                            user_ans = answers.get(chat_str, ["Ismail"])
                             
                             help_text = (
-                                "🤖 *Chowdeck Sniper Active!*\n\n"
-                                f"Your Status:\n• Token: {has_token}\n• Cart: {has_cart}\n• Bridge State: {bot_status}\n\n"
-                                "1️⃣ Link token:\n`/settoken <token_or_json>`\n\n"
-                                "2️⃣ Set cart ID:\n`/setcart YOUR_CART_ID`"
+                                "🤖 *Chowdeck Sniper Pro Active!*\n\n"
+                                f"Status:\n• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n\n"
+                                "Use the persistent buttons below or send commands like `/setanswer`."
                             )
-                            if not ADMIN_CHAT_ID or str(chat_id) == ADMIN_CHAT_ID:
-                                help_text += (
-                                    "\n\n3️⃣ Control Termux Bridge:\n"
-                                    "• `/pause` - Pause Termux polling\n"
-                                    "• `/resume` - Resume Termux polling"
-                                )
-                            await send_telegram(chat_id, help_text)
+                            
+                            # Construct persistent Reply Keyboard layout
+                            keyboard_rows = [
+                                [{"text": "🔄 Refresh Status"}]
+                            ]
+                            if is_admin:
+                                keyboard_rows.append([{"text": "⏸️ Pause Bridge"}, {"text": "▶️ Resume Bridge"}])
+                                
+                            reply_markup = {"keyboard": keyboard_rows, "resize_keyboard": True}
+                            await send_telegram(chat_id, help_text, reply_markup=reply_markup)
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                clean_val = sanitize_token(parts[1])
                                 tokens = load_json(TOKEN_FILE)
-                                tokens[str(chat_id)] = clean_val
+                                tokens[chat_str] = sanitize_token(parts[1])
                                 save_json(TOKEN_FILE, tokens)
-                                await send_telegram(chat_id, "✅ *Success!* Token saved and sanitized.")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/settoken <token>`")
+                                await send_telegram(chat_id, "✅ Token saved.")
                         elif text.startswith("/setcart"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                cart_id = parts[1].strip()
                                 carts = load_json(CART_FILE)
-                                carts[str(chat_id)] = {"cart_id": cart_id}
+                                carts[chat_str] = {"cart_id": parts[1].strip()}
                                 save_json(CART_FILE, carts)
-                                await send_telegram(chat_id, f"✅ *Cart ID Saved:* `{cart_id}`")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/setcart <cart_id>`")
-                        elif text.startswith("/pause"):
-                            if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
-                                await send_telegram(chat_id, "⛔ *Unauthorized:* You do not have permission to control this bot.")
-                            else:
-                                set_bot_active(False)
-                                await send_telegram(chat_id, "⏸️ *Bridge Paused.* Termux polling is now sleeping to save credits.")
-                        elif text.startswith("/resume"):
-                            if ADMIN_CHAT_ID and str(chat_id) != ADMIN_CHAT_ID:
-                                await send_telegram(chat_id, "⛔ *Unauthorized:* You do not have permission to control this bot.")
-                            else:
-                                set_bot_active(True)
-                                await send_telegram(chat_id, "▶️ *Bridge Resumed.* Termux polling is active and watching.")
+                                await send_telegram(chat_id, "✅ Cart ID saved.")
+                        elif text.startswith("/setanswer"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                ans_list = [a.strip() for a in re.split(r'[,|/]', parts[1]) if a.strip()][:3]
+                                answers = load_json(ANSWER_FILE)
+                                answers[chat_str] = ans_list
+                                save_json(ANSWER_FILE, answers)
+                                await send_telegram(chat_id, f"✅ Security Answers Saved: `{', '.join(ans_list)}`")
+                        elif text.startswith("/pause") and is_admin:
+                            set_bot_active(False)
+                            await send_telegram(chat_id, "⏸️ Bridge Paused.")
+                        elif text.startswith("/resume") and is_admin:
+                            set_bot_active(True)
+                            await send_telegram(chat_id, "▶️ Bridge Resumed.")
                         else:
                             await process_text(text)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"Telegram poller error: {e}")
+                print(f"Poller error: {e}")
             await asyncio.sleep(2)
 
 async def main():
     global loop_ref
     loop_ref = asyncio.get_running_loop()
-    
     threading.Thread(target=run_http_server, daemon=True).start()
-    
     worker_task = asyncio.create_task(worker())
     try:
         await telegram_poller()
@@ -354,4 +455,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped gracefully.")
+        print("\n🛑 Stopped.")
