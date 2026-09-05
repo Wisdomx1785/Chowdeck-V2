@@ -31,7 +31,7 @@ def load_json(file_path):
             with open(file_path, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️ Error reading {file_path}: {e}")
+            print(f"⚠️ Error reading {file_path}: {e}", flush=True)
             return {}
     return {}
 
@@ -40,7 +40,7 @@ def save_json(file_path, data):
         with open(file_path, "w") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print(f"❌ Failed to save {file_path}: {e}")
+        print(f"❌ Failed to save {file_path}: {e}", flush=True)
 
 def get_bot_active():
     state = load_json(STATE_FILE)
@@ -63,7 +63,7 @@ def sanitize_token(raw_input):
                     if "token" in data:
                         return data["token"]
         except Exception as e:
-            print(f"Cookie string parse error: {e}")
+            print(f"Cookie string parse error: {e}", flush=True)
 
     if cleaned.startswith("{") and "token" in cleaned:
         try:
@@ -95,7 +95,7 @@ async def send_telegram(chat_id, text, reply_markup=None):
             res = await temp_client.post(url, json=payload, timeout=15.0)
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"Telegram send error to {chat_id}: {e}")
+        print(f"Telegram send error to {chat_id}: {e}", flush=True)
         return None
 
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
@@ -109,7 +109,7 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
     
     lockout_expiry = lockouts.get(chat_str, 0)
     if time.time() < lockout_expiry and not specific_answer:
-        print(f"🔒 User {chat_id} is temporarily locked out. Skipping.")
+        print(f"🔒 User {chat_id} is temporarily locked out. Skipping.", flush=True)
         return 429
 
     clean_token = sanitize_token(token)
@@ -127,12 +127,11 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
     }
     
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    print(f"📤 Firing request for code '{code}' (User {chat_id})...")
+    print(f"📤 Firing request for code '{code}' (User {chat_id})...", flush=True)
     
     try:
-        # If an emergency override answer was passed directly, try it instantly!
         if specific_answer:
-            print(f"⚡ Instant retry override with answer: '{specific_answer}'")
+            print(f"⚡ Instant retry override with answer: '{specific_answer}'", flush=True)
             claim_res = await asyncio.to_thread(
                 execute_chowdeck_request, "POST", claim_url, headers, user_cookies, {"code": code, "answer": specific_answer}
             )
@@ -175,9 +174,9 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
                             break
                         await asyncio.sleep(0.05)
             except Exception as e:
-                print(f"⚠️ Challenge eval error: {e}")
+                print(f"⚠️ Challenge eval error: {e}", flush=True)
 
-        print(f"📥 User {chat_id} Status [{claim_res.status_code}]: {claim_res.text}")
+        print(f"📥 User {chat_id} Status [{claim_res.status_code}]: {claim_res.text}", flush=True)
         msg = f"🎯 *Code Target:* `{code}`\nStatus: `{claim_res.status_code}`\nResponse: `{claim_res.text}`"
         
         user_cart = carts.get(chat_str)
@@ -203,7 +202,7 @@ async def claim_for_single_user(chat_id, token, code, user_cookies, carts, answe
             
         return claim_res.status_code
     except Exception as e:
-        print(f"❌ Error for user {chat_id}: {e}")
+        print(f"❌ Error for user {chat_id}: {e}", flush=True)
         return 500
 
 async def claim_code(raw_code):
@@ -213,7 +212,7 @@ async def claim_code(raw_code):
 
     claimed_history = load_json(CLAIMED_FILE)
     if code in claimed_history:
-        print(f"⏩ Skipping '{code}': Already attempted/claimed previously.")
+        print(f"⏩ Skipping '{code}': Already attempted/claimed previously.", flush=True)
         return
 
     tokens = load_json(TOKEN_FILE)
@@ -238,19 +237,20 @@ async def worker():
             try:
                 await claim_code(code)
             except Exception as e:
-                print(f"Worker error: {e}")
+                print(f"Worker error: {e}", flush=True)
             finally:
                 code_queue.task_done()
                 await asyncio.sleep(2.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"Worker loop error: {e}")
+            print(f"Worker loop error: {e}", flush=True)
             await asyncio.sleep(2)
 
 async def process_text(text):
     if not text:
         return
+    print(f"Scanning text: {text}", flush=True)
     pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
     codes = re.findall(pattern, text)
     ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
@@ -262,17 +262,20 @@ async def process_text(text):
             valid.append(cleaned)
             
     for code in list(dict.fromkeys(valid)):
+        print(f"🚨 Queued Code: {code}", flush=True)
         await code_queue.put(code)
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/status":
+        if self.path == "/status" or self.path == "/":
             try:
+                active = get_bot_active()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"active": get_bot_active()}).encode('utf-8'))
-            except Exception:
+                self.wfile.write(json.dumps({"status": "online", "active": active}).encode('utf-8'))
+            except Exception as e:
+                print(f"Status check error: {e}", flush=True)
                 self.send_response(500)
                 self.end_headers()
         else:
@@ -290,7 +293,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
-        except Exception:
+        except Exception as e:
+            print(f"Webhook error: {e}", flush=True)
             self.send_response(400)
             self.end_headers()
 
@@ -298,7 +302,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return
 
 def run_http_server():
-    HTTPServer(('0.0.0.0', 8080), WebhookHandler).serve_forever()
+    server = HTTPServer(('0.0.0.0', 8080), WebhookHandler)
+    print("🌐 Railway HTTP webhook server running on port 8080...", flush=True)
+    server.serve_forever()
 
 async def telegram_poller():
     global last_update_id
@@ -319,7 +325,6 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                         
-                        # Handle persistent Reply Keyboard Clicks
                         if text == "🔄 Refresh Status":
                             tokens = load_json(TOKEN_FILE)
                             carts = load_json(CART_FILE)
@@ -349,7 +354,6 @@ async def telegram_poller():
                                 await send_telegram(chat_id, "▶️ *Bridge Resumed*")
                             continue
 
-                        # Handle Emergency Reply-to-Message Override + Immediate Retry
                         reply_to = msg.get("reply_to_message")
                         if reply_to and "Security Failed" in reply_to.get("text", ""):
                             new_ans = text
@@ -363,7 +367,6 @@ async def telegram_poller():
                                 answers[chat_str] = current_list[:3]
                                 save_json(ANSWER_FILE, answers)
                                 
-                                # Extract target code from the replied message using regex backticks
                                 match_code = re.search(r'`([A-Z0-9]+)`', reply_to.get("text", ""))
                                 if match_code:
                                     target_code = match_code.group(1)
@@ -381,7 +384,6 @@ async def telegram_poller():
                                         )
                                 continue
 
-                        # Command and standard routing
                         if text.startswith("/start"):
                             tokens = load_json(TOKEN_FILE)
                             carts = load_json(CART_FILE)
@@ -396,7 +398,6 @@ async def telegram_poller():
                                 "Use the persistent buttons below or send commands like `/setanswer`."
                             )
                             
-                            # Construct persistent Reply Keyboard layout
                             keyboard_rows = [
                                 [{"text": "🔄 Refresh Status"}]
                             ]
@@ -438,7 +439,7 @@ async def telegram_poller():
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"Poller error: {e}")
+                print(f"Poller error: {e}", flush=True)
             await asyncio.sleep(2)
 
 async def main():
@@ -455,4 +456,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Stopped.")
+        print("\n🛑 Stopped.", flush=True)
