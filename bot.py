@@ -98,6 +98,14 @@ async def send_telegram(chat_id, text, reply_markup=None):
         print(f"Telegram send error to {chat_id}: {e}", flush=True)
         return None
 
+async def answer_callback_query(callback_query_id, text=""):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    try:
+        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
+            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=10.0)
+    except Exception as e:
+        print(f"Callback answer error: {e}", flush=True)
+
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
     with httpx.Client(timeout=15.0, proxy=PROXY_URL if PROXY_URL else None) as client:
         if method == "POST":
@@ -316,6 +324,47 @@ async def telegram_poller():
                 if res.status_code == 200:
                     for update in res.json().get("result", []):
                         last_update_id = update["update_id"]
+                        
+                        # Handle Inline Keyboard Button Clicks (Callback Queries)
+                        if "callback_query" in update:
+                            cq = update["callback_query"]
+                            cq_id = cq["id"]
+                            chat_id = cq["message"]["chat"]["id"]
+                            data_action = cq["data"]
+                            chat_str = str(chat_id)
+                            is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+                            
+                            if data_action == "btn_status":
+                                tokens = load_json(TOKEN_FILE)
+                                carts = load_json(CART_FILE)
+                                answers = load_json(ANSWER_FILE)
+                                has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
+                                has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
+                                user_ans = answers.get(chat_str, ["Ismail"])
+                                bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
+                                
+                                status_msg = (
+                                    f"📊 *Live Status*\n\n"
+                                    f"• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n• State: {bot_status}"
+                                )
+                                await answer_callback_query(cq_id, "Status refreshed!")
+                                await send_telegram(chat_id, status_msg)
+                            elif data_action == "btn_pause":
+                                if not is_admin:
+                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
+                                else:
+                                    set_bot_active(False)
+                                    await answer_callback_query(cq_id, "Bridge Paused!")
+                                    await send_telegram(chat_id, "⏸️ *Bridge Paused* via inline button.")
+                            elif data_action == "btn_resume":
+                                if not is_admin:
+                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
+                                else:
+                                    set_bot_active(True)
+                                    await answer_callback_query(cq_id, "Bridge Resumed!")
+                                    await send_telegram(chat_id, "▶️ *Bridge Resumed* via inline button.")
+                            continue
+
                         msg = update.get("message", {})
                         chat_id = msg.get("chat", {}).get("id")
                         text = msg.get("text", "").strip()
@@ -324,36 +373,8 @@ async def telegram_poller():
                         
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
-                        
-                        if text == "🔄 Refresh Status":
-                            tokens = load_json(TOKEN_FILE)
-                            carts = load_json(CART_FILE)
-                            answers = load_json(ANSWER_FILE)
-                            has_token = "✅ Configured" if chat_str in tokens else "❌ Not Set"
-                            has_cart = "✅ Configured" if chat_str in carts else "❌ Not Set"
-                            user_ans = answers.get(chat_str, ["Ismail"])
-                            
-                            status_msg = (
-                                f"📊 *Live Status*\n\n"
-                                f"• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n• State: {'🟢 Active' if get_bot_active() else '⏸️ Paused'}"
-                            )
-                            await send_telegram(chat_id, status_msg)
-                            continue
-                        elif text == "⏸️ Pause Bridge":
-                            if not is_admin:
-                                await send_telegram(chat_id, "⛔ *Unauthorized.*")
-                            else:
-                                set_bot_active(False)
-                                await send_telegram(chat_id, "⏸️ *Bridge Paused*")
-                            continue
-                        elif text == "▶️ Resume Bridge":
-                            if not is_admin:
-                                await send_telegram(chat_id, "⛔ *Unauthorized.*")
-                            else:
-                                set_bot_active(True)
-                                await send_telegram(chat_id, "▶️ *Bridge Resumed*")
-                            continue
 
+                        # Handle Emergency Reply-to-Message Override + Immediate Retry
                         reply_to = msg.get("reply_to_message")
                         if reply_to and "Security Failed" in reply_to.get("text", ""):
                             new_ans = text
@@ -395,16 +416,20 @@ async def telegram_poller():
                             help_text = (
                                 "🤖 *Chowdeck Sniper Pro Active!*\n\n"
                                 f"Status:\n• Token: {has_token}\n• Cart: {has_cart}\n• Answers: `{', '.join(user_ans)}`\n\n"
-                                "Use the persistent buttons below or send commands like `/setanswer`."
+                                "Select an option below:"
                             )
                             
-                            keyboard_rows = [
-                                [{"text": "🔄 Refresh Status"}]
+                            # Construct Inline Keyboard embedded inside the chat message bubble
+                            keyboard_buttons = [
+                                [{"text": "🔄 Refresh Status", "callback_data": "btn_status"}]
                             ]
                             if is_admin:
-                                keyboard_rows.append([{"text": "⏸️ Pause Bridge"}, {"text": "▶️ Resume Bridge"}])
+                                keyboard_buttons.append([
+                                    {"text": "⏸️ Pause Bridge", "callback_data": "btn_pause"},
+                                    {"text": "▶️ Resume Bridge", "callback_data": "btn_resume"}
+                                ])
                                 
-                            reply_markup = {"keyboard": keyboard_rows, "resize_keyboard": True}
+                            reply_markup = {"inline_keyboard": keyboard_buttons}
                             await send_telegram(chat_id, help_text, reply_markup=reply_markup)
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
