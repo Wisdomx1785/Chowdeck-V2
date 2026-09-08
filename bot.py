@@ -354,24 +354,29 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         msg_text = res_json.get("message", "").lower()
         data_obj = res_json.get("data", {})
         
-        has_security_q = isinstance(data_obj, dict) and "security_question" in data_obj
-        q_text = data_obj.get("security_question") if has_security_q else None
+        # STRICT SECURITY QUESTION CHECKING:
+        # Look specifically for the actual security question dictionary key returned by the API
+        q_text = None
+        if isinstance(data_obj, dict):
+            q_text = data_obj.get("security_question") or data_obj.get("question")
+        
+        has_security_q = q_text is not None or "security question" in msg_text
         user_mode = get_user_mode(chat_str)
 
         if not specific_answer:
             if "too many failed" in msg_text:
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
-            elif has_security_q or "security question" in msg_text or "incorrect" in msg_text or claim_res.status_code == 400:
-                if q_text or "security question" in msg_text or user_mode == "prompt":
-                    actual_q = q_text if q_text else res_json.get("message", "Security question required.")
-                    return {
-                        "slot": slot_key, 
-                        "status": claim_res.status_code, 
-                        "needs_prompt": True, 
-                        "question": actual_q, 
-                        "response": res_json
-                    }
+            elif has_security_q:
+                # Only trigger prompt if there is a real security question challenge
+                actual_q = q_text if q_text else msg_text
+                return {
+                    "slot": slot_key, 
+                    "status": claim_res.status_code, 
+                    "needs_prompt": True, 
+                    "question": actual_q, 
+                    "response": res_json
+                }
 
         cart_info = carts_db.get(chat_str, {}).get(slot_key, {})
         cart_id = cart_info.get("cart_id")
