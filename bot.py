@@ -25,6 +25,8 @@ LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts_multi.json")
 ACTIVE_SLOT_FILE = os.path.join(DATA_DIR, "active_slots.json")
 PENDING_PROMPT_FILE = os.path.join(DATA_DIR, "pending_prompts.json")
 ACCOUNT_TOGGLES_FILE = os.path.join(DATA_DIR, "account_toggles.json")
+BURNER_FILE = os.path.join(DATA_DIR, "admin_burner.json")
+BURNER_CART_FILE = os.path.join(DATA_DIR, "admin_burner_cart.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -76,7 +78,7 @@ def set_active_slot(chat_str, slot):
 def is_slot_active_state(chat_str, slot_id):
     toggles = load_json(ACCOUNT_TOGGLES_FILE)
     user_toggles = toggles.get(chat_str, {})
-    return user_toggles.get(str(slot_id), True) # Default active
+    return user_toggles.get(str(slot_id), True)
 
 def toggle_slot_state(chat_str, slot_id):
     toggles = load_json(ACCOUNT_TOGGLES_FILE)
@@ -86,6 +88,24 @@ def toggle_slot_state(chat_str, slot_id):
     toggles[chat_str][str(slot_id)] = not current
     save_json(ACCOUNT_TOGGLES_FILE, toggles)
     return not current
+
+def get_burner_credentials(chat_str):
+    burners = load_json(BURNER_FILE)
+    return burners.get(chat_str, {})
+
+def save_burner_credentials(chat_str, token_data):
+    burners = load_json(BURNER_FILE)
+    burners[chat_str] = token_data
+    save_json(BURNER_FILE, burners)
+
+def get_burner_cart(chat_str):
+    carts = load_json(BURNER_CART_FILE)
+    return carts.get(chat_str, {})
+
+def save_burner_cart(chat_str, cart_data):
+    carts = load_json(BURNER_CART_FILE)
+    carts[chat_str] = cart_data
+    save_json(BURNER_CART_FILE, carts)
 
 def get_admin_stats():
     tokens_db = load_json(TOKENS_FILE)
@@ -176,7 +196,6 @@ def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
     current_mode = get_user_mode(chat_str).upper()
     
-    # 2 rows of slots (1-5 and 6-10)
     slot_row_1 = []
     slot_row_2 = []
     for i in range(1, 11):
@@ -204,7 +223,7 @@ def build_control_keyboard(chat_str, is_admin):
         ]
     ]
     if is_admin:
-        keyboard.insert(2, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}])
+        keyboard.insert(2, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"}
@@ -226,6 +245,65 @@ def build_accounts_keyboard(chat_str):
         rows.append(row)
     rows.append([{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}])
     return {"inline_keyboard": rows}
+
+def build_admin_burner_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🧪 Test Code (Send via /test)", "callback_data": "burner_info"}],
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+    ]}
+
+async def execute_burner_test(chat_id, code):
+    chat_str = str(chat_id)
+    token_data = get_burner_credentials(chat_str)
+    if not token_data or not token_data.get("token"):
+        return "❌ Burner account token not configured! Use `/setburnertoken` first."
+
+    token = token_data.get("token")
+    user_cookies = token_data.get("cookies", {})
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Origin": "https://chowdeck.com",
+        "Referer": "https://chowdeck.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    }
+    
+    claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+    payload_data = {"code": code, "answer": "Ismail", "security_answer": "Ismail"}
+    
+    try:
+        claim_res = await asyncio.to_thread(
+            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
+        )
+        res_json = {}
+        try:
+            res_json = claim_res.json()
+        except Exception:
+            pass
+
+        cart_info = get_burner_cart(chat_str)
+        cart_id = cart_info.get("cart_id")
+        vendor_id = cart_info.get("vendor_id")
+        
+        cart_status_str = ""
+        if cart_id and claim_res.status_code == 200:
+            apply_payload = {"cart_id": cart_id, "promo_codes": [code]}
+            if vendor_id:
+                apply_payload["vendor_id"] = vendor_id
+            apply_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, apply_payload
+            )
+            cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
+
+        return (
+            f"🧪 *Burner Test Result for `{code}`*\n"
+            f"Status Code: `{claim_res.status_code}`\n"
+            f"API Response: `{json.dumps(res_json)}`{cart_status_str}"
+        )
+    except Exception as e:
+        return f"❌ Burner test error: {e}"
 
 async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
     chat_str = str(chat_id)
@@ -257,12 +335,8 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     
     try:
-        # Single pre-configured master answer
         master_ans_list = answers_db.get(chat_str, {}).get("master", ["Ismail"])
-        if isinstance(master_ans_list, list):
-            master_ans = master_ans_list[0] if master_ans_list else "Ismail"
-        else:
-            master_ans = str(master_ans_list)
+        master_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
 
         ans_to_use = specific_answer if specific_answer else master_ans
         payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
@@ -280,10 +354,8 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         msg_text = res_json.get("message", "").lower()
         data_obj = res_json.get("data", {})
         
-        # Check if security question is returned or required
         has_security_q = isinstance(data_obj, dict) and "security_question" in data_obj
         q_text = data_obj.get("security_question") if has_security_q else None
-
         user_mode = get_user_mode(chat_str)
 
         if not specific_answer:
@@ -291,7 +363,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
             elif has_security_q or "security question" in msg_text or "incorrect" in msg_text or claim_res.status_code == 400:
-                # If Prompt mode OR Auto mode failed with wrong answer/security question
                 if q_text or "security question" in msg_text or user_mode == "prompt":
                     actual_q = q_text if q_text else res_json.get("message", "Security question required.")
                     return {
@@ -362,7 +433,7 @@ async def claim_code(raw_code):
         for res in results:
             slot = res["slot"]
             if res.get("status") == 0:
-                continue # skipped inactive
+                continue
                 
             status = res["status"]
             resp_data = res.get("response", {})
@@ -485,7 +556,7 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
                                     f"• Active Slot: `Slot {slot_num}`\n"
                                     f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                     f"• Mode: `{user_m.upper()}`\n"
@@ -506,7 +577,6 @@ async def telegram_poller():
                                 state_text = "Activated" if new_state else "Deactivated"
                                 await answer_callback_query(cq_id, f"Slot {s_num} {state_text}!")
                                 
-                                # Update My Accounts message view
                                 active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
                                     f"💼 *My Chowdeck Accounts (1-10)*\n"
@@ -539,6 +609,31 @@ async def telegram_poller():
                                     "parse_mode": "Markdown",
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
+                            elif data_action == "btn_burner_menu":
+                                if not is_admin:
+                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
+                                else:
+                                    burner_data = get_burner_credentials(chat_str)
+                                    b_status = "🟢 Linked" if burner_data.get("token") else "🔴 Not Configured"
+                                    burner_text = (
+                                        f"🧪 *Admin Burner Account Panel*\n\n"
+                                        f"• Burner Status: {b_status}\n\n"
+                                        "Use commands to configure:\n"
+                                        "• `/setburnertoken <token>`\n"
+                                        "• `/setburnercart <cart_id> <vendor_id>`\n"
+                                        "• `/test <CODE>`"
+                                    )
+                                    await answer_callback_query(cq_id, "Burner panel opened!")
+                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": burner_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_burner_keyboard()
+                                    })
+                            elif data_action == "burner_info":
+                                await answer_callback_query(cq_id, "Type /test <CODE> in chat to run safe check!")
                             elif data_action == "btn_main_menu":
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
@@ -546,7 +641,7 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 menu_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
                                     f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                     f"• Mode: `{user_m.upper()}`\n"
@@ -572,7 +667,7 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
                                     f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                     f"• Mode: `{new_m.upper()}`\n"
@@ -760,6 +855,48 @@ async def telegram_poller():
                             else:
                                 current_m = get_user_mode(chat_str)
                                 await send_telegram(chat_id, f"📌 Current Mode: *{current_m.upper()}*")
+                        elif text.startswith("/setburnertoken") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                raw_input = parts[1].strip()
+                                extracted_token = raw_input
+                                extracted_cookies = {}
+                                if "user=" in raw_input or ";" in raw_input:
+                                    try:
+                                        for p in raw_input.split(";"):
+                                            p = p.strip()
+                                            if "=" in p:
+                                                k, v = p.split("=", 1)
+                                                extracted_cookies[k.strip()] = v.strip()
+                                                if k.strip() == "user":
+                                                    decoded = urllib.parse.unquote(v.strip())
+                                                    data = json.loads(decoded)
+                                                    if "token" in data:
+                                                        extracted_token = data["token"]
+                                    except Exception:
+                                        pass
+                                if extracted_token.lower().startswith("bearer "):
+                                    extracted_token = extracted_token[7:].strip()
+                                
+                                save_burner_credentials(chat_str, {"token": extracted_token, "cookies": extracted_cookies})
+                                await send_telegram(chat_id, "✅ *Admin Burner Account Token* successfully linked!")
+                        elif text.startswith("/setburnercart") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                subparts = parts[1].strip().split()
+                                c_id = subparts[0]
+                                v_id = subparts[1] if len(subparts) > 1 else None
+                                save_burner_cart(chat_str, {"cart_id": c_id, "vendor_id": v_id})
+                                await send_telegram(chat_id, f"✅ *Burner Cart Linked* — Cart ID: `{c_id}`, Vendor ID: `{v_id}`")
+                        elif text.startswith("/test") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                test_code = robust_clean_code(parts[1])
+                                await send_telegram(chat_id, f"🔬 Testing code `{test_code}` on burner account...")
+                                result_msg = await execute_burner_test(chat_id, test_code)
+                                await send_telegram(chat_id, result_msg)
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/test <CODE>`")
                         elif text.startswith("/pause") and is_admin:
                             set_bot_active(False)
                             await send_telegram(chat_id, "⏸️ Bridge Paused.")
