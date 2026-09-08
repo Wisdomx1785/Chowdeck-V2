@@ -333,11 +333,44 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
     }
     
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+    user_mode = get_user_mode(chat_str)
     
     try:
         master_ans_list = answers_db.get(chat_str, {}).get("master", ["Ismail"])
         master_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
 
+        # PROMPT MODE: Probe first without guessing pre-configured answer
+        if user_mode == "prompt" and not specific_answer:
+            probe_payload = {"code": code, "answer": "", "security_answer": ""}
+            probe_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, probe_payload
+            )
+            probe_json = {}
+            try:
+                probe_json = probe_res.json()
+            except Exception:
+                pass
+            
+            data_obj = probe_json.get("data", {})
+            q_text = None
+            if isinstance(data_obj, dict):
+                q_text = data_obj.get("security_question") or data_obj.get("question")
+            if not q_text:
+                msg_txt = probe_json.get("message", "").lower()
+                if "security question" in msg_txt or "question" in msg_txt:
+                    q_text = probe_json.get("message")
+            
+            if q_text or probe_res.status_code == 400:
+                final_q = q_text if q_text else probe_json.get("message", "Security question required.")
+                return {
+                    "slot": slot_key,
+                    "status": probe_res.status_code,
+                    "needs_prompt": True,
+                    "question": final_q,
+                    "response": probe_json
+                }
+
+        # AUTO MODE or user provided specific answer
         ans_to_use = specific_answer if specific_answer else master_ans
         payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
         
@@ -354,27 +387,23 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         msg_text = res_json.get("message", "").lower()
         data_obj = res_json.get("data", {})
         
-        # STRICT SECURITY QUESTION CHECKING:
-        # Look specifically for the actual security question dictionary key returned by the API
         q_text = None
         if isinstance(data_obj, dict):
             q_text = data_obj.get("security_question") or data_obj.get("question")
-        
-        has_security_q = q_text is not None or "security question" in msg_text
-        user_mode = get_user_mode(chat_str)
+        if not q_text and ("security question" in msg_txt or "incorrect" in msg_txt or "not correct" in msg_txt):
+            q_text = res_json.get("message")
 
         if not specific_answer:
             if "too many failed" in msg_text:
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
-            elif has_security_q:
-                # Only trigger prompt if there is a real security question challenge
-                actual_q = q_text if q_text else msg_text
+            elif q_text:
+                # Auto mode pre-configured answer failed / triggered question -> ask user for emergency answer
                 return {
                     "slot": slot_key, 
                     "status": claim_res.status_code, 
                     "needs_prompt": True, 
-                    "question": actual_q, 
+                    "question": q_text, 
                     "response": res_json
                 }
 
