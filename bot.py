@@ -24,6 +24,7 @@ STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts_multi.json")
 ACTIVE_SLOT_FILE = os.path.join(DATA_DIR, "active_slots.json")
 PENDING_PROMPT_FILE = os.path.join(DATA_DIR, "pending_prompts.json")
+ACCOUNT_TOGGLES_FILE = os.path.join(DATA_DIR, "account_toggles.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -71,6 +72,20 @@ def set_active_slot(chat_str, slot):
     slots = load_json(ACTIVE_SLOT_FILE)
     slots[chat_str] = str(slot)
     save_json(ACTIVE_SLOT_FILE, slots)
+
+def is_slot_active_state(chat_str, slot_id):
+    toggles = load_json(ACCOUNT_TOGGLES_FILE)
+    user_toggles = toggles.get(chat_str, {})
+    return user_toggles.get(str(slot_id), True) # Default active
+
+def toggle_slot_state(chat_str, slot_id):
+    toggles = load_json(ACCOUNT_TOGGLES_FILE)
+    if chat_str not in toggles:
+        toggles[chat_str] = {}
+    current = toggles[chat_str].get(str(slot_id), True)
+    toggles[chat_str][str(slot_id)] = not current
+    save_json(ACCOUNT_TOGGLES_FILE, toggles)
+    return not current
 
 def get_admin_stats():
     tokens_db = load_json(TOKENS_FILE)
@@ -161,19 +176,30 @@ def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
     current_mode = get_user_mode(chat_str).upper()
     
-    slot_row = []
-    for i in range(1, 6):
+    # 2 rows of slots (1-5 and 6-10)
+    slot_row_1 = []
+    slot_row_2 = []
+    for i in range(1, 11):
         s_str = str(i)
-        label = f"📌 Slot {i}" if s_str == active_slot else f"{i}"
-        slot_row.append({"text": label, "callback_data": f"slot_{i}"})
+        is_active = is_slot_active_state(chat_str, s_str)
+        icon = "✅" if is_active else "❌"
+        label = f"📌 S{i}" if s_str == active_slot else f"{icon} {i}"
+        
+        btn = {"text": label, "callback_data": f"slot_{i}"}
+        if i <= 5:
+            slot_row_1.append(btn)
+        else:
+            slot_row_2.append(btn)
         
     keyboard = [
-        slot_row,
+        slot_row_1,
+        slot_row_2,
         [
-            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
-            {"text": "🔄 Refresh", "callback_data": "btn_status"}
+            {"text": "👥 My Accounts", "callback_data": "btn_my_accounts"},
+            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"}
         ],
         [
+            {"text": "🔄 Refresh", "callback_data": "btn_status"},
             {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
         ]
     ]
@@ -185,10 +211,29 @@ def build_control_keyboard(chat_str, is_admin):
         ])
     return {"inline_keyboard": keyboard}
 
+def build_accounts_keyboard(chat_str):
+    rows = []
+    row = []
+    for i in range(1, 11):
+        s_str = str(i)
+        active = is_slot_active_state(chat_str, s_str)
+        status_icon = "✅" if active else "❌"
+        row.append({"text": f"{status_icon} Slot {i}", "callback_data": f"toggle_acc_{i}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}])
+    return {"inline_keyboard": rows}
+
 async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
     chat_str = str(chat_id)
     slot_key = str(slot_id)
     
+    if not is_slot_active_state(chat_str, slot_key):
+        return {"slot": slot_key, "status": 0, "message": "skipped (inactive)"}
+
     lockout_key = f"{chat_str}_{slot_key}"
     if time.time() < lockouts_db.get(lockout_key, 0) and not specific_answer:
         return {"slot": slot_key, "status": 429, "message": "locked out"}
@@ -212,22 +257,20 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     
     try:
-        user_answers = answers_db.get(chat_str, {}).get("master", ["Ismail"])
-        if isinstance(user_answers, str):
-            user_answers = [user_answers]
-            
-        slot_answers = answers_db.get(chat_str, {}).get(slot_key)
-        if slot_answers:
-            user_answers = slot_answers
+        # Single pre-configured master answer
+        master_ans_list = answers_db.get(chat_str, {}).get("master", ["Ismail"])
+        if isinstance(master_ans_list, list):
+            master_ans = master_ans_list[0] if master_ans_list else "Ismail"
+        else:
+            master_ans = str(master_ans_list)
 
-        ans_to_use = specific_answer if specific_answer else user_answers[0]
+        ans_to_use = specific_answer if specific_answer else master_ans
         payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
         
         claim_res = await asyncio.to_thread(
             execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
         )
         
-        success_cleared = (claim_res.status_code == 200)
         res_json = {}
         try:
             res_json = claim_res.json()
@@ -235,32 +278,29 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             pass
             
         msg_text = res_json.get("message", "").lower()
+        data_obj = res_json.get("data", {})
         
-        if not success_cleared and not specific_answer:
+        # Check if security question is returned or required
+        has_security_q = isinstance(data_obj, dict) and "security_question" in data_obj
+        q_text = data_obj.get("security_question") if has_security_q else None
+
+        user_mode = get_user_mode(chat_str)
+
+        if not specific_answer:
             if "too many failed" in msg_text:
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
-            elif "security question" in msg_text or claim_res.status_code == 400:
-                if get_user_mode(chat_str) == "prompt" and "security_question" in res_json.get("data", {}):
-                    q_text = res_json["data"]["security_question"]
+            elif has_security_q or "security question" in msg_text or "incorrect" in msg_text or claim_res.status_code == 400:
+                # If Prompt mode OR Auto mode failed with wrong answer/security question
+                if q_text or "security question" in msg_text or user_mode == "prompt":
+                    actual_q = q_text if q_text else res_json.get("message", "Security question required.")
                     return {
                         "slot": slot_key, 
                         "status": claim_res.status_code, 
                         "needs_prompt": True, 
-                        "question": q_text, 
+                        "question": actual_q, 
                         "response": res_json
                     }
-                
-                for ans in user_answers[1:3]:
-                    payload_data = {"code": code, "answer": ans, "security_answer": ans}
-                    claim_res = await asyncio.to_thread(
-                        execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-                    )
-                    if claim_res.status_code == 200:
-                        success_cleared = True
-                        res_json = claim_res.json()
-                        break
-                    await asyncio.sleep(0.05)
 
         cart_info = carts_db.get(chat_str, {}).get(slot_key, {})
         cart_id = cart_info.get("cart_id")
@@ -321,6 +361,9 @@ async def claim_code(raw_code):
         
         for res in results:
             slot = res["slot"]
+            if res.get("status") == 0:
+                continue # skipped inactive
+                
             status = res["status"]
             resp_data = res.get("response", {})
             cart_suffix = res.get("cart_str", "")
@@ -334,7 +377,7 @@ async def claim_code(raw_code):
                 prompt_msg = (
                     f"🔒 *Security Question Detected for `{code}` (Slot {slot})!*\n"
                     f"Question: *\"{q_text}\"*\n\n"
-                    f"⚡ *Type the answer right here in chat* to instantly broadcast it to all your accounts!"
+                    f"⚡ *Type the answer right here in chat* to instantly broadcast it to all active slots!"
                 )
                 await send_telegram(chat_id=int(chat_str), text=prompt_msg)
             else:
@@ -439,13 +482,14 @@ async def telegram_poller():
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 user_m = get_user_mode(chat_str)
-                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
                                     f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
                                     f"• Active Slot: `Slot {slot_num}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                     f"• Mode: `{user_m.upper()}`\n"
-                                    f"• Master Answer: `{', '.join(answers)}`\n\n"
+                                    f"• Master Answer: `{m_ans}`\n\n"
                                     "Select an option below:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
@@ -453,6 +497,67 @@ async def telegram_poller():
                                     "chat_id": chat_id,
                                     "message_id": msg_id,
                                     "text": updated_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
+                            elif data_action.startswith("toggle_acc_"):
+                                s_num = data_action.split("_")[2]
+                                new_state = toggle_slot_state(chat_str, s_num)
+                                state_text = "Activated" if new_state else "Deactivated"
+                                await answer_callback_query(cq_id, f"Slot {s_num} {state_text}!")
+                                
+                                # Update My Accounts message view
+                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                acc_text = (
+                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
+                                    f"Total Configured: `10` | Active: `{active_count}`\n\n"
+                                    f"Click a button below to toggle its active state:\n"
+                                    f"✅ = Active & Sniping | ❌ = Disabled"
+                                )
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
+                            elif data_action == "btn_my_accounts":
+                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                acc_text = (
+                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
+                                    f"Total Slots: `10` | Active: `{active_count}`\n\n"
+                                    f"Click a button below to toggle its active state:\n"
+                                    f"✅ = Active & Sniping | ❌ = Disabled"
+                                )
+                                await answer_callback_query(cq_id, "Opening accounts manager...")
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
+                            elif data_action == "btn_main_menu":
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                active_s = get_active_slot(chat_str)
+                                user_m = get_user_mode(chat_str)
+                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
+                                menu_text = (
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                    f"• Active Slot: `Slot {active_s}`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
+                                    f"• Mode: `{user_m.upper()}`\n"
+                                    f"• Master Answer: `{m_ans}`\n\n"
+                                    "Select an option below:"
+                                )
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": menu_text,
                                     "parse_mode": "Markdown",
                                     "reply_markup": build_control_keyboard(chat_str, is_admin)
                                 })
@@ -464,13 +569,14 @@ async def telegram_poller():
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
-                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
                                     f"🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                     f"• Mode: `{new_m.upper()}`\n"
-                                    f"• Master Answer: `{', '.join(answers)}`\n\n"
+                                    f"• Master Answer: `{m_ans}`\n\n"
                                     "Select an option below:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
@@ -500,25 +606,27 @@ async def telegram_poller():
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
                                 user_m = get_user_mode(chat_str)
-                                answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 
                                 status_msg = (
                                     f"📊 *Portfolio Status*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Accounts: `{len(tokens_db)} / 5`\n"
+                                    f"• Configured Accounts: `{len(tokens_db)} / 10`\n"
                                     f"• Sniper Mode: `{user_m.upper()}`\n"
-                                    f"• Master Answer: `{', '.join(answers)}`"
+                                    f"• Master Answer: `{m_ans}`"
                                 )
                                 await answer_callback_query(cq_id, "Status refreshed!")
                                 await send_telegram(chat_id, status_msg)
                             elif data_action == "btn_guide":
                                 guide_msg = (
-                                    "📖 *Multi-Account Sniper Guide*\n\n"
-                                    "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 5` on the keyboard below.\n\n"
-                                    "2️⃣ *Link Token to Active Slot:*\n`/settoken <token>`\n\n"
-                                    "3️⃣ *Set Cart ID & Vendor ID:*\n`/setcart <cart_id> <vendor_id>`\n\n"
-                                    "4️⃣ *Master Security Answer:*\n`/setanswer word1, word2, word3`\n\n"
-                                    "5️⃣ *Toggle Mode:*\nTap the `⚙️ Mode` button on the keyboard!"
+                                    "📖 *Multi-Account Sniper Guide (1-10)*\n\n"
+                                    "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 10` on the keyboard.\n\n"
+                                    "2️⃣ *Manage Accounts:*\nTap `👥 My Accounts` to activate/deactivate specific slots with ✅/❌ toggles.\n\n"
+                                    "3️⃣ *Link Token:*\n`/settoken <token>`\n\n"
+                                    "4️⃣ *Set Cart ID & Vendor ID:*\n`/setcart <cart_id> <vendor_id>`\n\n"
+                                    "5️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
+                                    "6️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
                                 )
                                 await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
@@ -559,7 +667,7 @@ async def telegram_poller():
                                 answers_db[chat_str]["master"] = [user_ans]
                                 save_json(ANSWER_FILE, answers_db)
                                 
-                                await send_telegram(chat_id, f"⚡ *Prompt Answer Captured!* Blasting `{user_ans}` across all accounts simultaneously for `{target_code}`...")
+                                await send_telegram(chat_id, f"⚡ *Emergency Answer Captured!* Blasting `{user_ans}` instantly across all active slots for `{target_code}`...")
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 carts_db = load_json(CARTS_FILE)
@@ -573,6 +681,8 @@ async def telegram_poller():
                                     ]
                                     results = await asyncio.gather(*tasks)
                                     for res in results:
+                                        if res.get("status") == 0:
+                                            continue
                                         s_id = res["slot"]
                                         st = res["status"]
                                         rp = res.get("response", {})
@@ -583,14 +693,15 @@ async def telegram_poller():
                         if text.startswith("/start"):
                             tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                             user_m = get_user_mode(chat_str)
-                            answers = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                            master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
+                            m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                             
                             help_text = (
-                                "🤖 *Chowdeck Multi-Account Sniper Active!*\n\n"
+                                "🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
                                 f"• Active Slot: `Slot {active_slot}`\n"
-                                f"• Configured Slots: `{len(tokens_db)} / 5`\n"
+                                f"• Configured Slots: `{len(tokens_db)} / 10`\n"
                                 f"• Mode: `{user_m.upper()}`\n"
-                                f"• Master Answer: `{', '.join(answers)}`\n\n"
+                                f"• Master Answer: `{m_ans}`\n\n"
                                 "Select an option below:"
                             )
                             await send_telegram(chat_id, help_text, reply_markup=build_control_keyboard(chat_str, is_admin))
@@ -607,11 +718,11 @@ async def telegram_poller():
                             await send_telegram(chat_id, admin_text, reply_markup=build_control_keyboard(chat_str, is_admin))
                         elif text.startswith("/acc"):
                             parts = text.split(" ", 1)
-                            if len(parts) > 1 and parts[1].strip() in ["1", "2", "3", "4", "5"]:
+                            if len(parts) > 1 and parts[1].strip() in [str(i) for i in range(1, 11)]:
                                 set_active_slot(chat_str, parts[1].strip())
                                 await send_telegram(chat_id, f"✅ Switched to *Slot {parts[1].strip()}*.", reply_markup=build_control_keyboard(chat_str, is_admin))
                             else:
-                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-5>` or tap buttons above.")
+                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-10>` or tap buttons above.")
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
@@ -633,13 +744,13 @@ async def telegram_poller():
                         elif text.startswith("/setanswer"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
-                                ans_list = [a.strip() for a in re.split(r'[,|/]', parts[1]) if a.strip()][:3]
+                                single_ans = parts[1].strip()
                                 answers_db = load_json(ANSWER_FILE)
                                 if chat_str not in answers_db:
                                     answers_db[chat_str] = {}
-                                answers_db[chat_str]["master"] = ans_list
+                                answers_db[chat_str]["master"] = [single_ans]
                                 save_json(ANSWER_FILE, answers_db)
-                                await send_telegram(chat_id, f"✅ Master Security Answers Saved (All 5 slots): `{', '.join(ans_list)}`")
+                                await send_telegram(chat_id, f"✅ Master Security Answer Saved: `{single_ans}`")
                         elif text.startswith("/mode"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1 and parts[1].strip().lower() in ["auto", "prompt"]:
