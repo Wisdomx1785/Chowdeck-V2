@@ -119,6 +119,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = raw_input.strip()
     extracted_token = cleaned
     extracted_cookies = {}
+    extracted_phone = None
 
     if "user=" in cleaned or ";" in cleaned:
         try:
@@ -133,6 +134,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
                         data = json.loads(decoded)
                         if "token" in data:
                             extracted_token = data["token"]
+                        extracted_phone = data.get("phone_number") or data.get("phone") or data.get("name") or data.get("email")
         except Exception as e:
             print(f"Cookie parse error: {e}", flush=True)
 
@@ -141,6 +143,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
             data = json.loads(cleaned)
             if "token" in data:
                 extracted_token = data["token"]
+            extracted_phone = data.get("phone_number") or data.get("phone") or data.get("name") or data.get("email")
         except Exception:
             pass
             
@@ -151,12 +154,38 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     if chat_str not in tokens_db:
         tokens_db[chat_str] = {}
     
+    existing_phone = tokens_db[chat_str].get(slot, {}).get("phone")
+    final_phone = extracted_phone if extracted_phone else existing_phone
+
     tokens_db[chat_str][slot] = {
         "token": extracted_token,
-        "cookies": extracted_cookies
+        "cookies": extracted_cookies,
+        "phone": str(final_phone)[:15] if final_phone else None
     }
     save_json(TOKENS_FILE, tokens_db)
     return extracted_token
+
+async def fetch_account_phone(token, cookies):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Origin": "https://chowdeck.com",
+        "Referer": "https://chowdeck.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    }
+    profile_url = "https://api.chowdeck.com/customer/profile"
+    try:
+        res = await asyncio.to_thread(
+            execute_chowdeck_request, "GET", profile_url, headers, cookies, None
+        )
+        if res.status_code == 200:
+            data = res.json().get("data", {})
+            phone = data.get("phone_number") or data.get("phone")
+            return phone
+    except Exception as e:
+        print(f"Profile fetch error: {e}", flush=True)
+    return None
 
 def robust_clean_code(raw):
     if not raw:
@@ -231,19 +260,29 @@ def build_control_keyboard(chat_str, is_admin):
     return {"inline_keyboard": keyboard}
 
 def build_accounts_keyboard(chat_str):
+    tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
     rows = []
     row = []
     for i in range(1, 11):
         s_str = str(i)
         active = is_slot_active_state(chat_str, s_str)
         status_icon = "✅" if active else "❌"
-        row.append({"text": f"{status_icon} Slot {i}", "callback_data": f"toggle_acc_{i}"})
+        
+        slot_info = tokens_db.get(s_str, {})
+        phone_label = slot_info.get("phone")
+        
+        if phone_label:
+            label = f"{status_icon} S{i}: {phone_label}"
+        else:
+            label = f"{status_icon} Slot {i} (Empty)"
+            
+        row.append({"text": label, "callback_data": f"toggle_acc_{i}"})
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}])
+    rows.append([{"text": "🔄 Refresh Phones", "callback_data": "btn_refresh_phones"}, {"text": "🔙 Main Menu", "callback_data": "btn_main_menu"}])
     return {"inline_keyboard": rows}
 
 def build_admin_burner_keyboard():
@@ -339,7 +378,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         master_ans_list = answers_db.get(chat_str, {}).get("master", ["Ismail"])
         master_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
 
-        # PROMPT MODE: Probe first without guessing pre-configured answer
         if user_mode == "prompt" and not specific_answer:
             probe_payload = {"code": code, "answer": "", "security_answer": ""}
             probe_res = await asyncio.to_thread(
@@ -355,34 +393,35 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             q_text = None
             if isinstance(data_obj, dict):
                 q_text = data_obj.get("security_question") or data_obj.get("question")
-            if not q_text:
-                msg_txt = probe_json.get("message", "").lower()
-                if "security question" in msg_txt or "question" in msg_txt:
-                    q_text = probe_json.get("message")
             
-            if q_text or probe_res.status_code == 400:
-                final_q = q_text if q_text else probe_json.get("message", "Security question required.")
+            msg_txt = probe_json.get("message", "").lower()
+            if not q_text and ("security question" in msg_txt or "question" in msg_txt):
+                q_text = probe_json.get("message")
+            
+            if q_text:
                 return {
                     "slot": slot_key,
                     "status": probe_res.status_code,
                     "needs_prompt": True,
-                    "question": final_q,
+                    "question": q_text,
                     "response": probe_json
                 }
-
-        # AUTO MODE or user provided specific answer
-        ans_to_use = specific_answer if specific_answer else master_ans
-        payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
-        
-        claim_res = await asyncio.to_thread(
-            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-        )
-        
-        res_json = {}
-        try:
-            res_json = claim_res.json()
-        except Exception:
-            pass
+            else:
+                claim_res = probe_res
+                res_json = probe_json
+        else:
+            ans_to_use = specific_answer if specific_answer else master_ans
+            payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
+            
+            claim_res = await asyncio.to_thread(
+                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
+            )
+            
+            res_json = {}
+            try:
+                res_json = claim_res.json()
+            except Exception:
+                pass
             
         msg_text = res_json.get("message", "").lower()
         data_obj = res_json.get("data", {})
@@ -390,7 +429,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         q_text = None
         if isinstance(data_obj, dict):
             q_text = data_obj.get("security_question") or data_obj.get("question")
-        if not q_text and ("security question" in msg_txt or "incorrect" in msg_txt or "not correct" in msg_txt):
+        if not q_text and ("security question" in msg_text or "incorrect" in msg_text or "not correct" in msg_text):
             q_text = res_json.get("message")
 
         if not specific_answer:
@@ -398,7 +437,6 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
                 lockouts_db[lockout_key] = time.time() + 900
                 save_json(LOCKOUT_FILE, lockouts_db)
             elif q_text:
-                # Auto mode pre-configured answer failed / triggered question -> ask user for emergency answer
                 return {
                     "slot": slot_key, 
                     "status": claim_res.status_code, 
@@ -486,7 +524,15 @@ async def claim_code(raw_code):
                 )
                 await send_telegram(chat_id=int(chat_str), text=prompt_msg)
             else:
-                summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+                if status == 500:
+                    summary_msg = (
+                        f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
+                        f"Status: `500 (Internal Server Error)`\n"
+                        f"💡 *Note:* Chowdeck returned a 500 error, but during claims this often means it committed successfully. *Check your app account now to verify if it landed!*"
+                    )
+                else:
+                    summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+                
                 await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
 async def worker():
@@ -643,6 +689,37 @@ async def telegram_poller():
                                     "parse_mode": "Markdown",
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
+                            elif data_action == "btn_refresh_phones":
+                                await answer_callback_query(cq_id, "Querying Chowdeck profiles...")
+                                user_slots = load_json(TOKENS_FILE).get(chat_str, {})
+                                updated_count = 0
+                                for slot_id, s_data in user_slots.items():
+                                    token = s_data.get("token")
+                                    cookies = s_data.get("cookies", {})
+                                    if token:
+                                        phone = await fetch_account_phone(token, cookies)
+                                        if phone:
+                                            s_data["phone"] = str(phone)[:15]
+                                            updated_count += 1
+                                tokens_db = load_json(TOKENS_FILE)
+                                tokens_db[chat_str] = user_slots
+                                save_json(TOKENS_FILE, tokens_db)
+                                
+                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                acc_text = (
+                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
+                                    f"Total Slots: `10` | Active: `{active_count}`\n"
+                                    f"Refreshed phones for `{updated_count}` slots!\n\n"
+                                    f"Click a button below to toggle its active state:"
+                                )
+                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
                             elif data_action == "btn_burner_menu":
                                 if not is_admin:
                                     await answer_callback_query(cq_id, "⛔ Unauthorized!")
@@ -753,7 +830,7 @@ async def telegram_poller():
                                     "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 10` on the keyboard.\n\n"
                                     "2️⃣ *Manage Accounts:*\nTap `👥 My Accounts` to activate/deactivate specific slots with ✅/❌ toggles.\n\n"
                                     "3️⃣ *Link Token:*\n`/settoken <token>`\n\n"
-                                    "4️⃣ *Set Cart ID & Vendor ID:*\n`/setcart <cart_id> <vendor_id>`\n\n"
+                                    "4️⃣ *Refresh Phones:*\n`/refreshphones` or use the menu button.\n\n"
                                     "5️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
                                     "6️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
                                 )
@@ -856,7 +933,36 @@ async def telegram_poller():
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
                                 parse_and_store_credentials(parts[1], chat_str, active_slot)
-                                await send_telegram(chat_id, f"✅ Token & session cookies saved to *Slot {active_slot}*.")
+                                
+                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+                                slot_data = tokens_db.get(active_slot, {})
+                                phone_found = slot_data.get("phone", "Unknown")
+                                
+                                await send_telegram(chat_id, f"✅ Token & session cookies saved to *Slot {active_slot}*!\n📞 Linked Phone/User: `{phone_found}`")
+                        elif text.startswith("/refreshphones"):
+                            tokens_db = load_json(TOKENS_FILE)
+                            user_slots = tokens_db.get(chat_str, {})
+                            
+                            if not user_slots:
+                                await send_telegram(chat_id, "❌ No accounts configured yet.")
+                            else:
+                                await send_telegram(chat_id, "🔄 Querying Chowdeck servers for all linked account phone numbers...")
+                                updated_count = 0
+                                
+                                for slot_id, s_data in user_slots.items():
+                                    token = s_data.get("token")
+                                    cookies = s_data.get("cookies", {})
+                                    if token:
+                                        phone = await fetch_account_phone(token, cookies)
+                                        if phone:
+                                            s_data["phone"] = str(phone)[:15]
+                                            updated_count += 1
+                                            
+                                save_json(TOKENS_FILE, tokens_db)
+                                await send_telegram(
+                                    chat_id, 
+                                    f"✅ *Phone Number Sync Complete!*\nSuccessfully updated phone numbers for `{updated_count}` configured slots. Open `👥 My Accounts` to view them."
+                                )
                         elif text.startswith("/setcart"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
