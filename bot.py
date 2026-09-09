@@ -5,6 +5,7 @@ import json
 import unicodedata
 import urllib.parse
 import threading
+import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 import time
@@ -115,6 +116,17 @@ def get_admin_stats():
     total_carts_configured = sum(len(carts) for carts in carts_db.values())
     return total_users, total_slots_configured, total_carts_configured
 
+def parse_jwt_payload(token):
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+            decoded_bytes = base64.urlsafe_b64decode(payload_b64)
+            return json.loads(decoded_bytes.decode('utf-8'))
+    except Exception:
+        pass
+    return {}
+
 def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = raw_input.strip()
     extracted_token = cleaned
@@ -150,6 +162,10 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     if extracted_token.lower().startswith("bearer "):
         extracted_token = extracted_token[7:].strip()
 
+    if not extracted_phone and extracted_token.count(".") == 2:
+        jwt_data = parse_jwt_payload(extracted_token)
+        extracted_phone = jwt_data.get("phone_number") or jwt_data.get("phone") or jwt_data.get("sub") or jwt_data.get("email")
+
     tokens_db = load_json(TOKENS_FILE)
     if chat_str not in tokens_db:
         tokens_db[chat_str] = {}
@@ -166,6 +182,12 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     return extracted_token
 
 async def fetch_account_phone(token, cookies):
+    if token and token.count(".") == 2:
+        jwt_data = parse_jwt_payload(token)
+        phone = jwt_data.get("phone_number") or jwt_data.get("phone") or jwt_data.get("sub")
+        if phone:
+            return phone
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -180,8 +202,11 @@ async def fetch_account_phone(token, cookies):
             execute_chowdeck_request, "GET", profile_url, headers, cookies, None
         )
         if res.status_code == 200:
-            data = res.json().get("data", {})
-            phone = data.get("phone_number") or data.get("phone")
+            res_json = res.json()
+            data = res_json.get("data", {})
+            if not isinstance(data, dict):
+                data = res_json
+            phone = data.get("phone_number") or data.get("phone") or data.get("user", {}).get("phone_number")
             return phone
     except Exception as e:
         print(f"Profile fetch error: {e}", flush=True)
@@ -690,7 +715,7 @@ async def telegram_poller():
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
                             elif data_action == "btn_refresh_phones":
-                                await answer_callback_query(cq_id, "Querying Chowdeck profiles...")
+                                await answer_callback_query(cq_id, "Querying Chowdeck profiles & JWT claims...")
                                 user_slots = load_json(TOKENS_FILE).get(chat_str, {})
                                 updated_count = 0
                                 for slot_id, s_data in user_slots.items():
@@ -946,7 +971,7 @@ async def telegram_poller():
                             if not user_slots:
                                 await send_telegram(chat_id, "❌ No accounts configured yet.")
                             else:
-                                await send_telegram(chat_id, "🔄 Querying Chowdeck servers for all linked account phone numbers...")
+                                await send_telegram(chat_id, "🔄 Querying Chowdeck profiles & JWT claims...")
                                 updated_count = 0
                                 
                                 for slot_id, s_data in user_slots.items():
