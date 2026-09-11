@@ -576,7 +576,7 @@ async def claim_code_global(raw_code):
                 await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Claims the code for the sender, auto-claims for the admin, and notifies other users transparently."""
+    """Claims the code 100% privately for the sender only, with no public broadcasts or admin auto-claims to prevent lag/rate-limiting."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -591,7 +591,6 @@ async def claim_code_isolated(chat_str, raw_code):
     answers_db = load_json(ANSWER_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
 
-    # 1. Claim for the user who pasted it
     await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
     tasks = [
         claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
@@ -632,37 +631,6 @@ async def claim_code_isolated(chat_str, raw_code):
                 summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
             
             await send_telegram(chat_id=int(chat_str), text=summary_msg)
-
-    # 2. Admin Auto-Claim Perk (If sender is not admin and ADMIN_CHAT_ID is configured)
-    if ADMIN_CHAT_ID and chat_str != ADMIN_CHAT_ID:
-        admin_slots = tokens_db.get(ADMIN_CHAT_ID, {})
-        if admin_slots:
-            await send_telegram(int(ADMIN_CHAT_ID), f"👑 *Admin Auto-Claim*: User pasted code `{code}` in chat. Firing across your admin slots...")
-            admin_tasks = [
-                claim_slot_worker(chat_id=int(ADMIN_CHAT_ID), slot_id=slot_id, token_data=t_data, code=code, 
-                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
-                for slot_id, t_data in admin_slots.items()
-            ]
-            admin_results = await asyncio.gather(*admin_tasks)
-            for res in admin_results:
-                slot = res["slot"]
-                if res.get("status") == 0:
-                    continue
-                status = res["status"]
-                resp_data = res.get("response", {})
-                cart_suffix = res.get("cart_str", "")
-                admin_summary = f"👑 *Admin Claim Result for `{code}`* (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-                await send_telegram(int(ADMIN_CHAT_ID), admin_summary)
-
-    # 3. Transparent notification to ALL OTHER users (excluding sender and admin)
-    for other_chat_str, other_slots in tokens_db.items():
-        if other_chat_str != chat_str and other_chat_str != ADMIN_CHAT_ID and other_slots:
-            alert_msg = (
-                f"📢 *Activity Alert*\n"
-                f"A user submitted a personal code: `{code}`.\n"
-                f"If you wish to claim it as well, you can paste or use it!"
-            )
-            await send_telegram(int(other_chat_str), alert_msg)
 
 async def worker():
     while True:
