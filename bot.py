@@ -28,6 +28,7 @@ PENDING_PROMPT_FILE = os.path.join(DATA_DIR, "pending_prompts.json")
 ACCOUNT_TOGGLES_FILE = os.path.join(DATA_DIR, "account_toggles.json")
 BURNER_FILE = os.path.join(DATA_DIR, "admin_burner.json")
 BURNER_CART_FILE = os.path.join(DATA_DIR, "admin_burner_cart.json")
+PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -66,6 +67,9 @@ def set_user_mode(chat_str, mode):
     modes = load_json(MODE_FILE)
     modes[chat_str] = mode
     save_json(MODE_FILE, modes)
+
+def get_max_slots(chat_str):
+    return 20 if (ADMIN_CHAT_ID and chat_str == ADMIN_CHAT_ID) else 10
 
 def get_active_slot(chat_str):
     slots = load_json(ACTIVE_SLOT_FILE)
@@ -115,6 +119,22 @@ def get_admin_stats():
     total_slots_configured = sum(len(slots) for slots in tokens_db.values())
     total_carts_configured = sum(len(carts) for carts in carts_db.values())
     return total_users, total_slots_configured, total_carts_configured
+
+def record_portfolio_win(chat_str, code, amount=1000):
+    portfolio = load_json(PORTFOLIO_FILE)
+    if chat_str not in portfolio:
+        portfolio[chat_str] = {"items": [], "total_value": 0}
+    
+    # Avoid duplicate entry for the exact same code on the same user
+    existing_codes = [item["code"] for item in portfolio[chat_str]["items"]]
+    if code not in existing_codes:
+        portfolio[chat_str]["items"].append({
+            "code": code,
+            "amount": amount,
+            "timestamp": time.time()
+        })
+        portfolio[chat_str]["total_value"] = sum(item["amount"] for item in portfolio[chat_str]["items"])
+        save_json(PORTFOLIO_FILE, portfolio)
 
 def parse_jwt_payload(token):
     try:
@@ -240,7 +260,7 @@ async def send_telegram(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            res = await temp_client.post(url, json=payload, timeout=15.0)
+            res = await temp_client.post(url, json=payload, timeout=10.0)
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram send error to {chat_id}: {e}", flush=True)
@@ -250,12 +270,12 @@ async def answer_callback_query(callback_query_id, text=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     try:
         async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=10.0)
+            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=5.0)
     except Exception as e:
         print(f"Callback answer error: {e}", flush=True)
 
 def execute_chowdeck_request(method, url, headers, cookies, json_data):
-    with httpx.Client(timeout=15.0, proxy=PROXY_URL if PROXY_URL else None) as client:
+    with httpx.Client(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None) as client:
         if method == "POST":
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
@@ -263,10 +283,14 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
     current_mode = get_user_mode(chat_str).upper()
+    max_slots = get_max_slots(chat_str)
     
     slot_row_1 = []
     slot_row_2 = []
-    for i in range(1, 11):
+    slot_row_3 = []
+    slot_row_4 = []
+    
+    for i in range(1, max_slots + 1):
         s_str = str(i)
         is_active = is_slot_active_state(chat_str, s_str)
         icon = "✅" if is_active else "❌"
@@ -275,23 +299,35 @@ def build_control_keyboard(chat_str, is_admin):
         btn = {"text": label, "callback_data": f"slot_{i}"}
         if i <= 5:
             slot_row_1.append(btn)
-        else:
+        elif i <= 10:
             slot_row_2.append(btn)
+        elif i <= 15:
+            slot_row_3.append(btn)
+        else:
+            slot_row_4.append(btn)
         
-    keyboard = [
-        slot_row_1,
-        slot_row_2,
+    keyboard = [slot_row_1, slot_row_2]
+    if slot_row_3:
+        keyboard.append(slot_row_3)
+    if slot_row_4:
+        keyboard.append(slot_row_4)
+        
+    keyboard.extend([
         [
             {"text": "👥 My Accounts", "callback_data": "btn_my_accounts"},
-            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"}
+            {"text": "💰 Portfolio", "callback_data": "btn_portfolio"}
         ],
         [
-            {"text": "🔄 Refresh", "callback_data": "btn_status"},
+            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
+            {"text": "🔄 Refresh", "callback_data": "btn_status"}
+        ],
+        [
             {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
         ]
-    ]
+    ])
+    
     if is_admin:
-        keyboard.insert(2, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
+        keyboard.insert(len(keyboard) - 1, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"}
@@ -300,9 +336,10 @@ def build_control_keyboard(chat_str, is_admin):
 
 def build_accounts_keyboard(chat_str):
     tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+    max_slots = get_max_slots(chat_str)
     rows = []
     row = []
-    for i in range(1, 11):
+    for i in range(1, max_slots + 1):
         s_str = str(i)
         active = is_slot_active_state(chat_str, s_str)
         status_icon = "✅" if active else "❌"
@@ -313,7 +350,7 @@ def build_accounts_keyboard(chat_str):
         if phone_label:
             label = f"{status_icon} S{i}: {phone_label}"
         else:
-            label = f"{status_icon} Slot {i} (Empty)"
+            label = f"{status_icon} S{i} (Empty)"
             
         row.append({"text": label, "callback_data": f"toggle_acc_{i}"})
         if len(row) == 2:
@@ -502,6 +539,9 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             )
             cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
 
+        if claim_res.status_code in [200, 201]:
+            record_portfolio_win(chat_str, code)
+
         return {
             "slot": slot_key,
             "status": claim_res.status_code,
@@ -576,7 +616,7 @@ async def claim_code_global(raw_code):
                 await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Claims the code 100% privately for the sender only, with no public broadcasts or admin auto-claims to prevent lag/rate-limiting."""
+    """Claims the code 100% privately for the sender only, with no public broadcasts or admin auto-claims."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -650,11 +690,11 @@ async def worker():
                 print(f"Worker error: {e}", flush=True)
             finally:
                 code_queue.task_done()
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
 async def process_text_global(text):
     if not text:
@@ -733,7 +773,7 @@ async def telegram_poller():
     async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as tg_client:
         while True:
             try:
-                res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 30}, timeout=35.0)
+                res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 25}, timeout=30.0)
                 if res.status_code == 200:
                     for update in res.json().get("result", []):
                         last_update_id = update["update_id"]
@@ -746,6 +786,7 @@ async def telegram_poller():
                             data_action = cq["data"]
                             chat_str = str(chat_id)
                             is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+                            max_slots = get_max_slots(chat_str)
                             
                             if data_action.startswith("slot_"):
                                 slot_num = data_action.split("_")[1]
@@ -757,9 +798,9 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
                                     f"• Active Slot: `Slot {slot_num}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
                                     f"• Mode: `{user_m.upper()}`\n"
                                     f"• Master Answer: `{m_ans}`\n\n"
                                     "Select an option below:"
@@ -778,10 +819,10 @@ async def telegram_poller():
                                 state_text = "Activated" if new_state else "Deactivated"
                                 await answer_callback_query(cq_id, f"Slot {s_num} {state_text}!")
                                 
-                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
-                                    f"Total Configured: `10` | Active: `{active_count}`\n\n"
+                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
+                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n\n"
                                     f"Click a button below to toggle its active state:\n"
                                     f"✅ = Active & Sniping | ❌ = Disabled"
                                 )
@@ -794,10 +835,10 @@ async def telegram_poller():
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
                             elif data_action == "btn_my_accounts":
-                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
-                                    f"Total Slots: `10` | Active: `{active_count}`\n\n"
+                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
+                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n\n"
                                     f"Click a button below to toggle its active state:\n"
                                     f"✅ = Active & Sniping | ❌ = Disabled"
                                 )
@@ -810,6 +851,20 @@ async def telegram_poller():
                                     "parse_mode": "Markdown",
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
+                            elif data_action == "btn_portfolio":
+                                portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
+                                items = portfolio_data.get("items", [])
+                                total_val = portfolio_data.get("total_value", 0)
+                                
+                                items_snippet = "\n".join([f"• `{i['code']}` — ₦{i['amount']}" for i in items[-10:]]) if items else "No claims recorded yet."
+                                portfolio_text = (
+                                    f"💰 *Your Claim Portfolio*\n\n"
+                                    f"• Total Vouchers Claimed: `{len(items)}`\n"
+                                    f"• Total Value Saved: `₦{total_val:,}`\n\n"
+                                    f"📜 *Recent Claims:*\n{items_snippet}"
+                                )
+                                await answer_callback_query(cq_id, "Portfolio loaded!")
+                                await send_telegram(chat_id, portfolio_text)
                             elif data_action == "btn_refresh_phones":
                                 await answer_callback_query(cq_id, "Querying Chowdeck profiles & JWT claims...")
                                 user_slots = load_json(TOKENS_FILE).get(chat_str, {})
@@ -826,10 +881,10 @@ async def telegram_poller():
                                 tokens_db[chat_str] = user_slots
                                 save_json(TOKENS_FILE, tokens_db)
                                 
-                                active_count = sum(1 for i in range(1, 11) if is_slot_active_state(chat_str, str(i)))
+                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-10)*\n"
-                                    f"Total Slots: `10` | Active: `{active_count}`\n"
+                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
+                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n"
                                     f"Refreshed phones for `{updated_count}` slots!\n\n"
                                     f"Click a button below to toggle its active state:"
                                 )
@@ -873,9 +928,9 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 menu_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
                                     f"• Mode: `{user_m.upper()}`\n"
                                     f"• Master Answer: `{m_ans}`\n\n"
                                     "Select an option below:"
@@ -899,9 +954,9 @@ async def telegram_poller():
                                 master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
                                 m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                                 updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
+                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / 10`\n"
+                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
                                     f"• Mode: `{new_m.upper()}`\n"
                                     f"• Master Answer: `{m_ans}`\n\n"
                                     "Select an option below:"
@@ -939,7 +994,7 @@ async def telegram_poller():
                                 status_msg = (
                                     f"📊 *Portfolio Status*\n\n"
                                     f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Accounts: `{len(tokens_db)} / 10`\n"
+                                    f"• Configured Accounts: `{len(tokens_db)} / {max_slots}`\n"
                                     f"• Sniper Mode: `{user_m.upper()}`\n"
                                     f"• Master Answer: `{m_ans}`"
                                 )
@@ -947,8 +1002,8 @@ async def telegram_poller():
                                 await send_telegram(chat_id, status_msg)
                             elif data_action == "btn_guide":
                                 guide_msg = (
-                                    "📖 *Multi-Account Sniper Guide (1-10)*\n\n"
-                                    "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 10` on the keyboard.\n\n"
+                                    f"📖 *Multi-Account Sniper Guide (1-{max_slots})*\n\n"
+                                    f"1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot {max_slots}` on the keyboard.\n\n"
                                     "2️⃣ *Manage Accounts:*\nTap `👥 My Accounts` to activate/deactivate specific slots with ✅/❌ toggles.\n\n"
                                     "3️⃣ *Link Token:*\n`/settoken <token>`\n\n"
                                     "4️⃣ *Set Phone/Label Manually:*\n`/setphone <phone_or_label>`\n\n"
@@ -979,6 +1034,7 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                         active_slot = get_active_slot(chat_str)
+                        max_slots = get_max_slots(chat_str)
 
                         pending_prompts = load_json(PENDING_PROMPT_FILE)
                         if chat_str in pending_prompts and not text.startswith("/"):
@@ -1025,9 +1081,9 @@ async def telegram_poller():
                             m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
                             
                             help_text = (
-                                "🤖 *Chowdeck Multi-Account Sniper Active (1-10)*\n\n"
+                                f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
                                 f"• Active Slot: `Slot {active_slot}`\n"
-                                f"• Configured Slots: `{len(tokens_db)} / 10`\n"
+                                f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
                                 f"• Mode: `{user_m.upper()}`\n"
                                 f"• Master Answer: `{m_ans}`\n\n"
                                 "Select an option below:"
@@ -1044,13 +1100,25 @@ async def telegram_poller():
                                 f"• Total Carts Linked: `{c_count}`"
                             )
                             await send_telegram(chat_id, admin_text, reply_markup=build_control_keyboard(chat_str, is_admin))
+                        elif text.startswith("/portfolio") or text.startswith("/vouchers"):
+                            portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
+                            items = portfolio_data.get("items", [])
+                            total_val = portfolio_data.get("total_value", 0)
+                            items_snippet = "\n".join([f"• `{i['code']}` — ₦{i['amount']}" for i in items[-15:]]) if items else "No claims recorded yet."
+                            portfolio_text = (
+                                f"💰 *Your Claim Portfolio*\n\n"
+                                f"• Total Vouchers Claimed: `{len(items)}`\n"
+                                f"• Total Value Saved: `₦{total_val:,}`\n\n"
+                                f"📜 *Recent Claims:*\n{items_snippet}"
+                            )
+                            await send_telegram(chat_id, portfolio_text)
                         elif text.startswith("/acc"):
                             parts = text.split(" ", 1)
-                            if len(parts) > 1 and parts[1].strip() in [str(i) for i in range(1, 11)]:
+                            if len(parts) > 1 and parts[1].strip() in [str(i) for i in range(1, max_slots + 1)]:
                                 set_active_slot(chat_str, parts[1].strip())
                                 await send_telegram(chat_id, f"✅ Switched to *Slot {parts[1].strip()}*.", reply_markup=build_control_keyboard(chat_str, is_admin))
                             else:
-                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-10>` or tap buttons above.")
+                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-{max_slots}>` or tap buttons above.")
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
@@ -1185,7 +1253,7 @@ async def telegram_poller():
                 raise
             except Exception as e:
                 print(f"Poller error: {e}", flush=True)
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.1)
 
 async def main():
     global loop_ref
