@@ -127,6 +127,20 @@ def parse_jwt_payload(token):
         pass
     return {}
 
+def extract_phone_from_data(data):
+    if not isinstance(data, dict):
+        return None
+    return (
+        data.get("phone_number") or 
+        data.get("phone") or 
+        data.get("phoneNumber") or 
+        data.get("mobile") or 
+        data.get("telephone") or 
+        data.get("user_phone") or
+        data.get("user", {}).get("phone_number") or
+        data.get("user", {}).get("phone")
+    )
+
 def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = raw_input.strip()
     extracted_token = cleaned
@@ -146,7 +160,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
                         data = json.loads(decoded)
                         if "token" in data:
                             extracted_token = data["token"]
-                        extracted_phone = data.get("phone_number") or data.get("phone") or data.get("name") or data.get("email")
+                        extracted_phone = extract_phone_from_data(data)
         except Exception as e:
             print(f"Cookie parse error: {e}", flush=True)
 
@@ -155,7 +169,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
             data = json.loads(cleaned)
             if "token" in data:
                 extracted_token = data["token"]
-            extracted_phone = data.get("phone_number") or data.get("phone") or data.get("name") or data.get("email")
+            extracted_phone = extract_phone_from_data(data)
         except Exception:
             pass
             
@@ -164,7 +178,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
 
     if not extracted_phone and extracted_token.count(".") == 2:
         jwt_data = parse_jwt_payload(extracted_token)
-        extracted_phone = jwt_data.get("phone_number") or jwt_data.get("phone") or jwt_data.get("sub") or jwt_data.get("email")
+        extracted_phone = extract_phone_from_data(jwt_data)
 
     tokens_db = load_json(TOKENS_FILE)
     if chat_str not in tokens_db:
@@ -184,7 +198,7 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
 async def fetch_account_phone(token, cookies):
     if token and token.count(".") == 2:
         jwt_data = parse_jwt_payload(token)
-        phone = jwt_data.get("phone_number") or jwt_data.get("phone") or jwt_data.get("sub")
+        phone = extract_phone_from_data(jwt_data)
         if phone:
             return phone
 
@@ -206,7 +220,7 @@ async def fetch_account_phone(token, cookies):
             data = res_json.get("data", {})
             if not isinstance(data, dict):
                 data = res_json
-            phone = data.get("phone_number") or data.get("phone") or data.get("user", {}).get("phone_number")
+            phone = extract_phone_from_data(data)
             return phone
     except Exception as e:
         print(f"Profile fetch error: {e}", flush=True)
@@ -498,7 +512,8 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
     except Exception as e:
         return {"slot": slot_key, "status": 500, "message": str(e)}
 
-async def claim_code(raw_code):
+async def claim_code_global(raw_code):
+    """Claims the code across ALL users in tokens_db (triggered by X webhook)."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -560,12 +575,109 @@ async def claim_code(raw_code):
                 
                 await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
+async def claim_code_isolated(chat_str, raw_code):
+    """Claims the code for the sender, auto-claims for the admin, and notifies other users transparently."""
+    code = robust_clean_code(raw_code)
+    if not code or len(code) < 4:
+        return
+
+    tokens_db = load_json(TOKENS_FILE)
+    user_slots = tokens_db.get(chat_str, {})
+    if not user_slots:
+        await send_telegram(int(chat_str), "❌ You have no accounts configured to claim this code.")
+        return
+
+    carts_db = load_json(CARTS_FILE)
+    answers_db = load_json(ANSWER_FILE)
+    lockouts_db = load_json(LOCKOUT_FILE)
+
+    # 1. Claim for the user who pasted it
+    await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
+    tasks = [
+        claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
+                          carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
+        for slot_id, t_data in user_slots.items()
+    ]
+    results = await asyncio.gather(*tasks)
+
+    for res in results:
+        slot = res["slot"]
+        if res.get("status") == 0:
+            continue
+            
+        status = res["status"]
+        resp_data = res.get("response", {})
+        cart_suffix = res.get("cart_str", "")
+        
+        if res.get("needs_prompt"):
+            q_text = res["question"]
+            pending = load_json(PENDING_PROMPT_FILE)
+            pending[chat_str] = {"code": code, "slot": slot}
+            save_json(PENDING_PROMPT_FILE, pending)
+            
+            prompt_msg = (
+                f"🔒 *Security Question Detected for personal code `{code}` (Slot {slot})!*\n"
+                f"Question: *\"{q_text}\"*\n\n"
+                f"⚡ *Type the answer right here in chat* to respond!"
+            )
+            await send_telegram(chat_id=int(chat_str), text=prompt_msg)
+        else:
+            if status == 500:
+                summary_msg = (
+                    f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
+                    f"Status: `500 (Internal Server Error)`\n"
+                    f"💡 *Note:* Chowdeck returned a 500 error, check your app account to verify!"
+                )
+            else:
+                summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+            
+            await send_telegram(chat_id=int(chat_str), text=summary_msg)
+
+    # 2. Admin Auto-Claim Perk (If sender is not admin and ADMIN_CHAT_ID is configured)
+    if ADMIN_CHAT_ID and chat_str != ADMIN_CHAT_ID:
+        admin_slots = tokens_db.get(ADMIN_CHAT_ID, {})
+        if admin_slots:
+            await send_telegram(int(ADMIN_CHAT_ID), f"👑 *Admin Auto-Claim*: User pasted code `{code}` in chat. Firing across your admin slots...")
+            admin_tasks = [
+                claim_slot_worker(chat_id=int(ADMIN_CHAT_ID), slot_id=slot_id, token_data=t_data, code=code, 
+                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
+                for slot_id, t_data in admin_slots.items()
+            ]
+            admin_results = await asyncio.gather(*admin_tasks)
+            for res in admin_results:
+                slot = res["slot"]
+                if res.get("status") == 0:
+                    continue
+                status = res["status"]
+                resp_data = res.get("response", {})
+                cart_suffix = res.get("cart_str", "")
+                admin_summary = f"👑 *Admin Claim Result for `{code}`* (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+                await send_telegram(int(ADMIN_CHAT_ID), admin_summary)
+
+    # 3. Transparent notification to ALL OTHER users (excluding sender and admin)
+    for other_chat_str, other_slots in tokens_db.items():
+        if other_chat_str != chat_str and other_chat_str != ADMIN_CHAT_ID and other_slots:
+            alert_msg = (
+                f"📢 *Activity Alert*\n"
+                f"A user submitted a personal code: `{code}`.\n"
+                f"If you wish to claim it as well, you can paste or use it!"
+            )
+            await send_telegram(int(other_chat_str), alert_msg)
+
 async def worker():
     while True:
         try:
-            code = await code_queue.get()
+            item = await code_queue.get()
             try:
-                await claim_code(code)
+                if isinstance(item, tuple):
+                    source_type, data = item
+                    if source_type == "global":
+                        await claim_code_global(data)
+                    elif source_type == "isolated":
+                        chat_str, code = data
+                        await claim_code_isolated(chat_str, code)
+                else:
+                    await claim_code_global(item)
             except Exception as e:
                 print(f"Worker error: {e}", flush=True)
             finally:
@@ -576,7 +688,7 @@ async def worker():
         except Exception as e:
             await asyncio.sleep(2)
 
-async def process_text(text):
+async def process_text_global(text):
     if not text:
         return
     pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
@@ -590,7 +702,23 @@ async def process_text(text):
             valid.append(cleaned)
             
     for code in list(dict.fromkeys(valid)):
-        await code_queue.put(code)
+        await code_queue.put(("global", code))
+
+async def process_text_isolated(chat_str, text):
+    if not text:
+        return
+    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
+    codes = re.findall(pattern, text)
+    ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
+    
+    valid = []
+    for c in codes:
+        cleaned = robust_clean_code(c)
+        if cleaned and cleaned not in ignore:
+            valid.append(cleaned)
+            
+    for code in list(dict.fromkeys(valid)):
+        await code_queue.put(("isolated", (chat_str, code)))
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -615,7 +743,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             data = json.loads(body)
             text = data.get("text", "")
             if text and loop_ref:
-                asyncio.run_coroutine_threadsafe(process_text(text), loop_ref)
+                asyncio.run_coroutine_threadsafe(process_text_global(text), loop_ref)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
@@ -855,9 +983,10 @@ async def telegram_poller():
                                     "1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot 10` on the keyboard.\n\n"
                                     "2️⃣ *Manage Accounts:*\nTap `👥 My Accounts` to activate/deactivate specific slots with ✅/❌ toggles.\n\n"
                                     "3️⃣ *Link Token:*\n`/settoken <token>`\n\n"
-                                    "4️⃣ *Refresh Phones:*\n`/refreshphones` or use the menu button.\n\n"
-                                    "5️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
-                                    "6️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
+                                    "4️⃣ *Set Phone/Label Manually:*\n`/setphone <phone_or_label>`\n\n"
+                                    "5️⃣ *Refresh Phones:*\n`/refreshphones` or use the menu button.\n\n"
+                                    "6️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
+                                    "7️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
                                 )
                                 await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
@@ -898,7 +1027,7 @@ async def telegram_poller():
                                 answers_db[chat_str]["master"] = [user_ans]
                                 save_json(ANSWER_FILE, answers_db)
                                 
-                                await send_telegram(chat_id, f"⚡ *Emergency Answer Captured!* Blasting `{user_ans}` instantly across all active slots for `{target_code}`...")
+                                await send_telegram(chat_id, f"⚡ *Emergency Answer Captured!* Blasting `{user_ans}` instantly across your active slots for `{target_code}`...")
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 carts_db = load_json(CARTS_FILE)
@@ -964,6 +1093,20 @@ async def telegram_poller():
                                 phone_found = slot_data.get("phone", "Unknown")
                                 
                                 await send_telegram(chat_id, f"✅ Token & session cookies saved to *Slot {active_slot}*!\n📞 Linked Phone/User: `{phone_found}`")
+                        elif text.startswith("/setphone"):
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                custom_phone = parts[1].strip()[:15]
+                                tokens_db = load_json(TOKENS_FILE)
+                                if chat_str not in tokens_db:
+                                    tokens_db[chat_str] = {}
+                                if active_slot not in tokens_db[chat_str]:
+                                    tokens_db[chat_str][active_slot] = {}
+                                tokens_db[chat_str][active_slot]["phone"] = custom_phone
+                                save_json(TOKENS_FILE, tokens_db)
+                                await send_telegram(chat_id, f"✅ Phone/Label for *Slot {active_slot}* set to: `{custom_phone}`")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/setphone <phone_number_or_label>`")
                         elif text.startswith("/refreshphones"):
                             tokens_db = load_json(TOKENS_FILE)
                             user_slots = tokens_db.get(chat_str, {})
@@ -1069,7 +1212,7 @@ async def telegram_poller():
                             set_bot_active(True)
                             await send_telegram(chat_id, "▶️ Bridge Resumed.")
                         else:
-                            await process_text(text)
+                            await process_text_isolated(chat_str, text)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
