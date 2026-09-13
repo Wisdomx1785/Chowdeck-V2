@@ -11,8 +11,15 @@ import httpx
 import time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+
+# GetXAPI Key Pool Management
+GETXAPI_KEYS_RAW = os.getenv("GETXAPI_KEYS", "").strip()
+GETXAPI_KEYS = [k.strip() for k in GETXAPI_KEYS_RAW.split(",") if k.strip()]
+getxapi_index = 0
+getxapi_lock = threading.Lock()
 
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.dirname(os.path.abspath(__file__)))
 
@@ -120,16 +127,16 @@ def get_admin_stats():
     total_carts_configured = sum(len(carts) for carts in carts_db.values())
     return total_users, total_slots_configured, total_carts_configured
 
-def record_portfolio_win(chat_str, code, amount=1000):
+def record_portfolio_win(chat_str, code, slot_id, amount=2000):
     portfolio = load_json(PORTFOLIO_FILE)
     if chat_str not in portfolio:
         portfolio[chat_str] = {"items": [], "total_value": 0}
     
-    # Avoid duplicate entry for the exact same code on the same user
-    existing_codes = [item["code"] for item in portfolio[chat_str]["items"]]
-    if code not in existing_codes:
+    already_logged = any(item["code"] == code and str(item.get("slot")) == str(slot_id) for item in portfolio[chat_str]["items"])
+    if not already_logged:
         portfolio[chat_str]["items"].append({
             "code": code,
+            "slot": str(slot_id),
             "amount": amount,
             "timestamp": time.time()
         })
@@ -254,8 +261,10 @@ def robust_clean_code(raw):
     return cleaned
 
 async def send_telegram(chat_id, text, reply_markup=None):
+    if not chat_id:
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": int(chat_id), "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
@@ -265,6 +274,11 @@ async def send_telegram(chat_id, text, reply_markup=None):
     except Exception as e:
         print(f"Telegram send error to {chat_id}: {e}", flush=True)
         return None
+
+async def broadcast_to_channel(text):
+    if not TELEGRAM_CHANNEL_ID:
+        return
+    await send_telegram(TELEGRAM_CHANNEL_ID, text)
 
 async def answer_callback_query(callback_query_id, text=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
@@ -279,6 +293,30 @@ def execute_chowdeck_request(method, url, headers, cookies, json_data):
         if method == "POST":
             return client.post(url, json=json_data, headers=headers, cookies=cookies)
         return client.get(url, headers=headers, cookies=cookies)
+
+# GetXAPI Key Rotator & Notifier Helper
+def get_current_getxapi_key():
+    global getxapi_index
+    with getxapi_lock:
+        if not GETXAPI_KEYS:
+            return None
+        if getxapi_index >= len(GETXAPI_KEYS):
+            return None
+        return GETXAPI_KEYS[getxapi_index]
+
+def rotate_getxapi_key(reason="Rate limited / Exhausted"):
+    global getxapi_index
+    with getxapi_lock:
+        old_idx = getxapi_index
+        getxapi_index += 1
+        new_idx = getxapi_index
+        
+    if ADMIN_CHAT_ID:
+        if new_idx < len(GETXAPI_KEYS):
+            msg = f"⚠️ *GetXAPI Key #{old_idx + 1} Exhausted* ({reason})!\n🔄 Automatically switched to Key #{new_idx + 1}."
+        else:
+            msg = f"❌ *All GetXAPI Keys Exhausted!* ({reason}). No keys left in pool!"
+        asyncio.run_coroutine_threadsafe(send_telegram(ADMIN_CHAT_ID, msg), loop_ref)
 
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
@@ -540,7 +578,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
 
         if claim_res.status_code in [200, 201]:
-            record_portfolio_win(chat_str, code)
+            record_portfolio_win(chat_str, code, slot_key, amount=2000)
 
         return {
             "slot": slot_key,
@@ -553,7 +591,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         return {"slot": slot_key, "status": 500, "message": str(e)}
 
 async def claim_code_global(raw_code):
-    """Claims the code across ALL users in tokens_db (triggered by X webhook)."""
+    """Flattens and fires EVERY slot across EVERY user simultaneously in one massive global parallel blast."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -562,6 +600,12 @@ async def claim_code_global(raw_code):
     if code in claimed_history:
         return
 
+    await broadcast_to_channel(
+        f"🚨 *New Chowdeck Code Detected!*\n\n"
+        f"Code: `{code}`\n"
+        f"⚡ *Rush to your bot now before it flies away!*"
+    )
+
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
     answers_db = load_json(ANSWER_FILE)
@@ -569,54 +613,70 @@ async def claim_code_global(raw_code):
     
     if not tokens_db:
         return
-    
+
+    all_tasks = []
+    task_meta = []
+
     for chat_str, user_slots in tokens_db.items():
         if not user_slots:
             continue
-            
-        tasks = [
-            claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
-                              carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
-            for slot_id, t_data in user_slots.items()
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        
-        for res in results:
-            slot = res["slot"]
-            if res.get("status") == 0:
-                continue
-                
-            status = res["status"]
-            resp_data = res.get("response", {})
-            cart_suffix = res.get("cart_str", "")
-            
-            if res.get("needs_prompt"):
-                q_text = res["question"]
-                pending = load_json(PENDING_PROMPT_FILE)
-                pending[chat_str] = {"code": code, "slot": slot}
-                save_json(PENDING_PROMPT_FILE, pending)
-                
-                prompt_msg = (
-                    f"🔒 *Security Question Detected for `{code}` (Slot {slot})!*\n"
-                    f"Question: *\"{q_text}\"*\n\n"
-                    f"⚡ *Type the answer right here in chat* to instantly broadcast it to all active slots!"
+        for slot_id, t_data in user_slots.items():
+            all_tasks.append(
+                claim_slot_worker(
+                    chat_id=int(chat_str), 
+                    slot_id=slot_id, 
+                    token_data=t_data, 
+                    code=code, 
+                    carts_db=carts_db, 
+                    answers_db=answers_db, 
+                    lockouts_db=lockouts_db
                 )
-                await send_telegram(chat_id=int(chat_str), text=prompt_msg)
+            )
+            task_meta.append((chat_str, slot_id))
+
+    if not all_tasks:
+        return
+
+    results = await asyncio.gather(*all_tasks)
+
+    for (chat_str, slot), res in zip(task_meta, results):
+        if res.get("status") == 0:
+            continue
+            
+        status = res["status"]
+        resp_data = res.get("response", {})
+        cart_suffix = res.get("cart_str", "")
+        
+        if res.get("needs_prompt"):
+            q_text = res["question"]
+            pending = load_json(PENDING_PROMPT_FILE)
+            pending[chat_str] = {"code": code, "slot": slot}
+            save_json(PENDING_PROMPT_FILE, pending)
+            
+            await broadcast_to_channel(
+                f"🔒 *Security Question Triggered for `{code}`!*\n"
+                f"💬 *Answer the question directly in your bot chat or wait for admin broadcast!*"
+            )
+
+            prompt_msg = (
+                f"🔒 *Security Question Detected for `{code}` (Slot {slot})!*\n"
+                f"Question: *\"{q_text}\"*\n\n"
+                f"⚡ *Type the answer right here in chat* to instantly broadcast it to all active slots!"
+            )
+            await send_telegram(chat_id=int(chat_str), text=prompt_msg)
+        else:
+            if status == 500:
+                summary_msg = (
+                    f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
+                    f"Status: `500 (Internal Server Error)`\n"
+                    f"💡 *Note:* Chowdeck returned a 500 error, but during claims this often means it committed successfully. *Check your app account now to verify if it landed!*"
+                )
             else:
-                if status == 500:
-                    summary_msg = (
-                        f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
-                        f"Status: `500 (Internal Server Error)`\n"
-                        f"💡 *Note:* Chowdeck returned a 500 error, but during claims this often means it committed successfully. *Check your app account now to verify if it landed!*"
-                    )
-                else:
-                    summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-                
-                await send_telegram(chat_id=int(chat_str), text=summary_msg)
+                summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+            
+            await send_telegram(chat_id=int(chat_str), text=summary_msg)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Claims the code 100% privately for the sender only, with no public broadcasts or admin auto-claims."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -856,12 +916,12 @@ async def telegram_poller():
                                 items = portfolio_data.get("items", [])
                                 total_val = portfolio_data.get("total_value", 0)
                                 
-                                items_snippet = "\n".join([f"• `{i['code']}` — ₦{i['amount']}" for i in items[-10:]]) if items else "No claims recorded yet."
+                                items_snippet = "\n".join([f"• `{i['code']}` (S{i['slot']}) — ₦{i['amount']:,}" for i in items[-10:]]) if items else "No claims recorded yet."
                                 portfolio_text = (
                                     f"💰 *Your Claim Portfolio*\n\n"
-                                    f"• Total Vouchers Claimed: `{len(items)}`\n"
+                                    f"• Total Slot Wins: `{len(items)}`\n"
                                     f"• Total Value Saved: `₦{total_val:,}`\n\n"
-                                    f"📜 *Recent Claims:*\n{items_snippet}"
+                                    f"📜 *Recent Slot Claims:*\n{items_snippet}"
                                 )
                                 await answer_callback_query(cq_id, "Portfolio loaded!")
                                 await send_telegram(chat_id, portfolio_text)
@@ -1051,6 +1111,14 @@ async def telegram_poller():
                                 answers_db[chat_str]["master"] = [user_ans]
                                 save_json(ANSWER_FILE, answers_db)
                                 
+                                if is_admin:
+                                    await broadcast_to_channel(
+                                        f"💡 *Admin Answer Dropped!*\n\n"
+                                        f"Code: `{target_code}`\n"
+                                        f"Answer: `{user_ans}`\n\n"
+                                        f"⚡ *Copy and paste fast!*"
+                                    )
+                                
                                 await send_telegram(chat_id, f"⚡ *Emergency Answer Captured!* Blasting `{user_ans}` instantly across your active slots for `{target_code}`...")
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
@@ -1104,12 +1172,12 @@ async def telegram_poller():
                             portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
                             items = portfolio_data.get("items", [])
                             total_val = portfolio_data.get("total_value", 0)
-                            items_snippet = "\n".join([f"• `{i['code']}` — ₦{i['amount']}" for i in items[-15:]]) if items else "No claims recorded yet."
+                            items_snippet = "\n".join([f"• `{i['code']}` (S{i['slot']}) — ₦{i['amount']:,}" for i in items[-15:]]) if items else "No claims recorded yet."
                             portfolio_text = (
                                 f"💰 *Your Claim Portfolio*\n\n"
-                                f"• Total Vouchers Claimed: `{len(items)}`\n"
+                                f"• Total Slot Wins: `{len(items)}`\n"
                                 f"• Total Value Saved: `₦{total_val:,}`\n\n"
-                                f"📜 *Recent Claims:*\n{items_snippet}"
+                                f"📜 *Recent Slot Claims:*\n{items_snippet}"
                             )
                             await send_telegram(chat_id, portfolio_text)
                         elif text.startswith("/acc"):
