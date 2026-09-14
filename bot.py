@@ -139,7 +139,7 @@ def record_portfolio_win(chat_str, code, slot_id, amount=2000):
             "amount": amount,
             "timestamp": time.time()
         })
-        portfolio[chat_str]["total_value"] = sum(item["amount"] for item in portfolio[chat_str]["items"])
+        portfolio[chat_str]["total_value"] = sum(item.get("amount", 2000) for item in portfolio[chat_str]["items"])
         save_json(PORTFOLIO_FILE, portfolio)
 
 def parse_jwt_payload(token):
@@ -576,7 +576,6 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
-    # Use a single shared async client with high concurrency limits for true unthrottled parallelism
     limits = httpx.Limits(max_keepalive_connections=200, max_connections=500)
     async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
@@ -600,7 +599,6 @@ async def claim_code_global(raw_code):
         if not all_tasks:
             return
 
-        # True unthrottled concurrent execution across all slots at the exact same millisecond
         results = await asyncio.gather(*all_tasks)
 
     user_summaries = {}
@@ -807,9 +805,9 @@ async def telegram_poller():
                             max_slots = get_max_slots(chat_str)
                             
                             if data_action.startswith("slot_"):
+                                await answer_callback_query(cq_id, f"Switched slots")
                                 slot_num = data_action.split("_")[1]
                                 set_active_slot(chat_str, slot_num)
-                                await answer_callback_query(cq_id, f"Switched to Slot {slot_num}")
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 user_m = get_user_mode(chat_str)
@@ -832,10 +830,9 @@ async def telegram_poller():
                                     "reply_markup": build_control_keyboard(chat_str, is_admin)
                                 })
                             elif data_action.startswith("toggle_acc_"):
+                                await answer_callback_query(cq_id, f"Toggled account")
                                 s_num = data_action.split("_")[2]
-                                new_state = toggle_slot_state(chat_str, s_num)
-                                state_text = "Activated" if new_state else "Deactivated"
-                                await answer_callback_query(cq_id, f"Slot {s_num} {state_text}!")
+                                toggle_slot_state(chat_str, s_num)
                                 
                                 active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
@@ -853,6 +850,7 @@ async def telegram_poller():
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
                             elif data_action == "btn_my_accounts":
+                                await answer_callback_query(cq_id, "Accounts manager")
                                 active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
                                 acc_text = (
                                     f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
@@ -860,7 +858,6 @@ async def telegram_poller():
                                     f"Click a button below to toggle its active state:\n"
                                     f"✅ = Active & Sniping | ❌ = Disabled"
                                 )
-                                await answer_callback_query(cq_id, "Opening accounts manager...")
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
                                 await tg_client.post(url_edit, json={
                                     "chat_id": chat_id,
@@ -870,21 +867,21 @@ async def telegram_poller():
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
                             elif data_action == "btn_portfolio":
+                                await answer_callback_query(cq_id, "Portfolio loaded!")
                                 portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
                                 items = portfolio_data.get("items", [])
                                 total_val = portfolio_data.get("total_value", 0)
                                 
-                                items_snippet = "\n".join([f"• `{i['code']}` (S{i['slot']}) — ₦{i['amount']:,}" for i in items[-10:]]) if items else "No claims recorded yet."
+                                items_snippet = "\n".join([f"• `{i.get('code', 'UNKNOWN')}` (S{i.get('slot', '1')}) — ₦{i.get('amount', 2000):,}" for i in items[-10:]]) if items else "No claims recorded yet."
                                 portfolio_text = (
                                     f"💰 *Your Claim Portfolio*\n\n"
                                     f"• Total Slot Wins: `{len(items)}`\n"
                                     f"• Total Value Saved: `₦{total_val:,}`\n\n"
                                     f"📜 *Recent Slot Claims:*\n{items_snippet}"
                                 )
-                                await answer_callback_query(cq_id, "Portfolio loaded!")
                                 await send_telegram(chat_id, portfolio_text)
                             elif data_action == "btn_refresh_phones":
-                                await answer_callback_query(cq_id, "Querying Chowdeck profiles & JWT claims...")
+                                await answer_callback_query(cq_id, "Refreshing profiles...")
                                 user_slots = load_json(TOKENS_FILE).get(chat_str, {})
                                 updated_count = 0
                                 for slot_id, s_data in user_slots.items():
@@ -915,9 +912,8 @@ async def telegram_poller():
                                     "reply_markup": build_accounts_keyboard(chat_str)
                                 })
                             elif data_action == "btn_burner_menu":
-                                if not is_admin:
-                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
-                                else:
+                                await answer_callback_query(cq_id, "Burner panel opened")
+                                if is_admin:
                                     burner_data = get_burner_credentials(chat_str)
                                     b_status = "🟢 Linked" if burner_data.get("token") else "🔴 Not Configured"
                                     burner_text = (
@@ -928,7 +924,6 @@ async def telegram_poller():
                                         "• `/setburnercart <cart_id> <vendor_id>`\n"
                                         "• `/test <CODE>`"
                                     )
-                                    await answer_callback_query(cq_id, "Burner panel opened!")
                                     url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
                                     await tg_client.post(url_edit, json={
                                         "chat_id": chat_id,
@@ -938,8 +933,9 @@ async def telegram_poller():
                                         "reply_markup": build_admin_burner_keyboard()
                                     })
                             elif data_action == "burner_info":
-                                await answer_callback_query(cq_id, "Type /test <CODE> in chat to run safe check!")
+                                await answer_callback_query(cq_id, "Type /test <CODE>")
                             elif data_action == "btn_main_menu":
+                                await answer_callback_query(cq_id, "Main menu")
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
                                 user_m = get_user_mode(chat_str)
@@ -965,7 +961,7 @@ async def telegram_poller():
                                 current_m = get_user_mode(chat_str)
                                 new_m = "prompt" if current_m == "auto" else "auto"
                                 set_user_mode(chat_str, new_m)
-                                await answer_callback_query(cq_id, f"Mode switched to {new_m.upper()}")
+                                await answer_callback_query(cq_id, f"Mode: {new_m.upper()}")
                                 
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
@@ -988,9 +984,8 @@ async def telegram_poller():
                                     "reply_markup": build_control_keyboard(chat_str, is_admin)
                                 })
                             elif data_action == "btn_admin_stats":
-                                if not is_admin:
-                                    await answer_callback_query(cq_id, "⛔ Unauthorized!")
-                                else:
+                                await answer_callback_query(cq_id, "Stats loaded")
+                                if is_admin:
                                     u_count, s_count, c_count = get_admin_stats()
                                     bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
                                     admin_text = (
@@ -1000,9 +995,9 @@ async def telegram_poller():
                                         f"• Total Configured Slots: `{s_count}`\n"
                                         f"• Total Carts Linked: `{c_count}`"
                                     )
-                                    await answer_callback_query(cq_id, "Admin stats loaded!")
                                     await send_telegram(chat_id, admin_text)
                             elif data_action == "btn_status":
+                                await answer_callback_query(cq_id, "Status refreshed")
                                 tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
                                 active_s = get_active_slot(chat_str)
                                 user_m = get_user_mode(chat_str)
@@ -1016,9 +1011,9 @@ async def telegram_poller():
                                     f"• Sniper Mode: `{user_m.upper()}`\n"
                                     f"• Master Answer: `{m_ans}`"
                                 )
-                                await answer_callback_query(cq_id, "Status refreshed!")
                                 await send_telegram(chat_id, status_msg)
                             elif data_action == "btn_guide":
+                                await answer_callback_query(cq_id, "Guide opened")
                                 guide_msg = (
                                     f"📖 *Multi-Account Sniper Guide (1-{max_slots})*\n\n"
                                     f"1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot {max_slots}` on the keyboard.\n\n"
@@ -1029,17 +1024,16 @@ async def telegram_poller():
                                     "6️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
                                     "7️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
                                 )
-                                await answer_callback_query(cq_id, "Opening guide...")
                                 await send_telegram(chat_id, guide_msg)
                             elif data_action == "btn_pause":
+                                await answer_callback_query(cq_id, "Paused")
                                 if is_admin:
                                     set_bot_active(False)
-                                    await answer_callback_query(cq_id, "Bridge Paused!")
                                     await send_telegram(chat_id, "⏸️ *Bridge Paused* via inline button.")
                             elif data_action == "btn_resume":
+                                await answer_callback_query(cq_id, "Resumed")
                                 if is_admin:
                                     set_bot_active(True)
-                                    await answer_callback_query(cq_id, "Bridge Resumed!")
                                     await send_telegram(chat_id, "▶️ *Bridge Resumed* via inline button.")
                             continue
 
@@ -1132,7 +1126,7 @@ async def telegram_poller():
                             portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
                             items = portfolio_data.get("items", [])
                             total_val = portfolio_data.get("total_value", 0)
-                            items_snippet = "\n".join([f"• `{i['code']}` (S{i['slot']}) — ₦{i['amount']:,}" for i in items[-15:]]) if items else "No claims recorded yet."
+                            items_snippet = "\n".join([f"• `{i.get('code', 'UNKNOWN')}` (S{i.get('slot', '1')}) — ₦{i.get('amount', 2000):,}" for i in items[-15:]]) if items else "No claims recorded yet."
                             portfolio_text = (
                                 f"💰 *Your Claim Portfolio*\n\n"
                                 f"• Total Slot Wins: `{len(items)}`\n"
