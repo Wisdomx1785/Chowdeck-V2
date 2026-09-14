@@ -15,7 +15,6 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
-# GetXAPI Key Pool Management
 GETXAPI_KEYS_RAW = os.getenv("GETXAPI_KEYS", "").strip()
 GETXAPI_KEYS = [k.strip() for k in GETXAPI_KEYS_RAW.split(",") if k.strip()]
 getxapi_index = 0
@@ -239,16 +238,15 @@ async def fetch_account_phone(token, cookies):
     }
     profile_url = "https://api.chowdeck.com/customer/profile"
     try:
-        res = await asyncio.to_thread(
-            execute_chowdeck_request, "GET", profile_url, headers, cookies, None
-        )
-        if res.status_code == 200:
-            res_json = res.json()
-            data = res_json.get("data", {})
-            if not isinstance(data, dict):
-                data = res_json
-            phone = extract_phone_from_data(data)
-            return phone
+        async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None) as client:
+            res = await client.get(profile_url, headers=headers, cookies=cookies)
+            if res.status_code == 200:
+                res_json = res.json()
+                data = res_json.get("data", {})
+                if not isinstance(data, dict):
+                    data = res_json
+                phone = extract_phone_from_data(data)
+                return phone
     except Exception as e:
         print(f"Profile fetch error: {e}", flush=True)
     return None
@@ -287,36 +285,6 @@ async def answer_callback_query(callback_query_id, text=""):
             await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=5.0)
     except Exception as e:
         print(f"Callback answer error: {e}", flush=True)
-
-def execute_chowdeck_request(method, url, headers, cookies, json_data):
-    with httpx.Client(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None) as client:
-        if method == "POST":
-            return client.post(url, json=json_data, headers=headers, cookies=cookies)
-        return client.get(url, headers=headers, cookies=cookies)
-
-# GetXAPI Key Rotator & Notifier Helper
-def get_current_getxapi_key():
-    global getxapi_index
-    with getxapi_lock:
-        if not GETXAPI_KEYS:
-            return None
-        if getxapi_index >= len(GETXAPI_KEYS):
-            return None
-        return GETXAPI_KEYS[getxapi_index]
-
-def rotate_getxapi_key(reason="Rate limited / Exhausted"):
-    global getxapi_index
-    with getxapi_lock:
-        old_idx = getxapi_index
-        getxapi_index += 1
-        new_idx = getxapi_index
-        
-    if ADMIN_CHAT_ID:
-        if new_idx < len(GETXAPI_KEYS):
-            msg = f"⚠️ *GetXAPI Key #{old_idx + 1} Exhausted* ({reason})!\n🔄 Automatically switched to Key #{new_idx + 1}."
-        else:
-            msg = f"❌ *All GetXAPI Keys Exhausted!* ({reason}). No keys left in pool!"
-        asyncio.run_coroutine_threadsafe(send_telegram(ADMIN_CHAT_ID, msg), loop_ref)
 
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
@@ -427,28 +395,25 @@ async def execute_burner_test(chat_id, code):
     payload_data = {"code": code, "answer": "Ismail", "security_answer": "Ismail"}
     
     try:
-        claim_res = await asyncio.to_thread(
-            execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-        )
-        res_json = {}
-        try:
-            res_json = claim_res.json()
-        except Exception:
-            pass
+        async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None) as client:
+            claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
+            res_json = {}
+            try:
+                res_json = claim_res.json()
+            except Exception:
+                pass
 
-        cart_info = get_burner_cart(chat_str)
-        cart_id = cart_info.get("cart_id")
-        vendor_id = cart_info.get("vendor_id")
-        
-        cart_status_str = ""
-        if cart_id and claim_res.status_code == 200:
-            apply_payload = {"cart_id": cart_id, "promo_codes": [code]}
-            if vendor_id:
-                apply_payload["vendor_id"] = vendor_id
-            apply_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, apply_payload
-            )
-            cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
+            cart_info = get_burner_cart(chat_str)
+            cart_id = cart_info.get("cart_id")
+            vendor_id = cart_info.get("vendor_id")
+            
+            cart_status_str = ""
+            if cart_id and claim_res.status_code == 200:
+                apply_payload = {"cart_id": cart_id, "promo_codes": [code]}
+                if vendor_id:
+                    apply_payload["vendor_id"] = vendor_id
+                apply_res = await client.post("https://api.chowdeck.com/customer/discount/apply", json=apply_payload, headers=headers, cookies=user_cookies)
+                cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
 
         return (
             f"🧪 *Burner Test Result for `{code}`*\n"
@@ -458,7 +423,7 @@ async def execute_burner_test(chat_id, code):
     except Exception as e:
         return f"❌ Burner test error: {e}"
 
-async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
+async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
     chat_str = str(chat_id)
     slot_key = str(slot_id)
     
@@ -494,9 +459,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
 
         if user_mode == "prompt" and not specific_answer:
             probe_payload = {"code": code, "answer": "", "security_answer": ""}
-            probe_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, probe_payload
-            )
+            probe_res = await client.post(claim_url, json=probe_payload, headers=headers, cookies=user_cookies)
             probe_json = {}
             try:
                 probe_json = probe_res.json()
@@ -527,9 +490,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             ans_to_use = specific_answer if specific_answer else master_ans
             payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
             
-            claim_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", claim_url, headers, user_cookies, payload_data
-            )
+            claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
             
             res_json = {}
             try:
@@ -572,9 +533,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
             if vendor_id:
                 apply_payload["vendor_id"] = vendor_id
                 
-            apply_res = await asyncio.to_thread(
-                execute_chowdeck_request, "POST", "https://api.chowdeck.com/customer/discount/apply", headers, user_cookies, apply_payload
-            )
+            apply_res = await client.post("https://api.chowdeck.com/customer/discount/apply", json=apply_payload, headers=headers, cookies=user_cookies)
             cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
 
         if claim_res.status_code in [200, 201]:
@@ -591,7 +550,7 @@ async def claim_slot_worker(chat_id, slot_id, token_data, code, carts_db, answer
         return {"slot": slot_key, "status": 500, "message": str(e)}
 
 async def claim_code_global(raw_code):
-    """Flattens and fires EVERY slot across EVERY user simultaneously in one massive global parallel blast."""
+    """Fires EVERY slot across EVERY user simultaneously using a shared unthrottled async client session."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -617,35 +576,41 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
-    for chat_str, user_slots in tokens_db.items():
-        if not user_slots:
-            continue
-        for slot_id, t_data in user_slots.items():
-            all_tasks.append(
-                claim_slot_worker(
-                    chat_id=int(chat_str), 
-                    slot_id=slot_id, 
-                    token_data=t_data, 
-                    code=code, 
-                    carts_db=carts_db, 
-                    answers_db=answers_db, 
-                    lockouts_db=lockouts_db
+    # Use a single shared async client with high concurrency limits for true unthrottled parallelism
+    limits = httpx.Limits(max_keepalive_connections=200, max_connections=500)
+    async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+        for chat_str, user_slots in tokens_db.items():
+            if not user_slots:
+                continue
+            for slot_id, t_data in user_slots.items():
+                all_tasks.append(
+                    claim_slot_worker(
+                        client=client,
+                        chat_id=int(chat_str), 
+                        slot_id=slot_id, 
+                        token_data=t_data, 
+                        code=code, 
+                        carts_db=carts_db, 
+                        answers_db=answers_db, 
+                        lockouts_db=lockouts_db
+                    )
                 )
-            )
-            task_meta.append((chat_str, slot_id))
+                task_meta.append((chat_str, slot_id))
 
-    if not all_tasks:
-        return
+        if not all_tasks:
+            return
 
-    results = await asyncio.gather(*all_tasks)
+        # True unthrottled concurrent execution across all slots at the exact same millisecond
+        results = await asyncio.gather(*all_tasks)
 
+    user_summaries = {}
+    prompt_tasks = []
+    
     for (chat_str, slot), res in zip(task_meta, results):
         if res.get("status") == 0:
             continue
             
         status = res["status"]
-        resp_data = res.get("response", {})
-        cart_suffix = res.get("cart_str", "")
         
         if res.get("needs_prompt"):
             q_text = res["question"]
@@ -657,24 +622,29 @@ async def claim_code_global(raw_code):
                 f"🔒 *Security Question Triggered for `{code}`!*\n"
                 f"💬 *Answer the question directly in your bot chat or wait for admin broadcast!*"
             )
-
             prompt_msg = (
                 f"🔒 *Security Question Detected for `{code}` (Slot {slot})!*\n"
                 f"Question: *\"{q_text}\"*\n\n"
-                f"⚡ *Type the answer right here in chat* to instantly broadcast it to all active slots!"
+                f"⚡ *Type the answer right here in chat* to respond!"
             )
-            await send_telegram(chat_id=int(chat_str), text=prompt_msg)
-        else:
-            if status == 500:
-                summary_msg = (
-                    f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
-                    f"Status: `500 (Internal Server Error)`\n"
-                    f"💡 *Note:* Chowdeck returned a 500 error, but during claims this often means it committed successfully. *Check your app account now to verify if it landed!*"
-                )
-            else:
-                summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-            
-            await send_telegram(chat_id=int(chat_str), text=summary_msg)
+            prompt_tasks.append(send_telegram(chat_id=int(chat_str), text=prompt_msg))
+            continue
+
+        if chat_str not in user_summaries:
+            user_summaries[chat_str] = []
+        
+        user_summaries[chat_str].append(f"• S{slot}: `{status}`")
+
+    if prompt_tasks:
+        await asyncio.gather(*prompt_tasks)
+
+    notif_tasks = []
+    for chat_str, lines in user_summaries.items():
+        summary_text = f"🎯 *Code Target:* `{code}`\n" + "\n".join(lines)
+        notif_tasks.append(send_telegram(chat_id=int(chat_str), text=summary_text))
+    
+    if notif_tasks:
+        await asyncio.gather(*notif_tasks)
 
 async def claim_code_isolated(chat_str, raw_code):
     code = robust_clean_code(raw_code)
@@ -692,45 +662,33 @@ async def claim_code_isolated(chat_str, raw_code):
     lockouts_db = load_json(LOCKOUT_FILE)
 
     await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
-    tasks = [
-        claim_slot_worker(chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
-                          carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
-        for slot_id, t_data in user_slots.items()
-    ]
-    results = await asyncio.gather(*tasks)
+    
+    limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
+    async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+        tasks = [
+            claim_slot_worker(client=client, chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
+                              carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
+            for slot_id, t_data in user_slots.items()
+        ]
+        results = await asyncio.gather(*tasks)
 
+    lines = []
     for res in results:
         slot = res["slot"]
         if res.get("status") == 0:
             continue
-            
         status = res["status"]
-        resp_data = res.get("response", {})
-        cart_suffix = res.get("cart_str", "")
-        
         if res.get("needs_prompt"):
             q_text = res["question"]
             pending = load_json(PENDING_PROMPT_FILE)
             pending[chat_str] = {"code": code, "slot": slot}
             save_json(PENDING_PROMPT_FILE, pending)
-            
-            prompt_msg = (
-                f"🔒 *Security Question Detected for personal code `{code}` (Slot {slot})!*\n"
-                f"Question: *\"{q_text}\"*\n\n"
-                f"⚡ *Type the answer right here in chat* to respond!"
-            )
-            await send_telegram(chat_id=int(chat_str), text=prompt_msg)
+            await send_telegram(chat_id=int(chat_str), text=f"🔒 *Security Question (Slot {slot}):* \"{q_text}\"\nType answer to respond.")
         else:
-            if status == 500:
-                summary_msg = (
-                    f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
-                    f"Status: `500 (Internal Server Error)`\n"
-                    f"💡 *Note:* Chowdeck returned a 500 error, check your app account to verify!"
-                )
-            else:
-                summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-            
-            await send_telegram(chat_id=int(chat_str), text=summary_msg)
+            lines.append(f"• S{slot}: `{status}`")
+
+    if lines:
+        await send_telegram(chat_id=int(chat_str), text=f"🎯 *Personal Code Target:* `{code}`\n" + "\n".join(lines))
 
 async def worker():
     while True:
@@ -1126,12 +1084,14 @@ async def telegram_poller():
                                 lockouts_db = load_json(LOCKOUT_FILE)
                                 
                                 if tokens_db:
-                                    tasks = [
-                                        claim_slot_worker(chat_id=chat_id, slot_id=s_id, token_data=t_data, code=target_code,
-                                                          carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=user_ans)
-                                        for s_id, t_data in tokens_db.items()
-                                    ]
-                                    results = await asyncio.gather(*tasks)
+                                    limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
+                                    async with httpx.AsyncClient(timeout=10.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+                                        tasks = [
+                                            claim_slot_worker(client=client, chat_id=chat_id, slot_id=s_id, token_data=t_data, code=target_code,
+                                                              carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=user_ans)
+                                            for s_id, t_data in tokens_db.items()
+                                        ]
+                                        results = await asyncio.gather(*tasks)
                                     for res in results:
                                         if res.get("status") == 0:
                                             continue
