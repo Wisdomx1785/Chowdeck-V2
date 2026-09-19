@@ -500,7 +500,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
         if not q_text and ("security question" in msg_text or "incorrect" in msg_text or "not correct" in msg_text or "question" in msg_text):
             q_text = res_json.get("message")
 
-        # PROMPT MODE SAFETY: If prompt mode is active and we probed with blank answer, catch security questions properly
         if user_mode == "prompt" and not specific_answer:
             if q_text or (claim_res.status_code in [400, 422] and not ("does not exist" in msg_text or "invalid" in msg_text or "expired" in msg_text or "used" in msg_text)):
                 if not q_text:
@@ -566,7 +565,7 @@ async def claim_code_global(raw_code):
     if code in claimed_history:
         return
 
-    # Broadcast notification to public channel (triggered by X webhook or admin paste)
+    # Broadcast notification to public channel for global drops
     await broadcast_to_channel(
         f"🚨 *New Chowdeck Code Detected!*\n\n"
         f"Code: `{code}`\n"
@@ -655,17 +654,20 @@ async def claim_code_global(raw_code):
         await asyncio.gather(*telegram_tasks)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Isolated paste-in-chat by admin: broadcasts to public channel AND claims strictly across admin's own slots."""
+    """Isolated paste-in-chat: claims ONLY across this user's slots. Broadcasts to public channel ONLY if triggered by ADMIN."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
 
-    # Broadcast detection to public channel so channel subscribers see the code you dropped!
-    await broadcast_to_channel(
-        f"🚨 *New Chowdeck Code Detected!*\n\n"
-        f"Code: `{code}`\n"
-        f"⚡ *Rush to your bot now before it flies away!*"
-    )
+    is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+
+    # ONLY broadcast to public channel if the person pasting is the ADMIN!
+    if is_admin:
+        await broadcast_to_channel(
+            f"🚨 *New Chowdeck Code Detected!*\n\n"
+            f"Code: `{code}`\n"
+            f"⚡ *Rush to your bot now before it flies away!*"
+        )
 
     tokens_db = load_json(TOKENS_FILE)
     user_slots = tokens_db.get(chat_str, {})
@@ -783,7 +785,6 @@ async def process_text_isolated(chat_str, text):
             valid.append(cleaned)
             
     for code in list(dict.fromkeys(valid)):
-        # Admin paste-in-chat triggers isolated claim + public channel broadcast notification!
         await code_queue.put(("isolated", (chat_str, code)))
 
 class WebhookHandler(BaseHTTPRequestHandler):
