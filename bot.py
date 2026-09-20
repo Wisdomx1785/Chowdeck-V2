@@ -565,7 +565,7 @@ async def claim_code_global(raw_code):
     if code in claimed_history:
         return
 
-    # Broadcast notification to public channel for global drops
+    # Broadcast notification to public channel (Code detected)
     await broadcast_to_channel(
         f"🚨 *New Chowdeck Code Detected!*\n\n"
         f"Code: `{code}`\n"
@@ -654,7 +654,7 @@ async def claim_code_global(raw_code):
         await asyncio.gather(*telegram_tasks)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Isolated paste-in-chat: claims ONLY across this user's slots. Broadcasts to public channel ONLY if triggered by ADMIN."""
+    """Isolated paste-in-chat: claims strictly across user's slots. Broadcasts to public channel ONLY if triggered by ADMIN."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
