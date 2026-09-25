@@ -6,6 +6,7 @@ import unicodedata
 import urllib.parse
 import threading
 import base64
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 import time
@@ -453,7 +454,8 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     user_mode = get_user_mode(chat_str)
     
-    max_retries = 2
+    # ADVANCED RESILIENT RETRY ENGINE FOR 429, 500, 503 & CLAIM_BUSY
+    max_retries = 3
     claim_res = None
     res_json = {}
 
@@ -475,13 +477,25 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             except Exception:
                 res_json = {}
 
-            if claim_res.status_code in [500, 503] and attempt < max_retries:
-                await asyncio.sleep(0.04)
+            msg_text = res_json.get("message", "").lower()
+            data_obj = res_json.get("data", {})
+            sub_code = data_obj.get("code", "") if isinstance(data_obj, dict) else ""
+
+            is_busy = (
+                claim_res.status_code in [429, 500, 503] or 
+                sub_code == "claim_busy" or 
+                "high demand" in msg_text or 
+                "try again" in msg_text
+            )
+
+            if is_busy and attempt < max_retries:
+                jitter = random.uniform(0.04, 0.12)
+                await asyncio.sleep(jitter)
                 continue
             break
         except (httpx.RequestError, httpx.TimeoutException):
             if attempt < max_retries:
-                await asyncio.sleep(0.04)
+                await asyncio.sleep(0.05)
                 continue
             return {"slot": slot_key, "status": 500, "response": {"message": "Network/Timeout error"}}
         except Exception as e:
@@ -501,7 +515,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             q_text = res_json.get("message")
 
         if user_mode == "prompt" and not specific_answer:
-            if q_text or (claim_res.status_code in [400, 422] and not ("does not exist" in msg_text or "invalid" in msg_text or "expired" in msg_text or "used" in msg_text)):
+            if q_text or (claim_res.status_code in [400, 422] and not ("does not exist" in msg_text or "invalid" in msg_text or "expired" in msg_text or "used" in msg_text or "high demand" in msg_text)):
                 if not q_text:
                     q_text = res_json.get("message") if res_json.get("message") else "Security question required for this code."
                 return {
@@ -565,7 +579,6 @@ async def claim_code_global(raw_code):
     if code in claimed_history:
         return
 
-    # Broadcast notification to public channel (Code detected)
     await broadcast_to_channel(
         f"🚨 *New Chowdeck Code Detected!*\n\n"
         f"Code: `{code}`\n"
@@ -583,7 +596,8 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
-    limits = httpx.Limits(max_keepalive_connections=500, max_connections=1000)
+    # Scaled limits for 500+ users / 1000+ slots concurrency
+    limits = httpx.Limits(max_keepalive_connections=1000, max_connections=2000)
     async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
             if not user_slots:
@@ -654,14 +668,12 @@ async def claim_code_global(raw_code):
         await asyncio.gather(*telegram_tasks)
 
 async def claim_code_isolated(chat_str, raw_code):
-    """Isolated paste-in-chat: claims strictly across user's slots. Broadcasts to public channel ONLY if triggered by ADMIN."""
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
 
     is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
 
-    # ONLY broadcast to public channel if the person pasting is the ADMIN!
     if is_admin:
         await broadcast_to_channel(
             f"🚨 *New Chowdeck Code Detected!*\n\n"
@@ -681,7 +693,7 @@ async def claim_code_isolated(chat_str, raw_code):
 
     await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
     
-    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
+    limits = httpx.Limits(max_keepalive_connections=200, max_connections=400)
     async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         tasks = [
             claim_slot_worker(client=client, chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
@@ -749,7 +761,7 @@ async def worker():
                 print(f"Worker error: {e}", flush=True)
             finally:
                 code_queue.task_done()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.05)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1113,41 +1125,48 @@ async def telegram_poller():
                                     answers_db[chat_str]["master"] = [user_ans]
                                     save_json(ANSWER_FILE, answers_db)
                                     
-                                    if is_admin:
-                                        await broadcast_to_channel(
+                                    # Non-blocking background execution for answer dropping so chat NEVER freezes
+                                    async def execute_answer_burst(c_str, code_val, ans_val):
+                                        broadcast_coro = broadcast_to_channel(
                                             f"💡 *Admin Answer Dropped!*\n\n"
-                                            f"Code: `{target_code}`\n"
-                                            f"Answer: `{user_ans}`\n\n"
+                                            f"Code: `{code_val}`\n"
+                                            f"Answer: `{ans_val}`\n\n"
                                             f"⚡ *Copy and paste fast!*"
-                                        )
-                                    
-                                    await send_telegram(chat_id, f"⚡ *Emergency Answer Captured!* Blasting `{user_ans}` instantly across your active slots for `{target_code}`...")
-                                    
-                                    tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                    carts_db = load_json(CARTS_FILE)
-                                    lockouts_db = load_json(LOCKOUT_FILE)
-                                    
-                                    if tokens_db:
-                                        limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
-                                        async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-                                            tasks = [
-                                                claim_slot_worker(client=client, chat_id=chat_id, slot_id=s_id, token_data=t_data, code=target_code,
-                                                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=user_ans)
-                                                for s_id, t_data in tokens_db.items()
-                                            ]
-                                            results = await asyncio.gather(*tasks)
+                                        ) if is_admin else asyncio.sleep(0)
                                         
-                                        answer_tasks = []
-                                        for res in results:
-                                            if res.get("status") == 0:
-                                                continue
-                                            s_id = res["slot"]
-                                            st = res["status"]
-                                            rp = res.get("response", {})
-                                            cs = res.get("cart_str", "")
-                                            answer_tasks.append(send_telegram(chat_id, f"🎯 *Code Target:* `{target_code}` (Slot {s_id})\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}"))
-                                        if answer_tasks:
-                                            await asyncio.gather(*answer_tasks)
+                                        local_notif_coro = send_telegram(int(c_str), f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`...")
+                                        
+                                        tokens_db = load_json(TOKENS_FILE).get(c_str, {})
+                                        carts_db = load_json(CARTS_FILE)
+                                        lockouts_db = load_json(LOCKOUT_FILE)
+                                        
+                                        slot_result_tasks = []
+                                        if tokens_db:
+                                            limits = httpx.Limits(max_keepalive_connections=200, max_connections=400)
+                                            async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+                                                tasks = [
+                                                    claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
+                                                                      carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=ans_val)
+                                                    for s_id, t_data in tokens_db.items()
+                                                ]
+                                                results = await asyncio.gather(*tasks)
+                                            
+                                            for res in results:
+                                                if res.get("status") == 0:
+                                                    continue
+                                                s_id = res["slot"]
+                                                st = res["status"]
+                                                rp = res.get("response", {})
+                                                cs = res.get("cart_str", "")
+                                                slot_result_tasks.append(send_telegram(int(c_str), f"🎯 *Code Target:* `{code_val}` (Slot {s_id})\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}"))
+
+                                        await asyncio.gather(
+                                            broadcast_coro,
+                                            local_notif_coro,
+                                            *slot_result_tasks
+                                        )
+
+                                    asyncio.create_task(execute_answer_burst(chat_str, target_code, user_ans))
                                 continue
 
                         if text.startswith("/start"):
