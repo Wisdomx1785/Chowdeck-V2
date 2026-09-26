@@ -1,11 +1,23 @@
 import httpx
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
+async def test_single_endpoint(client, url, headers):
+    try:
+        res = await client.get(url, headers=headers)
+        try:
+            resp_data = res.json()
+        except Exception:
+            resp_data = res.text[:150]
+        return url, {"status": res.status_code, "response": resp_data}
+    except Exception as e:
+        return url, {"status": "error", "message": str(e)}
+
 async def probe_prediction_routes(token: str, proxy_url: str = None):
     """
-    Diagnostic probe to discover Chowdeck's mobile app prediction and bill endpoints with safe error handling.
+    Concurrently probes Chowdeck prediction and bill endpoints with proxy support.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -22,24 +34,11 @@ async def probe_prediction_routes(token: str, proxy_url: str = None):
         "https://api.chowdeck.co.uk/customer/predictions"
     ]
     
-    results = {}
-    async with httpx.AsyncClient(timeout=7.0, proxy=proxy_url) as client:
-        for url in test_endpoints:
-            try:
-                res = await client.get(url, headers=headers)
-                try:
-                    resp_data = res.json()
-                except Exception:
-                    resp_data = res.text[:150]
-                    
-                results[url] = {
-                    "status": res.status_code,
-                    "response": resp_data
-                }
-            except Exception as e:
-                results[url] = {"status": "error", "message": str(e)}
-                
-    return results
+    async with httpx.AsyncClient(timeout=6.0, proxy=proxy_url if proxy_url else None) as client:
+        tasks = [test_single_endpoint(client, url, headers) for url in test_endpoints]
+        results_list = await asyncio.gather(*tasks)
+        
+    return {url: data for url, data in results_list}
 
 async def submit_match_prediction(token: str, home_score: int, away_score: int, phone_number: str, proxy_url: str = None):
     """
@@ -66,7 +65,7 @@ async def submit_match_prediction(token: str, home_score: int, away_score: int, 
     
     endpoint = "https://api.chowdeck.com/customer/bills/airtime" 
     
-    async with httpx.AsyncClient(timeout=8.0, proxy=proxy_url) as client:
+    async with httpx.AsyncClient(timeout=8.0, proxy=proxy_url if proxy_url else None) as client:
         try:
             res = await client.post(endpoint, headers=headers, json=payload)
             try:
