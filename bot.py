@@ -1348,7 +1348,7 @@ async def telegram_poller():
                                 continue
                                 
                             await send_telegram(chat_id, "🔍 Probing Chowdeck mobile prediction and bill endpoints...")
-                            results = await probe_prediction_routes(burner_token)
+                            results = await probe_prediction_routes(burner_token, proxy_url=PROXY_URL)
                             
                             output = "<b>Endpoint Probe Results:</b>\n\n"
                             for url, data in results.items():
@@ -1379,7 +1379,7 @@ async def telegram_poller():
                                                 phone = s_data.get("phone", "09138972820")
                                                 if tkn:
                                                     predict_tasks.append(
-                                                        submit_match_prediction(token=tkn, home_score=home_sc, away_score=away_sc, phone_number=phone)
+                                                        submit_match_prediction(token=tkn, home_score=home_sc, away_score=away_sc, phone_number=phone, proxy_url=PROXY_URL)
                                                     )
                                                     
                                         res_list = await asyncio.gather(*predict_tasks)
