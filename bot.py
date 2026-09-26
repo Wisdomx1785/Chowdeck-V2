@@ -1,4 +1,4 @@
-import re
+Import re
 import asyncio
 import os
 import json
@@ -10,7 +10,6 @@ import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 import time
-from prediction_module import probe_prediction_routes, submit_match_prediction
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -455,6 +454,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     user_mode = get_user_mode(chat_str)
     
+    # ADVANCED RESILIENT RETRY ENGINE FOR 429, 500, 503 & CLAIM_BUSY
     max_retries = 3
     claim_res = None
     res_json = {}
@@ -596,6 +596,7 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
+    # Scaled limits for 500+ users / 1000+ slots concurrency
     limits = httpx.Limits(max_keepalive_connections=1000, max_connections=2000)
     async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
@@ -1124,6 +1125,7 @@ async def telegram_poller():
                                     answers_db[chat_str]["master"] = [user_ans]
                                     save_json(ANSWER_FILE, answers_db)
                                     
+                                    # Non-blocking background execution for answer dropping so chat NEVER freezes
                                     async def execute_answer_burst(c_str, code_val, ans_val):
                                         broadcast_coro = broadcast_to_channel(
                                             f"💡 *Admin Answer Dropped!*\n\n"
@@ -1334,62 +1336,6 @@ async def telegram_poller():
                                 await send_telegram(chat_id, result_msg)
                             else:
                                 await send_telegram(chat_id, "⚠️ Usage: `/test <CODE>`")
-                        elif text.startswith("/probepredict") and is_admin:
-                            burner_data = get_burner_credentials(chat_str)
-                            burner_token = burner_data.get("token")
-                            
-                            if not burner_token:
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                slot_1_data = tokens_db.get("1", {})
-                                burner_token = slot_1_data.get("token")
-                                
-                            if not burner_token:
-                                await send_telegram(chat_id, "❌ No active token found in burner credentials or Slot 1 to probe with.")
-                                continue
-                                
-                            await send_telegram(chat_id, "🔍 Probing Chowdeck mobile prediction and bill endpoints...")
-                            results = await probe_prediction_routes(burner_token, proxy_url=PROXY_URL)
-                            
-                            output = "<b>Endpoint Probe Results:</b>\n\n"
-                            for url, data in results.items():
-                                status = data.get("status")
-                                output += f"🔗 <code>{url}</code>\nStatus: <b>{status}</b>\n\n"
-                                
-                            await send_telegram(chat_id, output[:4000], parse_mode="HTML")
-
-                        elif text.startswith("/predict"):
-                            parts = text.split()
-                            if len(parts) >= 3:
-                                try:
-                                    home_sc = int(parts[1])
-                                    away_sc = int(parts[2])
-                                    
-                                    tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                    if not tokens_db:
-                                        await send_telegram(chat_id, "❌ No accounts configured for prediction checkout.")
-                                        continue
-                                        
-                                    await send_telegram(chat_id, f"⚽ Blasting prediction ({home_sc} - {away_sc}) + ₦100 airtime lock across active slots...")
-                                    
-                                    async with httpx.AsyncClient(timeout=8.0, proxy=PROXY_URL if PROXY_URL else None) as client:
-                                        predict_tasks = []
-                                        for s_id, s_data in tokens_db.items():
-                                            if is_slot_active_state(chat_str, s_id):
-                                                tkn = s_data.get("token")
-                                                phone = s_data.get("phone", "09138972820")
-                                                if tkn:
-                                                    predict_tasks.append(
-                                                        submit_match_prediction(token=tkn, home_score=home_sc, away_score=away_sc, phone_number=phone, proxy_url=PROXY_URL)
-                                                    )
-                                                    
-                                        res_list = await asyncio.gather(*predict_tasks)
-                                        
-                                    success_count = sum(1 for r in res_list if r.get("status_code") in [200, 201])
-                                    await send_telegram(chat_id, f"✅ Prediction sweep completed! Successfully locked in: <code>{success_count} / {len(predict_tasks)}</code> slots.", parse_mode="HTML")
-                                except ValueError:
-                                    await send_telegram(chat_id, "⚠️ Invalid score format. Use: `/predict <home> <away>` (e.g., `/predict 2 1`)")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/predict <home_score> <away_score>`")
                         elif text.startswith("/pause") and is_admin:
                             set_bot_active(False)
                             await send_telegram(chat_id, "⏸️ Bridge Paused.")
