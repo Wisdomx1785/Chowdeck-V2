@@ -357,6 +357,7 @@ def build_control_keyboard(chat_str, is_admin):
     
     if is_admin:
         keyboard.insert(len(keyboard) - 1, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
+        keyboard.insert(len(keyboard) - 1, [{"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"}
@@ -393,6 +394,11 @@ def build_accounts_keyboard(chat_str):
 def build_admin_burner_keyboard():
     return {"inline_keyboard": [
         [{"text": "🧪 Test Code (Send via /test)", "callback_data": "burner_info"}],
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+    ]}
+
+def build_admin_linked_keyboard():
+    return {"inline_keyboard": [
         [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
     ]}
 
@@ -701,7 +707,6 @@ async def claim_code_isolated(chat_str, raw_code):
             f"⚡ *Rush to your bot now before it flies away!*"
         )
 
-    # Determine all chat IDs to trigger (Admin + Linked secondary accounts if admin)
     target_chats = [chat_str]
     if is_admin:
         linked = get_linked_accounts(chat_str)
@@ -1020,6 +1025,27 @@ async def telegram_poller():
                                         "parse_mode": "Markdown",
                                         "reply_markup": build_admin_burner_keyboard()
                                     })
+                            elif data_action == "btn_linked_menu":
+                                await answer_callback_query(cq_id, "Linked accounts panel opened")
+                                if is_admin:
+                                    linked = get_linked_accounts(chat_str)
+                                    linked_snippet = "\n".join([f"• `{acc}`" for acc in linked]) if linked else "None linked yet."
+                                    linked_text = (
+                                        f"🔗 *Linked Secondary Telegram Accounts*\n\n"
+                                        f"{linked_snippet}\n\n"
+                                        "Use commands to manage:\n"
+                                        "• `/linkaccount <chat_id>`\n"
+                                        "• `/unlinkaccount <chat_id>`\n"
+                                        "• `/listlinked`"
+                                    )
+                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": linked_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_linked_keyboard()
+                                    })
                             elif data_action == "burner_info":
                                 await answer_callback_query(cq_id, "Type /test <CODE>")
                             elif data_action == "btn_main_menu":
@@ -1152,7 +1178,6 @@ async def telegram_poller():
                                     target_code = prompt_data["code"]
                                     user_ans = text
                                     
-                                    # Collect all target chats to answer (Admin + Mirror Linked Accounts if admin)
                                     chats_to_answer = [chat_str]
                                     if is_admin:
                                         linked = get_linked_accounts(chat_str)
@@ -1207,7 +1232,6 @@ async def telegram_poller():
                                             *slot_result_tasks
                                         )
 
-                                    # Run answer burst for admin and all linked secondary accounts simultaneously
                                     burst_tasks = [execute_answer_burst(c_s, target_code, user_ans, is_mirror=(c_s != chat_str)) for c_s in chats_to_answer]
                                     asyncio.create_task(asyncio.gather(*burst_tasks))
                                 continue
