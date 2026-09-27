@@ -36,6 +36,7 @@ ACCOUNT_TOGGLES_FILE = os.path.join(DATA_DIR, "account_toggles.json")
 BURNER_FILE = os.path.join(DATA_DIR, "admin_burner.json")
 BURNER_CART_FILE = os.path.join(DATA_DIR, "admin_burner_cart.json")
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
+LINKED_ACCOUNTS_FILE = os.path.join(DATA_DIR, "linked_accounts.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -118,6 +119,27 @@ def save_burner_cart(chat_str, cart_data):
     carts = load_json(BURNER_CART_FILE)
     carts[chat_str] = cart_data
     save_json(BURNER_CART_FILE, carts)
+
+def get_linked_accounts(chat_str):
+    linked = load_json(LINKED_ACCOUNTS_FILE)
+    return linked.get(chat_str, [])
+
+def add_linked_account(chat_str, secondary_chat_id):
+    linked = load_json(LINKED_ACCOUNTS_FILE)
+    if chat_str not in linked:
+        linked[chat_str] = []
+    sec_str = str(secondary_chat_id).strip()
+    if sec_str not in linked[chat_str]:
+        linked[chat_str].append(sec_str)
+        save_json(LINKED_ACCOUNTS_FILE, linked)
+
+def remove_linked_account(chat_str, secondary_chat_id):
+    linked = load_json(LINKED_ACCOUNTS_FILE)
+    if chat_str in linked:
+        sec_str = str(secondary_chat_id).strip()
+        if sec_str in linked[chat_str]:
+            linked[chat_str].remove(sec_str)
+            save_json(LINKED_ACCOUNTS_FILE, linked)
 
 def get_admin_stats():
     tokens_db = load_json(TOKENS_FILE)
@@ -454,7 +476,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     user_mode = get_user_mode(chat_str)
     
-    # ADVANCED RESILIENT RETRY ENGINE FOR 429, 500, 503 & CLAIM_BUSY
     max_retries = 3
     claim_res = None
     res_json = {}
@@ -596,7 +617,6 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
-    # Scaled limits for 500+ users / 1000+ slots concurrency
     limits = httpx.Limits(max_keepalive_connections=1000, max_connections=2000)
     async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
@@ -681,67 +701,80 @@ async def claim_code_isolated(chat_str, raw_code):
             f"⚡ *Rush to your bot now before it flies away!*"
         )
 
-    tokens_db = load_json(TOKENS_FILE)
-    user_slots = tokens_db.get(chat_str, {})
-    if not user_slots:
-        await send_telegram(int(chat_str), "❌ You have no accounts configured to claim this code.")
-        return
+    # Determine all chat IDs to trigger (Admin + Linked secondary accounts if admin)
+    target_chats = [chat_str]
+    if is_admin:
+        linked = get_linked_accounts(chat_str)
+        for l_chat in linked:
+            if l_chat not in target_chats:
+                target_chats.append(l_chat)
 
+    tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
     answers_db = load_json(ANSWER_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
 
-    await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
-    
-    limits = httpx.Limits(max_keepalive_connections=200, max_connections=400)
+    limits = httpx.Limits(max_keepalive_connections=500, max_connections=1000)
     async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-        tasks = [
-            claim_slot_worker(client=client, chat_id=int(chat_str), slot_id=slot_id, token_data=t_data, code=code, 
-                              carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
-            for slot_id, t_data in user_slots.items()
-        ]
-        results = await asyncio.gather(*tasks)
+        for c_str in target_chats:
+            user_slots = tokens_db.get(c_str, {})
+            if not user_slots:
+                if c_str == chat_str:
+                    await send_telegram(int(chat_str), "❌ You have no accounts configured to claim this code.")
+                continue
 
-    prompt_slots = []
-    prompt_q = None
-    telegram_tasks = []
-
-    for res in results:
-        slot = res["slot"]
-        if res.get("status") == 0:
-            continue
-        status = res["status"]
-        resp_data = res.get("response", {})
-        cart_suffix = res.get("cart_str", "")
-
-        if res.get("needs_prompt"):
-            prompt_q = res["question"]
-            prompt_slots.append(slot)
-            pending = load_json(PENDING_PROMPT_FILE)
-            pending[chat_str] = {"code": code, "slot": slot}
-            save_json(PENDING_PROMPT_FILE, pending)
-        else:
-            if status == 500:
-                summary_msg = (
-                    f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
-                    f"Status: `500 (Internal Server Error)`\n"
-                    f"💡 *Note:* Chowdeck returned a 500 error, check your app account!"
-                )
+            if c_str == chat_str:
+                await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
             else:
-                summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-            telegram_tasks.append(send_telegram(chat_id=int(chat_str), text=summary_msg))
+                await send_telegram(int(c_str), f"🔗 *[Mirrored Admin Code]* Processing code `{code}` across secondary slots...")
 
-    if prompt_q:
-        slot_range_str = format_slot_range(prompt_slots)
-        prompt_msg = (
-            f"🔒 *Security Question Detected for `{code}` ({slot_range_str})!*\n"
-            f"Question: *\"{prompt_q}\"*\n\n"
-            f"⚡ *Type the answer right here in chat* to respond!"
-        )
-        telegram_tasks.append(send_telegram(chat_id=int(chat_str), text=prompt_msg))
+            tasks = [
+                claim_slot_worker(client=client, chat_id=int(c_str), slot_id=slot_id, token_data=t_data, code=code, 
+                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
+                for slot_id, t_data in user_slots.items()
+            ]
+            results = await asyncio.gather(*tasks)
 
-    if telegram_tasks:
-        await asyncio.gather(*telegram_tasks)
+            prompt_slots = []
+            prompt_q = None
+            telegram_tasks = []
+
+            for res in results:
+                slot = res["slot"]
+                if res.get("status") == 0:
+                    continue
+                status = res["status"]
+                resp_data = res.get("response", {})
+                cart_suffix = res.get("cart_str", "")
+
+                if res.get("needs_prompt"):
+                    prompt_q = res["question"]
+                    prompt_slots.append(slot)
+                    pending = load_json(PENDING_PROMPT_FILE)
+                    pending[c_str] = {"code": code, "slot": slot}
+                    save_json(PENDING_PROMPT_FILE, pending)
+                else:
+                    if status == 500:
+                        summary_msg = (
+                            f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
+                            f"Status: `500 (Internal Server Error)`\n"
+                            f"💡 *Note:* Chowdeck returned a 500 error, check your app account!"
+                        )
+                    else:
+                        summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
+                    telegram_tasks.append(send_telegram(chat_id=int(c_str), text=summary_msg))
+
+            if prompt_q:
+                slot_range_str = format_slot_range(prompt_slots)
+                prompt_msg = (
+                    f"🔒 *Security Question Detected for `{code}` ({slot_range_str})!*\n"
+                    f"Question: *\"{prompt_q}\"*\n\n"
+                    f"⚡ *Type the answer right here in chat* to respond!"
+                )
+                telegram_tasks.append(send_telegram(chat_id=int(c_str), text=prompt_msg))
+
+            if telegram_tasks:
+                await asyncio.gather(*telegram_tasks)
 
 async def worker():
     while True:
@@ -1119,22 +1152,30 @@ async def telegram_poller():
                                     target_code = prompt_data["code"]
                                     user_ans = text
                                     
-                                    answers_db = load_json(ANSWER_FILE)
-                                    if chat_str not in answers_db:
-                                        answers_db[chat_str] = {}
-                                    answers_db[chat_str]["master"] = [user_ans]
-                                    save_json(ANSWER_FILE, answers_db)
+                                    # Collect all target chats to answer (Admin + Mirror Linked Accounts if admin)
+                                    chats_to_answer = [chat_str]
+                                    if is_admin:
+                                        linked = get_linked_accounts(chat_str)
+                                        for l_chat in linked:
+                                            if l_chat not in chats_to_answer:
+                                                chats_to_answer.append(l_chat)
                                     
-                                    # Non-blocking background execution for answer dropping so chat NEVER freezes
-                                    async def execute_answer_burst(c_str, code_val, ans_val):
+                                    async def execute_answer_burst(c_str, code_val, ans_val, is_mirror=False):
+                                        answers_db = load_json(ANSWER_FILE)
+                                        if c_str not in answers_db:
+                                            answers_db[c_str] = {}
+                                        answers_db[c_str]["master"] = [ans_val]
+                                        save_json(ANSWER_FILE, answers_db)
+
                                         broadcast_coro = broadcast_to_channel(
                                             f"💡 *Admin Answer Dropped!*\n\n"
                                             f"Code: `{code_val}`\n"
                                             f"Answer: `{ans_val}`\n\n"
                                             f"⚡ *Copy and paste fast!*"
-                                        ) if is_admin else asyncio.sleep(0)
+                                        ) if (is_admin and not is_mirror) else asyncio.sleep(0)
                                         
-                                        local_notif_coro = send_telegram(int(c_str), f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`...")
+                                        notif_text = f"🔗 *[Mirrored Admin Answer]* Blasting `{ans_val}` instantly across your secondary slots for `{code_val}`..." if is_mirror else f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`..."
+                                        local_notif_coro = send_telegram(int(c_str), notif_text)
                                         
                                         tokens_db = load_json(TOKENS_FILE).get(c_str, {})
                                         carts_db = load_json(CARTS_FILE)
@@ -1166,7 +1207,9 @@ async def telegram_poller():
                                             *slot_result_tasks
                                         )
 
-                                    asyncio.create_task(execute_answer_burst(chat_str, target_code, user_ans))
+                                    # Run answer burst for admin and all linked secondary accounts simultaneously
+                                    burst_tasks = [execute_answer_burst(c_s, target_code, user_ans, is_mirror=(c_s != chat_str)) for c_s in chats_to_answer]
+                                    asyncio.create_task(asyncio.gather(*burst_tasks))
                                 continue
 
                         if text.startswith("/start"):
@@ -1214,6 +1257,29 @@ async def telegram_poller():
                                 await send_telegram(chat_id, f"✅ Switched to *Slot {parts[1].strip()}*.", reply_markup=build_control_keyboard(chat_str, is_admin))
                             else:
                                 await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-{max_slots}>` or tap buttons above.")
+                        elif text.startswith("/linkaccount") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                sec_id = parts[1].strip()
+                                add_linked_account(chat_str, sec_id)
+                                await send_telegram(chat_id, f"✅ Successfully linked secondary Telegram Chat ID: `{sec_id}`.\nAll manual codes and security answers will now mirror to this account instantly!")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/linkaccount <secondary_chat_id>`")
+                        elif text.startswith("/unlinkaccount") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                sec_id = parts[1].strip()
+                                remove_linked_account(chat_str, sec_id)
+                                await send_telegram(chat_id, f"✅ Unlinked secondary Telegram Chat ID: `{sec_id}`.")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/unlinkaccount <secondary_chat_id>`")
+                        elif text.startswith("/listlinked") and is_admin:
+                            linked = get_linked_accounts(chat_str)
+                            if linked:
+                                linked_str = "\n".join([f"• `{acc}`" for acc in linked])
+                                await send_telegram(chat_id, f"🔗 *Linked Secondary Telegram Accounts:*\n{linked_str}")
+                            else:
+                                await send_telegram(chat_id, "📌 No secondary accounts linked yet. Use `/linkaccount <chat_id>` to add one.")
                         elif text.startswith("/settoken"):
                             parts = text.split(" ", 1)
                             if len(parts) > 1:
