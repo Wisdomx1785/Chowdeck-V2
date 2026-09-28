@@ -15,6 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "YourAdminUsername").strip() # Set your Telegram username in Railway variables
 
 GETXAPI_KEYS_RAW = os.getenv("GETXAPI_KEYS", "").strip()
 GETXAPI_KEYS = [k.strip() for k in GETXAPI_KEYS_RAW.split(",") if k.strip()]
@@ -261,7 +262,7 @@ async def fetch_account_phone(token, cookies):
     }
     profile_url = "https://api.chowdeck.com/customer/profile"
     try:
-        async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None) as client:
+        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None) as client:
             res = await client.get(profile_url, headers=headers, cookies=cookies)
             if res.status_code == 200:
                 res_json = res.json()
@@ -290,7 +291,7 @@ async def send_telegram(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            res = await temp_client.post(url, json=payload, timeout=7.0)
+            res = await temp_client.post(url, json=payload, timeout=4.0)
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
         print(f"Telegram send error to {chat_id}: {e}", flush=True)
@@ -305,9 +306,24 @@ async def answer_callback_query(callback_query_id, text=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     try:
         async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=5.0)
+            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=3.0)
     except Exception as e:
         print(f"Callback answer error: {e}", flush=True)
+
+async def check_channel_membership(client, chat_id):
+    if not TELEGRAM_CHANNEL_ID:
+        return True
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatMember"
+    try:
+        res = await client.get(url, params={"chat_id": TELEGRAM_CHANNEL_ID, "user_id": chat_id}, timeout=4.0)
+        if res.status_code == 200:
+            data = res.json().get("result", {})
+            status = data.get("status")
+            if status in ["creator", "administrator", "member", "restricted"]:
+                return True
+    except Exception as e:
+        print(f"Membership check error: {e}", flush=True)
+    return False
 
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
@@ -424,7 +440,7 @@ async def execute_burner_test(chat_id, code):
     payload_data = {"code": code, "answer": "Ismail", "security_answer": "Ismail"}
     
     try:
-        async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None) as client:
+        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None) as client:
             claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
             res_json = {}
             try:
@@ -482,7 +498,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     user_mode = get_user_mode(chat_str)
     
-    max_retries = 3
+    max_retries = 5
     claim_res = None
     res_json = {}
 
@@ -508,21 +524,22 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             data_obj = res_json.get("data", {})
             sub_code = data_obj.get("code", "") if isinstance(data_obj, dict) else ""
 
-            is_busy = (
-                claim_res.status_code in [429, 500, 503] or 
+            is_congested = (
+                claim_res.status_code in [429, 500, 502, 503, 504] or 
                 sub_code == "claim_busy" or 
                 "high demand" in msg_text or 
-                "try again" in msg_text
+                "try again" in msg_text or
+                "server error" in msg_text
             )
 
-            if is_busy and attempt < max_retries:
-                jitter = random.uniform(0.04, 0.12)
+            if is_congested and attempt < max_retries:
+                jitter = random.uniform(0.01, 0.03)
                 await asyncio.sleep(jitter)
                 continue
             break
         except (httpx.RequestError, httpx.TimeoutException):
             if attempt < max_retries:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.02)
                 continue
             return {"slot": slot_key, "status": 500, "response": {"message": "Network/Timeout error"}}
         except Exception as e:
@@ -623,8 +640,8 @@ async def claim_code_global(raw_code):
     all_tasks = []
     task_meta = []
 
-    limits = httpx.Limits(max_keepalive_connections=1000, max_connections=2000)
-    async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+    limits = httpx.Limits(max_keepalive_connections=1500, max_connections=3000)
+    async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
             if not user_slots:
                 continue
@@ -673,7 +690,7 @@ async def claim_code_global(raw_code):
                 summary_msg = (
                     f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
                     f"Status: `500 (Internal Server Error)`\n"
-                    f"💡 *Note:* Chowdeck returned a 500 error, check your app account!"
+                    f"💡 *Note:* Chowdeck server congested, auto-retries completed!"
                 )
             else:
                 summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
@@ -719,8 +736,8 @@ async def claim_code_isolated(chat_str, raw_code):
     answers_db = load_json(ANSWER_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
 
-    limits = httpx.Limits(max_keepalive_connections=500, max_connections=1000)
-    async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+    limits = httpx.Limits(max_keepalive_connections=800, max_connections=1500)
+    async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for c_str in target_chats:
             user_slots = tokens_db.get(c_str, {})
             if not user_slots:
@@ -763,7 +780,7 @@ async def claim_code_isolated(chat_str, raw_code):
                         summary_msg = (
                             f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
                             f"Status: `500 (Internal Server Error)`\n"
-                            f"💡 *Note:* Chowdeck returned a 500 error, check your app account!"
+                            f"💡 *Note:* Server congested, auto-retries completed!"
                         )
                     else:
                         summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
@@ -799,11 +816,11 @@ async def worker():
                 print(f"Worker error: {e}", flush=True)
             finally:
                 code_queue.task_done()
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
 async def process_text_global(text):
     if not text:
@@ -895,6 +912,22 @@ async def telegram_poller():
                             data_action = cq["data"]
                             chat_str = str(chat_id)
                             is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+                            
+                            if not is_admin:
+                                is_member = await check_channel_membership(tg_client, chat_id)
+                                if not is_member:
+                                    await answer_callback_query(cq_id, "Access Denied: Channel membership required.")
+                                    await send_telegram(
+                                        chat_id, 
+                                        "🔒 *Access Denied*\n\n"
+                                        "Both this bot and our update channel are currently *private*.\n\n"
+                                        "You must be a member of our channel before you can use this bot.\n\n"
+                                        "1️⃣ Join the private update channel.\n"
+                                        f"2️⃣ Message the admin directly: [Click Here to Message Admin](https://t.me/{ADMIN_USERNAME})\n\n"
+                                        "Once you are a member, send `/start` again."
+                                    )
+                                    continue
+
                             max_slots = get_max_slots(chat_str)
                             
                             if data_action.startswith("slot_"):
@@ -1159,6 +1192,21 @@ async def telegram_poller():
                         
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+
+                        if not is_admin:
+                            is_member = await check_channel_membership(tg_client, chat_id)
+                            if not is_member:
+                                await send_telegram(
+                                    chat_id, 
+                                    "🔒 *Access Denied*\n\n"
+                                    "Both this bot and our update channel are currently *private*.\n\n"
+                                    "You must be a member of our channel before you can use this bot.\n\n"
+                                    "1️⃣ Join the private update channel.\n"
+                                    f"2️⃣ Message the admin directly: [Click Here to Message Admin](https://t.me/{ADMIN_USERNAME})\n\n"
+                                    "Once you are a member, send `/start` again."
+                                )
+                                continue
+
                         active_slot = get_active_slot(chat_str)
                         max_slots = get_max_slots(chat_str)
 
@@ -1208,8 +1256,8 @@ async def telegram_poller():
                                         
                                         slot_result_tasks = []
                                         if tokens_db:
-                                            limits = httpx.Limits(max_keepalive_connections=200, max_connections=400)
-                                            async with httpx.AsyncClient(timeout=7.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+                                            limits = httpx.Limits(max_keepalive_connections=300, max_connections=600)
+                                            async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
                                                 tasks = [
                                                     claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
                                                                       carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=ans_val)
@@ -1438,7 +1486,7 @@ async def telegram_poller():
                 raise
             except Exception as e:
                 print(f"Poller error: {e}", flush=True)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)
 
 async def main():
     global loop_ref
