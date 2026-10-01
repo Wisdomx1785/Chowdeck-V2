@@ -15,7 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "YourAdminUsername").strip() # Set your Telegram username in Railway variables
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "YourAdminUsername").strip()
 
 GETXAPI_KEYS_RAW = os.getenv("GETXAPI_KEYS", "").strip()
 GETXAPI_KEYS = [k.strip() for k in GETXAPI_KEYS_RAW.split(",") if k.strip()]
@@ -49,7 +49,7 @@ def load_json(file_path):
             with open(file_path, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️ Error reading {file_path}: {e}", flush=True)
+            print(f"⚠️️ Error reading {file_path}: {e}", flush=True)
             return {}
     return {}
 
@@ -321,8 +321,10 @@ async def check_channel_membership(client, chat_id):
             status = data.get("status")
             if status in ["creator", "administrator", "member", "restricted"]:
                 return True
+        else:
+            print(f"⚠️ Telegram getChatMember failed for chat_id {chat_id}: Status {res.status_code} - {res.text}", flush=True)
     except Exception as e:
-        print(f"Membership check error: {e}", flush=True)
+        print(f"❌ Membership check exception: {e}", flush=True)
     return False
 
 def build_control_keyboard(chat_str, is_admin):
@@ -363,7 +365,7 @@ def build_control_keyboard(chat_str, is_admin):
             {"text": "💰 Portfolio", "callback_data": "btn_portfolio"}
         ],
         [
-            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
+            {"text": f"⚙️️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
             {"text": "🔄 Refresh", "callback_data": "btn_status"}
         ],
         [
@@ -372,7 +374,7 @@ def build_control_keyboard(chat_str, is_admin):
     ])
     
     if is_admin:
-        keyboard.insert(len(keyboard) - 1, [{"text": "🛡️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
+        keyboard.insert(len(keyboard) - 1, [{"text": "🛡️️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
         keyboard.insert(len(keyboard) - 1, [{"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
@@ -498,7 +500,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
     user_mode = get_user_mode(chat_str)
     
-    max_retries = 5
+    max_retries = 6
     claim_res = None
     res_json = {}
 
@@ -533,13 +535,14 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             )
 
             if is_congested and attempt < max_retries:
-                jitter = random.uniform(0.01, 0.03)
-                await asyncio.sleep(jitter)
+                # Smart Exponential Backoff Jitter to beat rate limits seamlessly
+                backoff = random.uniform(0.08 * (attempt + 1), 0.18 * (attempt + 1))
+                await asyncio.sleep(backoff)
                 continue
             break
         except (httpx.RequestError, httpx.TimeoutException):
             if attempt < max_retries:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05 * (attempt + 1))
                 continue
             return {"slot": slot_key, "status": 500, "response": {"message": "Network/Timeout error"}}
         except Exception as e:
@@ -1214,75 +1217,72 @@ async def telegram_poller():
                         is_new_code = (len(cleaned_input) >= 5 and re.match(r'^[A-Z0-9]{5,20}$', cleaned_input) and cleaned_input not in ["ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY", "TRUE", "FALSE"])
                         
                         pending_prompts = load_json(PENDING_PROMPT_FILE)
+                        # CRITICAL FIX: Prioritize pending prompt capture for ANY text (even 5-letter answers like "SEVEN")
                         if chat_str in pending_prompts and not text.startswith("/"):
-                            if is_new_code:
-                                pending_prompts.pop(chat_str, None)
-                                save_json(PENDING_PROMPT_FILE, pending_prompts)
-                            else:
-                                prompt_data = pending_prompts.pop(chat_str, None)
-                                save_json(PENDING_PROMPT_FILE, pending_prompts)
+                            prompt_data = pending_prompts.pop(chat_str, None)
+                            save_json(PENDING_PROMPT_FILE, pending_prompts)
+                            
+                            if prompt_data:
+                                target_code = prompt_data["code"]
+                                user_ans = text
                                 
-                                if prompt_data:
-                                    target_code = prompt_data["code"]
-                                    user_ans = text
+                                chats_to_answer = [chat_str]
+                                if is_admin:
+                                    linked = get_linked_accounts(chat_str)
+                                    for l_chat in linked:
+                                        if l_chat not in chats_to_answer:
+                                            chats_to_answer.append(l_chat)
+                                
+                                async def execute_answer_burst(c_str, code_val, ans_val, is_mirror=False):
+                                    answers_db = load_json(ANSWER_FILE)
+                                    if c_str not in answers_db:
+                                        answers_db[c_str] = {}
+                                    answers_db[c_str]["master"] = [ans_val]
+                                    save_json(ANSWER_FILE, answers_db)
+
+                                    broadcast_coro = broadcast_to_channel(
+                                        f"💡 *Admin Answer Dropped!*\n\n"
+                                        f"Code: `{code_val}`\n"
+                                        f"Answer: `{ans_val}`\n\n"
+                                        f"⚡ *Copy and paste fast!*"
+                                    ) if (is_admin and not is_mirror) else asyncio.sleep(0)
                                     
-                                    chats_to_answer = [chat_str]
-                                    if is_admin:
-                                        linked = get_linked_accounts(chat_str)
-                                        for l_chat in linked:
-                                            if l_chat not in chats_to_answer:
-                                                chats_to_answer.append(l_chat)
+                                    notif_text = f"🔗 *[Mirrored Admin Answer]* Blasting `{ans_val}` instantly across your secondary slots for `{code_val}`..." if is_mirror else f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`..."
+                                    local_notif_coro = send_telegram(int(c_str), notif_text)
                                     
-                                    async def execute_answer_burst(c_str, code_val, ans_val, is_mirror=False):
-                                        answers_db = load_json(ANSWER_FILE)
-                                        if c_str not in answers_db:
-                                            answers_db[c_str] = {}
-                                        answers_db[c_str]["master"] = [ans_val]
-                                        save_json(ANSWER_FILE, answers_db)
-
-                                        broadcast_coro = broadcast_to_channel(
-                                            f"💡 *Admin Answer Dropped!*\n\n"
-                                            f"Code: `{code_val}`\n"
-                                            f"Answer: `{ans_val}`\n\n"
-                                            f"⚡ *Copy and paste fast!*"
-                                        ) if (is_admin and not is_mirror) else asyncio.sleep(0)
+                                    tokens_db = load_json(TOKENS_FILE).get(c_str, {})
+                                    carts_db = load_json(CARTS_FILE)
+                                    lockouts_db = load_json(LOCKOUT_FILE)
+                                    
+                                    slot_result_tasks = []
+                                    if tokens_db:
+                                        limits = httpx.Limits(max_keepalive_connections=300, max_connections=600)
+                                        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
+                                            tasks = [
+                                                claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
+                                                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=ans_val)
+                                                for s_id, t_data in tokens_db.items()
+                                            ]
+                                            results = await asyncio.gather(*tasks)
                                         
-                                        notif_text = f"🔗 *[Mirrored Admin Answer]* Blasting `{ans_val}` instantly across your secondary slots for `{code_val}`..." if is_mirror else f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`..."
-                                        local_notif_coro = send_telegram(int(c_str), notif_text)
-                                        
-                                        tokens_db = load_json(TOKENS_FILE).get(c_str, {})
-                                        carts_db = load_json(CARTS_FILE)
-                                        lockouts_db = load_json(LOCKOUT_FILE)
-                                        
-                                        slot_result_tasks = []
-                                        if tokens_db:
-                                            limits = httpx.Limits(max_keepalive_connections=300, max_connections=600)
-                                            async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-                                                tasks = [
-                                                    claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
-                                                                      carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=ans_val)
-                                                    for s_id, t_data in tokens_db.items()
-                                                ]
-                                                results = await asyncio.gather(*tasks)
-                                            
-                                            for res in results:
-                                                if res.get("status") == 0:
-                                                    continue
-                                                s_id = res["slot"]
-                                                st = res["status"]
-                                                rp = res.get("response", {})
-                                                cs = res.get("cart_str", "")
-                                                slot_result_tasks.append(send_telegram(int(c_str), f"🎯 *Code Target:* `{code_val}` (Slot {s_id})\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}"))
+                                        for res in results:
+                                            if res.get("status") == 0:
+                                                continue
+                                            s_id = res["slot"]
+                                            st = res["status"]
+                                            rp = res.get("response", {})
+                                            cs = res.get("cart_str", "")
+                                            slot_result_tasks.append(send_telegram(int(c_str), f"🎯 *Code Target:* `{code_val}` (Slot {s_id})\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}"))
 
-                                        await asyncio.gather(
-                                            broadcast_coro,
-                                            local_notif_coro,
-                                            *slot_result_tasks
-                                        )
+                                    await asyncio.gather(
+                                        broadcast_coro,
+                                        local_notif_coro,
+                                        *slot_result_tasks
+                                    )
 
-                                    burst_tasks = [execute_answer_burst(c_s, target_code, user_ans, is_mirror=(c_s != chat_str)) for c_s in chats_to_answer]
-                                    asyncio.create_task(asyncio.gather(*burst_tasks))
-                                continue
+                                burst_tasks = [execute_answer_burst(c_s, target_code, user_ans, is_mirror=(c_s != chat_str)) for c_s in chats_to_answer]
+                                asyncio.create_task(asyncio.gather(*burst_tasks))
+                            continue
 
                         if text.startswith("/start"):
                             tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
