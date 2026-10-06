@@ -695,7 +695,7 @@ async def claim_code_global(raw_code):
     telegram_tasks = []
     
     for (chat_str, slot), res in zip(task_meta, results):
-        if res.get("status"] == 0:
+        if res.get("status") == 0:
             continue
             
         status = res["status"]
@@ -1283,13 +1283,10 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
 
-                        # Check if user is whitelisted or admin
                         if not is_user_whitelisted(chat_str):
-                            # Check if the text entered is a valid invite code
                             inv_codes = load_json(INVITE_CODES_FILE)
                             clean_text = text.strip()
                             if clean_text in inv_codes:
-                                # Consume invite code and whitelist user
                                 del inv_codes[clean_text]
                                 save_json(INVITE_CODES_FILE, inv_codes)
                                 add_to_whitelist(chat_str)
@@ -1363,7 +1360,7 @@ async def telegram_poller():
                                             results = await asyncio.gather(*tasks)
                                         
                                         for res in results:
-                                            if res.get("status"] == 0:
+                                            if res.get("status") == 0:
                                                 continue
                                             s_id = res["slot"]
                                             st = res["status"]
@@ -1565,7 +1562,7 @@ async def telegram_poller():
                                 extracted_cookies = {}
                                 if "user=" in raw_input or ";" in raw_input:
                                     try:
-                                        for p in raw_input.split(";") :
+                                        for p in raw_input.split(";"):
                                             p = p.strip()
                                             if "=" in p:
                                                 k, v = p.split("=", 1)
