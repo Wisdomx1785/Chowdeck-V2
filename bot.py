@@ -38,6 +38,8 @@ BURNER_FILE = os.path.join(DATA_DIR, "admin_burner.json")
 BURNER_CART_FILE = os.path.join(DATA_DIR, "admin_burner_cart.json")
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
 LINKED_ACCOUNTS_FILE = os.path.join(DATA_DIR, "linked_accounts.json")
+WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.json")
+INVITE_CODES_FILE = os.path.join(DATA_DIR, "invite_codes.json")
 
 last_update_id = 0
 code_queue = asyncio.Queue()
@@ -49,7 +51,7 @@ def load_json(file_path):
             with open(file_path, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️️ Error reading {file_path}: {e}", flush=True)
+            print(f"⚠️ Error reading {file_path}: {e}", flush=True)
             return {}
     return {}
 
@@ -60,6 +62,23 @@ def save_json(file_path, data):
             json.dump(data, f, indent=4)
     except Exception as e:
         print(f"❌ Failed to save {file_path}: {e}", flush=True)
+
+def is_user_whitelisted(chat_str):
+    if ADMIN_CHAT_ID and chat_str == ADMIN_CHAT_ID:
+        return True
+    whitelist = load_json(WHITELIST_FILE)
+    return whitelist.get(chat_str, False)
+
+def add_to_whitelist(chat_str):
+    whitelist = load_json(WHITELIST_FILE)
+    whitelist[chat_str] = True
+    save_json(WHITELIST_FILE, whitelist)
+
+def remove_from_whitelist(chat_str):
+    whitelist = load_json(WHITELIST_FILE)
+    if chat_str in whitelist:
+        del whitelist[chat_str]
+        save_json(WHITELIST_FILE, whitelist)
 
 def get_bot_active():
     state = load_json(STATE_FILE)
@@ -310,22 +329,20 @@ async def answer_callback_query(callback_query_id, text=""):
     except Exception as e:
         print(f"Callback answer error: {e}", flush=True)
 
-async def check_channel_membership(client, chat_id):
-    if not TELEGRAM_CHANNEL_ID:
-        return True
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChatMember"
+async def perform_ocr_on_image(image_bytes):
     try:
-        res = await client.get(url, params={"chat_id": TELEGRAM_CHANNEL_ID, "user_id": chat_id}, timeout=4.0)
-        if res.status_code == 200:
-            data = res.json().get("result", {})
-            status = data.get("status")
-            if status in ["creator", "administrator", "member", "restricted"]:
-                return True
-        else:
-            print(f"⚠️ Telegram getChatMember failed for chat_id {chat_id}: Status {res.status_code} - {res.text}", flush=True)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            files = {"file": ("screenshot.jpg", image_bytes, "image/jpeg")}
+            data = {"apikey": "helloworld", "language": "eng", "isOverlayRequired": False}
+            res = await client.post("https://api.ocr.space/parse/image", files=files, data=data)
+            if res.status_code == 200:
+                res_json = res.json()
+                parsed_results = res_json.get("ParsedResults", [])
+                if parsed_results:
+                    return parsed_results[0].get("ParsedText", "")
     except Exception as e:
-        print(f"❌ Membership check exception: {e}", flush=True)
-    return False
+        print(f"OCR error: {e}", flush=True)
+    return ""
 
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
@@ -365,7 +382,7 @@ def build_control_keyboard(chat_str, is_admin):
             {"text": "💰 Portfolio", "callback_data": "btn_portfolio"}
         ],
         [
-            {"text": f"⚙️️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
+            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
             {"text": "🔄 Refresh", "callback_data": "btn_status"}
         ],
         [
@@ -374,8 +391,8 @@ def build_control_keyboard(chat_str, is_admin):
     ])
     
     if is_admin:
-        keyboard.insert(len(keyboard) - 1, [{"text": "🛡️️ Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
-        keyboard.insert(len(keyboard) - 1, [{"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"}])
+        keyboard.insert(len(keyboard) - 1, [{"text": "🛡 Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
+        keyboard.insert(len(keyboard) - 1, [{"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"}, {"text": "🔑 Invites", "callback_data": "btn_invites_menu"}])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"}
@@ -417,6 +434,13 @@ def build_admin_burner_keyboard():
 
 def build_admin_linked_keyboard():
     return {"inline_keyboard": [
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+    ]}
+
+def build_admin_invites_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "➕ Generate Invite Code", "callback_data": "btn_gen_invite"}],
+        [{"text": "📋 List Whitelist", "callback_data": "btn_list_whitelist"}],
         [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
     ]}
 
@@ -535,7 +559,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             )
 
             if is_congested and attempt < max_retries:
-                # Smart Exponential Backoff Jitter to beat rate limits seamlessly
                 backoff = random.uniform(0.08 * (attempt + 1), 0.18 * (attempt + 1))
                 await asyncio.sleep(backoff)
                 continue
@@ -646,7 +669,7 @@ async def claim_code_global(raw_code):
     limits = httpx.Limits(max_keepalive_connections=1500, max_connections=3000)
     async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
-            if not user_slots:
+            if not user_slots or not is_user_whitelisted(chat_str):
                 continue
             for slot_id, t_data in user_slots.items():
                 all_tasks.append(
@@ -672,7 +695,7 @@ async def claim_code_global(raw_code):
     telegram_tasks = []
     
     for (chat_str, slot), res in zip(task_meta, results):
-        if res.get("status") == 0:
+        if res.get("status"] == 0:
             continue
             
         status = res["status"]
@@ -743,7 +766,7 @@ async def claim_code_isolated(chat_str, raw_code):
     async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for c_str in target_chats:
             user_slots = tokens_db.get(c_str, {})
-            if not user_slots:
+            if not user_slots or not is_user_whitelisted(c_str):
                 if c_str == chat_str:
                     await send_telegram(int(chat_str), "❌ You have no accounts configured to claim this code.")
                 continue
@@ -916,20 +939,15 @@ async def telegram_poller():
                             chat_str = str(chat_id)
                             is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
                             
-                            if not is_admin:
-                                is_member = await check_channel_membership(tg_client, chat_id)
-                                if not is_member:
-                                    await answer_callback_query(cq_id, "Access Denied: Channel membership required.")
-                                    await send_telegram(
-                                        chat_id, 
-                                        "🔒 *Access Denied*\n\n"
-                                        "Both this bot and our update channel are currently *private*.\n\n"
-                                        "You must be a member of our channel before you can use this bot.\n\n"
-                                        "1️⃣ Join the private update channel.\n"
-                                        f"2️⃣ Message the admin directly: [Click Here to Message Admin](https://t.me/{ADMIN_USERNAME})\n\n"
-                                        "Once you are a member, send `/start` again."
-                                    )
-                                    continue
+                            if not is_user_whitelisted(chat_str):
+                                await answer_callback_query(cq_id, "Access Denied: Invite code required.")
+                                await send_telegram(
+                                    chat_id,
+                                    "🔒 *Strictly Private Bot*\n\n"
+                                    "This bot is currently invite-only.\n"
+                                    "Please enter your valid **Invite Code** right here in chat to unlock access."
+                                )
+                                continue
 
                             max_slots = get_max_slots(chat_str)
                             
@@ -1082,6 +1100,41 @@ async def telegram_poller():
                                         "parse_mode": "Markdown",
                                         "reply_markup": build_admin_linked_keyboard()
                                     })
+                            elif data_action == "btn_invites_menu":
+                                await answer_callback_query(cq_id, "Invites panel opened")
+                                if is_admin:
+                                    inv_codes = load_json(INVITE_CODES_FILE)
+                                    codes_snippet = "\n".join([f"• `{c}`" for c in inv_codes.keys()]) if inv_codes else "No active invite codes."
+                                    inv_text = (
+                                        f"🔑 *Invite Code Management*\n\n"
+                                        f"Active Codes:\n{codes_snippet}\n\n"
+                                        "Commands:\n"
+                                        "• `/geninvite` — Generate a new invite code\n"
+                                        "• `/revokeinvite <code>` — Remove a code\n"
+                                        "• `/listwhitelist` — View authorized users"
+                                    )
+                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": inv_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_invites_keyboard()
+                                    })
+                            elif data_action == "btn_gen_invite":
+                                await answer_callback_query(cq_id, "Code generated!")
+                                if is_admin:
+                                    code_val = "INVITE-" + ''.join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+                                    inv_codes = load_json(INVITE_CODES_FILE)
+                                    inv_codes[code_val] = True
+                                    save_json(INVITE_CODES_FILE, inv_codes)
+                                    await send_telegram(chat_id, f"✅ New Invite Code Generated:\n`{code_val}`\n\nShare this privately with your user.")
+                            elif data_action == "btn_list_whitelist":
+                                await answer_callback_query(cq_id, "Whitelist loaded")
+                                if is_admin:
+                                    wl = load_json(WHITELIST_FILE)
+                                    wl_snippet = "\n".join([f"• `{uid}`" for uid in wl.keys()]) if wl else "No whitelisted users yet."
+                                    await send_telegram(chat_id, f"📋 *Authorized Users Whitelist:*\n{wl_snippet}")
                             elif data_action == "burner_info":
                                 await answer_callback_query(cq_id, "Type /test <CODE>")
                             elif data_action == "btn_main_menu":
@@ -1187,6 +1240,40 @@ async def telegram_poller():
                                     await send_telegram(chat_id, "▶️ *Bridge Resumed* via inline button.")
                             continue
 
+                        # Handle Photo / Screenshots sent to bot
+                        if "photo" in update.get("message", {}):
+                            msg = update["message"]
+                            chat_id = msg["chat"]["id"]
+                            chat_str = str(chat_id)
+                            is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
+
+                            if not is_user_whitelisted(chat_str):
+                                await send_telegram(
+                                    chat_id,
+                                    "🔒 *Strictly Private Bot*\n\n"
+                                    "This bot is currently invite-only.\n"
+                                    "Please enter your valid **Invite Code** right here in chat to unlock access."
+                                )
+                                continue
+
+                            photos = msg["photo"]
+                            file_id = photos[-1]["file_id"]
+                            
+                            file_res = await tg_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile", params={"file_id": file_id})
+                            if file_res.status_code == 200:
+                                file_path = file_res.json().get("result", {}).get("file_path")
+                                if file_path:
+                                    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                                    img_res = await tg_client.get(download_url)
+                                    if img_res.status_code == 200:
+                                        await send_telegram(chat_id, "🔍 *Screenshot received!* Reading text via OCR...")
+                                        extracted_text = await perform_ocr_on_image(img_res.content)
+                                        if extracted_text:
+                                            await process_text_isolated(chat_str, extracted_text)
+                                        else:
+                                            await send_telegram(chat_id, "❌ Could not extract text from this screenshot. Please send it as text.")
+                            continue
+
                         msg = update.get("message", {})
                         chat_id = msg.get("chat", {}).get("id")
                         text = msg.get("text", "").strip()
@@ -1196,19 +1283,30 @@ async def telegram_poller():
                         chat_str = str(chat_id)
                         is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
 
-                        if not is_admin:
-                            is_member = await check_channel_membership(tg_client, chat_id)
-                            if not is_member:
+                        # Check if user is whitelisted or admin
+                        if not is_user_whitelisted(chat_str):
+                            # Check if the text entered is a valid invite code
+                            inv_codes = load_json(INVITE_CODES_FILE)
+                            clean_text = text.strip()
+                            if clean_text in inv_codes:
+                                # Consume invite code and whitelist user
+                                del inv_codes[clean_text]
+                                save_json(INVITE_CODES_FILE, inv_codes)
+                                add_to_whitelist(chat_str)
                                 await send_telegram(
-                                    chat_id, 
-                                    "🔒 *Access Denied*\n\n"
-                                    "Both this bot and our update channel are currently *private*.\n\n"
-                                    "You must be a member of our channel before you can use this bot.\n\n"
-                                    "1️⃣ Join the private update channel.\n"
-                                    f"2️⃣ Message the admin directly: [Click Here to Message Admin](https://t.me/{ADMIN_USERNAME})\n\n"
-                                    "Once you are a member, send `/start` again."
+                                    chat_id,
+                                    "🎉 *Invite Code Accepted!*\n\n"
+                                    "You have been successfully whitelisted. Welcome to the private sniper bot!\n\n"
+                                    "Send `/start` to begin."
                                 )
-                                continue
+                            else:
+                                await send_telegram(
+                                    chat_id,
+                                    "🔒 *Strictly Private Bot - Access Denied*\n\n"
+                                    "This bot is invite-only and restricted.\n"
+                                    "Please enter a valid **Invite Code** right here in chat to get access."
+                                )
+                            continue
 
                         active_slot = get_active_slot(chat_str)
                         max_slots = get_max_slots(chat_str)
@@ -1217,7 +1315,6 @@ async def telegram_poller():
                         is_new_code = (len(cleaned_input) >= 5 and re.match(r'^[A-Z0-9]{5,20}$', cleaned_input) and cleaned_input not in ["ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY", "TRUE", "FALSE"])
                         
                         pending_prompts = load_json(PENDING_PROMPT_FILE)
-                        # CRITICAL FIX: Prioritize pending prompt capture for ANY text (even 5-letter answers like "SEVEN")
                         if chat_str in pending_prompts and not text.startswith("/"):
                             prompt_data = pending_prompts.pop(chat_str, None)
                             save_json(PENDING_PROMPT_FILE, pending_prompts)
@@ -1266,7 +1363,7 @@ async def telegram_poller():
                                             results = await asyncio.gather(*tasks)
                                         
                                         for res in results:
-                                            if res.get("status") == 0:
+                                            if res.get("status"] == 0:
                                                 continue
                                             s_id = res["slot"]
                                             st = res["status"]
@@ -1310,6 +1407,34 @@ async def telegram_poller():
                                 f"• Total Carts Linked: `{c_count}`"
                             )
                             await send_telegram(chat_id, admin_text, reply_markup=build_control_keyboard(chat_str, is_admin))
+                        elif text.startswith("/geninvite") and is_admin:
+                            code_val = "INVITE-" + ''.join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+                            inv_codes = load_json(INVITE_CODES_FILE)
+                            inv_codes[code_val] = True
+                            save_json(INVITE_CODES_FILE, inv_codes)
+                            await send_telegram(chat_id, f"✅ New Invite Code Generated:\n`{code_val}`\n\nShare this privately with your user.")
+                        elif text.startswith("/listwhitelist") and is_admin:
+                            wl = load_json(WHITELIST_FILE)
+                            wl_snippet = "\n".join([f"• `{uid}`" for uid in wl.keys()]) if wl else "No whitelisted users yet."
+                            await send_telegram(chat_id, f"📋 *Authorized Users Whitelist:*\n{wl_snippet}")
+                        elif text.startswith("/revokeinvite") and is_admin:
+                            parts = text.split(" ", 1)
+                            if len(parts) > 1:
+                                c_target = parts[1].strip()
+                                inv_codes = load_json(INVITE_CODES_FILE)
+                                if c_target in inv_codes:
+                                    del inv_codes[c_target]
+                                    save_json(INVITE_CODES_FILE, inv_codes)
+                                    await send_telegram(chat_id, f"✅ Invite code `{c_target}` revoked.")
+                                else:
+                                    wl = load_json(WHITELIST_FILE)
+                                    if c_target in wl:
+                                        remove_from_whitelist(c_target)
+                                        await send_telegram(chat_id, f"✅ User `{c_target}` removed from whitelist.")
+                                    else:
+                                        await send_telegram(chat_id, "⚠️ Code or Chat ID not found in invites/whitelist.")
+                            else:
+                                await send_telegram(chat_id, "⚠️ Usage: `/revokeinvite <code>` or `/revokeinvite <chat_id>`")
                         elif text.startswith("/portfolio") or text.startswith("/vouchers"):
                             portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
                             items = portfolio_data.get("items", [])
@@ -1440,7 +1565,7 @@ async def telegram_poller():
                                 extracted_cookies = {}
                                 if "user=" in raw_input or ";" in raw_input:
                                     try:
-                                        for p in raw_input.split(";"):
+                                        for p in raw_input.split(";") :
                                             p = p.strip()
                                             if "=" in p:
                                                 k, v = p.split("=", 1)
