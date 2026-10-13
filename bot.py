@@ -309,8 +309,7 @@ async def send_telegram(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        # TELEGRAM: NO PROXY
-        async with httpx.AsyncClient() as temp_client:
+        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
             res = await temp_client.post(url, json=payload, timeout=4.0)
             return res.json().get("result", {}).get("message_id")
     except Exception as e:
@@ -325,8 +324,7 @@ async def broadcast_to_channel(text):
 async def answer_callback_query(callback_query_id, text=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     try:
-        # TELEGRAM: NO PROXY
-        async with httpx.AsyncClient() as temp_client:
+        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
             await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=3.0)
     except Exception as e:
         print(f"Callback answer error: {e}", flush=True)
@@ -468,7 +466,6 @@ async def execute_burner_test(chat_id, code):
     payload_data = {"code": code, "answer": "Ismail", "security_answer": "Ismail"}
     
     try:
-        # CHOWDECK: USES PROXY
         async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None) as client:
             claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
             res_json = {}
@@ -670,7 +667,6 @@ async def claim_code_global(raw_code):
     task_meta = []
 
     limits = httpx.Limits(max_keepalive_connections=1500, max_connections=3000)
-    # CHOWDECK: USES PROXY
     async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for chat_str, user_slots in tokens_db.items():
             if not user_slots or not is_user_whitelisted(chat_str):
@@ -767,7 +763,6 @@ async def claim_code_isolated(chat_str, raw_code):
     lockouts_db = load_json(LOCKOUT_FILE)
 
     limits = httpx.Limits(max_keepalive_connections=800, max_connections=1500)
-    # CHOWDECK: USES PROXY
     async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
         for c_str in target_chats:
             user_slots = tokens_db.get(c_str, {})
@@ -777,7 +772,7 @@ async def claim_code_isolated(chat_str, raw_code):
                 continue
 
             if c_str == chat_str:
-                await send_telegram(int(c_str), f"🔍 Processing personal code `{code}` across your active slots...")
+                await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
             else:
                 await send_telegram(int(c_str), f"🔗 *[Mirrored Admin Code]* Processing code `{code}` across secondary slots...")
 
@@ -927,8 +922,7 @@ def run_http_server():
 async def telegram_poller():
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    # TELEGRAM: NO PROXY
-    async with httpx.AsyncClient() as tg_client:
+    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as tg_client:
         while True:
             try:
                 res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 25}, timeout=30.0)
@@ -975,15 +969,13 @@ async def telegram_poller():
                                     "Select an option below:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                # TELEGRAM: NO PROXY
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": updated_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": updated_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
                             elif data_action.startswith("toggle_acc_"):
                                 await answer_callback_query(cq_id, f"Toggled account")
                                 s_num = data_action.split("_")[2]
@@ -997,14 +989,13 @@ async def telegram_poller():
                                     f"✅ = Active & Sniping | ❌ = Disabled"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": acc_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_accounts_keyboard(chat_str)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
                             elif data_action == "btn_my_accounts":
                                 await answer_callback_query(cq_id, "Accounts manager")
                                 active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
@@ -1015,14 +1006,13 @@ async def telegram_poller():
                                     f"✅ = Active & Sniping | ❌ = Disabled"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": acc_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_accounts_keyboard(chat_str)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
                             elif data_action == "btn_portfolio":
                                 await answer_callback_query(cq_id, "Portfolio loaded!")
                                 portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
@@ -1061,14 +1051,13 @@ async def telegram_poller():
                                     f"Click a button below to toggle its active state:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": acc_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_accounts_keyboard(chat_str)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": acc_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_accounts_keyboard(chat_str)
+                                })
                             elif data_action == "btn_burner_menu":
                                 await answer_callback_query(cq_id, "Burner panel opened")
                                 if is_admin:
@@ -1083,14 +1072,13 @@ async def telegram_poller():
                                         "• `/test <CODE>`"
                                     )
                                     url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    async with httpx.AsyncClient() as edit_client:
-                                        await edit_client.post(url_edit, json={
-                                            "chat_id": chat_id,
-                                            "message_id": msg_id,
-                                            "text": burner_text,
-                                            "parse_mode": "Markdown",
-                                            "reply_markup": build_admin_burner_keyboard()
-                                        })
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": burner_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_burner_keyboard()
+                                    })
                             elif data_action == "btn_linked_menu":
                                 await answer_callback_query(cq_id, "Linked accounts panel opened")
                                 if is_admin:
@@ -1105,14 +1093,13 @@ async def telegram_poller():
                                         "• `/listlinked`"
                                     )
                                     url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    async with httpx.AsyncClient() as edit_client:
-                                        await edit_client.post(url_edit, json={
-                                            "chat_id": chat_id,
-                                            "message_id": msg_id,
-                                            "text": linked_text,
-                                            "parse_mode": "Markdown",
-                                            "reply_markup": build_admin_linked_keyboard()
-                                        })
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": linked_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_linked_keyboard()
+                                    })
                             elif data_action == "btn_invites_menu":
                                 await answer_callback_query(cq_id, "Invites panel opened")
                                 if is_admin:
@@ -1127,14 +1114,13 @@ async def telegram_poller():
                                         "• `/listwhitelist` — View authorized users"
                                     )
                                     url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    async with httpx.AsyncClient() as edit_client:
-                                        await edit_client.post(url_edit, json={
-                                            "chat_id": chat_id,
-                                            "message_id": msg_id,
-                                            "text": inv_text,
-                                            "parse_mode": "Markdown",
-                                            "reply_markup": build_admin_invites_keyboard()
-                                        })
+                                    await tg_client.post(url_edit, json={
+                                        "chat_id": chat_id,
+                                        "message_id": msg_id,
+                                        "text": inv_text,
+                                        "parse_mode": "Markdown",
+                                        "reply_markup": build_admin_invites_keyboard()
+                                    })
                             elif data_action == "btn_gen_invite":
                                 await answer_callback_query(cq_id, "Code generated!")
                                 if is_admin:
@@ -1167,14 +1153,13 @@ async def telegram_poller():
                                     "Select an option below:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": menu_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": menu_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
                             elif data_action == "btn_toggle_mode":
                                 current_m = get_user_mode(chat_str)
                                 new_m = "prompt" if current_m == "auto" else "auto"
@@ -1194,14 +1179,13 @@ async def telegram_poller():
                                     "Select an option below:"
                                 )
                                 url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                async with httpx.AsyncClient() as edit_client:
-                                    await edit_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": updated_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                    })
+                                await tg_client.post(url_edit, json={
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                    "text": updated_text,
+                                    "parse_mode": "Markdown",
+                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
+                                })
                             elif data_action == "btn_admin_stats":
                                 await answer_callback_query(cq_id, "Stats loaded")
                                 if is_admin:
@@ -1275,21 +1259,19 @@ async def telegram_poller():
                             photos = msg["photo"]
                             file_id = photos[-1]["file_id"]
                             
-                            # TELEGRAM: NO PROXY
-                            async with httpx.AsyncClient() as file_client:
-                                file_res = await file_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile", params={"file_id": file_id})
-                                if file_res.status_code == 200:
-                                    file_path = file_res.json().get("result", {}).get("file_path")
-                                    if file_path:
-                                        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                                        img_res = await file_client.get(download_url)
-                                        if img_res.status_code == 200:
-                                            await send_telegram(chat_id, "🔍 *Screenshot received!* Reading text via OCR...")
-                                            extracted_text = await perform_ocr_on_image(img_res.content)
-                                            if extracted_text:
-                                                await process_text_isolated(chat_str, extracted_text)
-                                            else:
-                                                await send_telegram(chat_id, "❌ Could not extract text from this screenshot. Please send it as text.")
+                            file_res = await tg_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile", params={"file_id": file_id})
+                            if file_res.status_code == 200:
+                                file_path = file_res.json().get("result", {}).get("file_path")
+                                if file_path:
+                                    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                                    img_res = await tg_client.get(download_url)
+                                    if img_res.status_code == 200:
+                                        await send_telegram(chat_id, "🔍 *Screenshot received!* Reading text via OCR...")
+                                        extracted_text = await perform_ocr_on_image(img_res.content)
+                                        if extracted_text:
+                                            await process_text_isolated(chat_str, extracted_text)
+                                        else:
+                                            await send_telegram(chat_id, "❌ Could not extract text from this screenshot. Please send it as text.")
                             continue
 
                         msg = update.get("message", {})
@@ -1369,7 +1351,6 @@ async def telegram_poller():
                                     slot_result_tasks = []
                                     if tokens_db:
                                         limits = httpx.Limits(max_keepalive_connections=300, max_connections=600)
-                                        # CHOWDECK: USES PROXY
                                         async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
                                             tasks = [
                                                 claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
