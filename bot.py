@@ -1353,9 +1353,12 @@ async def handle_command(chat_id, chat_str, text, is_admin):
     cmd = parts[0].split("@", 1)[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd in ("/start", "/help", "/guide"):
+    if cmd in ("/start", "/help"):
+        # Menu only. The guide is on-demand: it is sent solely when the user
+        # taps the "📖 Guide / Help" button (btn_guide) or types /guide.
         await send_telegram(chat_id, menu_text(chat_str),
                             reply_markup=build_control_keyboard(chat_str, is_admin))
+    elif cmd == "/guide":
         await send_telegram(chat_id, GUIDE_TEXT)
     elif cmd == "/admin":
         if not is_admin:
