@@ -1,228 +1,418 @@
-import re
+#!/usr/bin/env python3
+""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, trimmed Telegram chatter. * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. """
+
 import asyncio
-import os
+import base64
+import hmac
 import json
+import os
+import random
+import re
+import threading
+import time
 import unicodedata
 import urllib.parse
-import threading
-import base64
-import random
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import httpx
-import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import httpx
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "YourAdminUsername").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ALLOW_INSECURE_WEBHOOK = os.getenv("ALLOW_INSECURE_WEBHOOK", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+PORT = int(os.getenv("PORT", "8080"))
+OCR_API_KEY = os.getenv("OCR_API_KEY", "helloworld").strip() or "helloworld"
 
-GETXAPI_KEYS_RAW = os.getenv("GETXAPI_KEYS", "").strip()
-GETXAPI_KEYS = [k.strip() for k in GETXAPI_KEYS_RAW.split(",") if k.strip()]
-getxapi_index = 0
-getxapi_lock = threading.Lock()
+ADMIN_MAX_SLOTS = max(1, int(os.getenv("ADMIN_MAX_SLOTS", "20")))
+USER_MAX_SLOTS = max(1, int(os.getenv("USER_MAX_SLOTS", "10")))
 
-DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", os.path.dirname(os.path.abspath(__file__)))
+CLAIM_MAX_ATTEMPTS = max(1, int(os.getenv("CLAIM_MAX_ATTEMPTS", "6")))
+CLAIM_WINDOW_SECONDS = float(os.getenv("CLAIM_WINDOW_SECONDS", "4.0"))
+HEDGE_REQUESTS = max(1, int(os.getenv("HEDGE_REQUESTS", "3")))
+REQUEST_CONCURRENCY = max(10, int(os.getenv("REQUEST_CONCURRENCY", "150")))
+USER_CONCURRENCY = max(1, int(os.getenv("USER_CONCURRENCY", "12")))
+CLAIM_TIMEOUT = float(os.getenv("CLAIM_TIMEOUT", "4.0"))
 
-TOKENS_FILE = os.path.join(DATA_DIR, "tokens_multi.json")
-CARTS_FILE = os.path.join(DATA_DIR, "carts_multi.json")
-ANSWER_FILE = os.path.join(DATA_DIR, "answers_multi.json")
-MODE_FILE = os.path.join(DATA_DIR, "bot_modes.json")
-CLAIMED_FILE = os.path.join(DATA_DIR, "claimed.json")
-STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
-LOCKOUT_FILE = os.path.join(DATA_DIR, "lockouts_multi.json")
-ACTIVE_SLOT_FILE = os.path.join(DATA_DIR, "active_slots.json")
-PENDING_PROMPT_FILE = os.path.join(DATA_DIR, "pending_prompts.json")
-ACCOUNT_TOGGLES_FILE = os.path.join(DATA_DIR, "account_toggles.json")
-BURNER_FILE = os.path.join(DATA_DIR, "admin_burner.json")
-BURNER_CART_FILE = os.path.join(DATA_DIR, "admin_burner_cart.json")
-PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
-LINKED_ACCOUNTS_FILE = os.path.join(DATA_DIR, "linked_accounts.json")
-WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.json")
-INVITE_CODES_FILE = os.path.join(DATA_DIR, "invite_codes.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip() or _BASE_DIR
 
-last_update_id = 0
-code_queue = asyncio.Queue()
-loop_ref = None
+
+def _data_file(name):
+    return os.path.join(DATA_DIR, name)
+
+
+TOKENS_FILE = _data_file("tokens_multi.json")
+CARTS_FILE = _data_file("carts_multi.json")
+STATE_FILE = _data_file("bot_state.json")
+LOCKOUT_FILE = _data_file("lockouts_multi.json")
+ACTIVE_SLOT_FILE = _data_file("active_slots.json")
+PENDING_PROMPT_FILE = _data_file("pending_prompts.json")
+ACCOUNT_TOGGLES_FILE = _data_file("account_toggles.json")
+BURNER_FILE = _data_file("admin_burner.json")
+BURNER_CART_FILE = _data_file("admin_burner_cart.json")
+PORTFOLIO_FILE = _data_file("portfolio.json")
+LINKED_ACCOUNTS_FILE = _data_file("linked_accounts.json")
+WHITELIST_FILE = _data_file("whitelist.json")
+INVITE_CODES_FILE = _data_file("invite_codes.json")
+
+# Codes / words that must never be treated as promo codes.
+_IGNORE_TOKENS = {
+    "CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL",
+    "ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY",
+    "TRUE", "FALSE", "PROMO", "CODE", "VOUCHER", "ANSWER", "HELP",
+    "START", "STOP", "YES", "NO",
+}
+
+# ---------------------------------------------------------------------------
+# In-memory JSON store with debounced write-behind
+# ---------------------------------------------------------------------------
+_store_lock = threading.RLock()
+_cache = {}
+_dirty = set()
+_dirty_event = threading.Event()
+_writer_started = False
+
+
+def _atomic_write(path, data):
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 - never let persistence kill the bot
+        print(f"[store] failed to persist {path}: {e}", flush=True)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _writer_loop():
+    while True:
+        _dirty_event.wait()
+        time.sleep(0.25)  # debounce: coalesce rapid successive writes
+        with _store_lock:
+            paths = list(_dirty)
+            _dirty.clear()
+            _dirty_event.clear()
+            snapshot = {p: _cache.get(p) for p in paths}
+        for path, data in snapshot.items():
+            if data is not None:
+                _atomic_write(path, data)
+
+
+def start_store_writer():
+    global _writer_started
+    with _store_lock:
+        if _writer_started:
+            return
+        _writer_started = True
+    threading.Thread(target=_writer_loop, name="json-writer", daemon=True).start()
+
 
 def load_json(file_path):
+    """Return the cached document, hydrating from disk on first touch."""
+    with _store_lock:
+        if file_path in _cache:
+            return _cache[file_path]
+    data = {}
     if os.path.exists(file_path):
         try:
             with open(file_path, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"⚠️ Error reading {file_path}: {e}", flush=True)
-            return {}
-    return {}
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            print(f"[store] error reading {file_path}: {e}", flush=True)
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    with _store_lock:
+        _cache[file_path] = data
+        return data
+
 
 def save_json(file_path, data):
-    try:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"❌ Failed to save {file_path}: {e}", flush=True)
+    with _store_lock:
+        _cache[file_path] = data
+        _dirty.add(file_path)
+    _dirty_event.set()
+
+
+def flush_store():
+    """Force pending cache writes to disk (used on shutdown)."""
+    with _store_lock:
+        paths = list(_dirty)
+        _dirty.clear()
+        _dirty_event.clear()
+        snapshot = {p: _cache.get(p) for p in paths}
+    for path, data in snapshot.items():
+        if data is not None:
+            _atomic_write(path, data)
+
+
+# ---------------------------------------------------------------------------
+# Identity / access control
+# ---------------------------------------------------------------------------
+def is_admin_chat(chat_str):
+    """Only an explicitly configured ADMIN_CHAT_ID user is an admin. The previous logic (``not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID``) granted admin rights to every user whenever ADMIN_CHAT_ID was unset. """
+    chat_str = str(chat_str)
+    return bool(ADMIN_CHAT_ID) and chat_str == ADMIN_CHAT_ID
+
 
 def is_user_whitelisted(chat_str):
-    if ADMIN_CHAT_ID and chat_str == ADMIN_CHAT_ID:
+    chat_str = str(chat_str)
+    if is_admin_chat(chat_str):
         return True
     whitelist = load_json(WHITELIST_FILE)
-    return whitelist.get(chat_str, False)
+    return bool(whitelist.get(chat_str, False))
+
 
 def add_to_whitelist(chat_str):
+    chat_str = str(chat_str)
     whitelist = load_json(WHITELIST_FILE)
     whitelist[chat_str] = True
     save_json(WHITELIST_FILE, whitelist)
 
+
 def remove_from_whitelist(chat_str):
+    chat_str = str(chat_str)
     whitelist = load_json(WHITELIST_FILE)
     if chat_str in whitelist:
         del whitelist[chat_str]
         save_json(WHITELIST_FILE, whitelist)
 
-def get_bot_active():
-    state = load_json(STATE_FILE)
-    return state.get("active", True)
-
-def set_bot_active(val):
-    save_json(STATE_FILE, {"active": val})
-
-def get_user_mode(chat_str):
-    modes = load_json(MODE_FILE)
-    return modes.get(chat_str, "auto")
-
-def set_user_mode(chat_str, mode):
-    modes = load_json(MODE_FILE)
-    modes[chat_str] = mode
-    save_json(MODE_FILE, modes)
 
 def get_max_slots(chat_str):
-    return 20 if (ADMIN_CHAT_ID and chat_str == ADMIN_CHAT_ID) else 10
+    return ADMIN_MAX_SLOTS if is_admin_chat(chat_str) else USER_MAX_SLOTS
+
+
+# ---------------------------------------------------------------------------
+# Small state helpers
+# ---------------------------------------------------------------------------
+def get_bot_active():
+    return bool(load_json(STATE_FILE).get("active", True))
+
+
+def set_bot_active(val):
+    save_json(STATE_FILE, {"active": bool(val)})
+
 
 def get_active_slot(chat_str):
     slots = load_json(ACTIVE_SLOT_FILE)
-    return str(slots.get(chat_str, "1"))
+    return str(slots.get(str(chat_str), "1"))
+
 
 def set_active_slot(chat_str, slot):
     slots = load_json(ACTIVE_SLOT_FILE)
-    slots[chat_str] = str(slot)
+    slots[str(chat_str)] = str(slot)
     save_json(ACTIVE_SLOT_FILE, slots)
 
+
 def is_slot_active_state(chat_str, slot_id):
-    toggles = load_json(ACCOUNT_TOGGLES_FILE)
-    user_toggles = toggles.get(chat_str, {})
-    return user_toggles.get(str(slot_id), True)
+    toggles = load_json(ACCOUNT_TOGGLES_FILE).get(str(chat_str), {})
+    return bool(toggles.get(str(slot_id), True))
+
 
 def toggle_slot_state(chat_str, slot_id):
     toggles = load_json(ACCOUNT_TOGGLES_FILE)
-    if chat_str not in toggles:
-        toggles[chat_str] = {}
-    current = toggles[chat_str].get(str(slot_id), True)
-    toggles[chat_str][str(slot_id)] = not current
+    user_toggles = toggles.setdefault(str(chat_str), {})
+    current = bool(user_toggles.get(str(slot_id), True))
+    user_toggles[str(slot_id)] = not current
     save_json(ACCOUNT_TOGGLES_FILE, toggles)
     return not current
 
+
 def get_burner_credentials(chat_str):
-    burners = load_json(BURNER_FILE)
-    return burners.get(chat_str, {})
+    return load_json(BURNER_FILE).get(str(chat_str), {})
+
 
 def save_burner_credentials(chat_str, token_data):
     burners = load_json(BURNER_FILE)
-    burners[chat_str] = token_data
+    burners[str(chat_str)] = token_data
     save_json(BURNER_FILE, burners)
 
+
 def get_burner_cart(chat_str):
-    carts = load_json(BURNER_CART_FILE)
-    return carts.get(chat_str, {})
+    return load_json(BURNER_CART_FILE).get(str(chat_str), {})
+
 
 def save_burner_cart(chat_str, cart_data):
     carts = load_json(BURNER_CART_FILE)
-    carts[chat_str] = cart_data
+    carts[str(chat_str)] = cart_data
     save_json(BURNER_CART_FILE, carts)
 
+
 def get_linked_accounts(chat_str):
-    linked = load_json(LINKED_ACCOUNTS_FILE)
-    return linked.get(chat_str, [])
+    return list(load_json(LINKED_ACCOUNTS_FILE).get(str(chat_str), []))
+
 
 def add_linked_account(chat_str, secondary_chat_id):
     linked = load_json(LINKED_ACCOUNTS_FILE)
-    if chat_str not in linked:
-        linked[chat_str] = []
+    bucket = linked.setdefault(str(chat_str), [])
     sec_str = str(secondary_chat_id).strip()
-    if sec_str not in linked[chat_str]:
-        linked[chat_str].append(sec_str)
+    if sec_str and sec_str not in bucket:
+        bucket.append(sec_str)
         save_json(LINKED_ACCOUNTS_FILE, linked)
+
 
 def remove_linked_account(chat_str, secondary_chat_id):
     linked = load_json(LINKED_ACCOUNTS_FILE)
-    if chat_str in linked:
+    bucket = linked.get(str(chat_str))
+    if bucket:
         sec_str = str(secondary_chat_id).strip()
-        if sec_str in linked[chat_str]:
-            linked[chat_str].remove(sec_str)
+        if sec_str in bucket:
+            bucket.remove(sec_str)
             save_json(LINKED_ACCOUNTS_FILE, linked)
+
 
 def get_admin_stats():
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
     total_users = len(tokens_db)
-    total_slots_configured = sum(len(slots) for slots in tokens_db.values())
-    total_carts_configured = sum(len(carts) for carts in carts_db.values())
-    return total_users, total_slots_configured, total_carts_configured
+    total_slots = sum(len(slots) for slots in tokens_db.values())
+    total_carts = sum(len(carts) for carts in carts_db.values())
+    return total_users, total_slots, total_carts
+
 
 def record_portfolio_win(chat_str, code, slot_id, amount=2000):
+    chat_str = str(chat_str)
     portfolio = load_json(PORTFOLIO_FILE)
-    if chat_str not in portfolio:
-        portfolio[chat_str] = {"items": [], "total_value": 0}
-    
-    already_logged = any(item["code"] == code and str(item.get("slot")) == str(slot_id) for item in portfolio[chat_str]["items"])
-    if not already_logged:
-        portfolio[chat_str]["items"].append({
+    bucket = portfolio.setdefault(chat_str, {"items": [], "total_value": 0})
+    already = any(
+        item.get("code") == code and str(item.get("slot")) == str(slot_id)
+        for item in bucket.get("items", [])
+    )
+    if not already:
+        bucket.setdefault("items", []).append({
             "code": code,
             "slot": str(slot_id),
             "amount": amount,
-            "timestamp": time.time()
+            "timestamp": time.time(),
         })
-        portfolio[chat_str]["total_value"] = sum(item.get("amount", 2000) for item in portfolio[chat_str]["items"])
+        bucket["total_value"] = sum(
+            item.get("amount", 2000) for item in bucket["items"]
+        )
         save_json(PORTFOLIO_FILE, portfolio)
+
+
+# ---------------------------------------------------------------------------
+# Pending security-question prompts (FIFO queue per chat)
+# ---------------------------------------------------------------------------
+def add_or_update_pending(chat_str, entry):
+    store = load_json(PENDING_PROMPT_FILE)
+    bucket = [e for e in store.get(str(chat_str), []) if e.get("code") != entry.get("code")]
+    bucket.append(entry)
+    store[str(chat_str)] = bucket[-10:]
+    save_json(PENDING_PROMPT_FILE, store)
+
+
+def list_pending(chat_str):
+    return list(load_json(PENDING_PROMPT_FILE).get(str(chat_str), []))
+
+
+def pop_pending(chat_str, code=None, reply_to=None):
+    """Remove and return the prompt a user is answering. Resolution order: explicit code -> Telegram reply target -> oldest pending. """
+    store = load_json(PENDING_PROMPT_FILE)
+    bucket = list(store.get(str(chat_str), []))
+    target = None
+    if code:
+        target = next((e for e in bucket if e.get("code") == code), None)
+    elif reply_to is not None:
+        target = next((e for e in bucket if e.get("msg_id") == reply_to), None)
+    if target is None and bucket:
+        target = bucket[0]
+    if target is not None:
+        bucket = [e for e in bucket if e is not target]
+        store[str(chat_str)] = bucket
+        save_json(PENDING_PROMPT_FILE, store)
+    return target
+
+
+def clear_pending(chat_str, code=None):
+    store = load_json(PENDING_PROMPT_FILE)
+    bucket = list(store.get(str(chat_str), []))
+    if code:
+        bucket = [e for e in bucket if e.get("code") != code]
+    else:
+        bucket = []
+    store[str(chat_str)] = bucket
+    save_json(PENDING_PROMPT_FILE, store)
+    return bucket
+
+
+# ---------------------------------------------------------------------------
+# Code / credential parsing helpers
+# ---------------------------------------------------------------------------
+def robust_clean_code(raw):
+    if not raw:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(raw))
+    return "".join(c for c in normalized if c.isalnum()).upper()
+
+
+def looks_like_code(raw):
+    """Return a normalized promo code, or None when the text is not code-like. Used for code-priority parsing so a fresh promo code pasted while a security prompt is open is treated as a code, not as the answer. """
+    cleaned = robust_clean_code(raw)
+    if not (4 <= len(cleaned) <= 24):
+        return None
+    if cleaned in _IGNORE_TOKENS:
+        return None
+    if cleaned.startswith("INVITE"):
+        return None
+    if cleaned.isdigit():
+        # Bare numbers are far more likely to be an answer than a code.
+        return None
+    return cleaned
+
 
 def parse_jwt_payload(token):
     try:
-        parts = token.split(".")
+        parts = str(token).split(".")
         if len(parts) >= 2:
             payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-            decoded_bytes = base64.urlsafe_b64decode(payload_b64)
-            return json.loads(decoded_bytes.decode('utf-8'))
+            decoded = base64.urlsafe_b64decode(payload_b64)
+            return json.loads(decoded.decode("utf-8"))
     except Exception:
         pass
     return {}
 
+
 def extract_phone_from_data(data):
     if not isinstance(data, dict):
         return None
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
     return (
-        data.get("phone_number") or 
-        data.get("phone") or 
-        data.get("phoneNumber") or 
-        data.get("mobile") or 
-        data.get("telephone") or 
-        data.get("user_phone") or
-        data.get("user", {}).get("phone_number") or
-        data.get("user", {}).get("phone")
+        data.get("phone_number")
+        or data.get("phone")
+        or data.get("phoneNumber")
+        or data.get("mobile")
+        or data.get("telephone")
+        or data.get("user_phone")
+        or user.get("phone_number")
+        or user.get("phone")
     )
 
+
 def parse_and_store_credentials(raw_input, chat_str, slot):
-    cleaned = raw_input.strip()
+    cleaned = str(raw_input).strip()
     extracted_token = cleaned
     extracted_cookies = {}
     extracted_phone = None
 
     if "user=" in cleaned or ";" in cleaned:
         try:
-            parts = cleaned.split(";")
-            for p in parts:
-                p = p.strip()
-                if "=" in p:
-                    k, v = p.split("=", 1)
+            for part in cleaned.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
                     extracted_cookies[k.strip()] = v.strip()
                     if k.strip() == "user":
                         decoded = urllib.parse.unquote(v.strip())
@@ -230,8 +420,8 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
                         if "token" in data:
                             extracted_token = data["token"]
                         extracted_phone = extract_phone_from_data(data)
-        except Exception as e:
-            print(f"Cookie parse error: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[creds] cookie parse error: {e}", flush=True)
 
     if cleaned.startswith("{") and "token" in cleaned:
         try:
@@ -241,33 +431,30 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
             extracted_phone = extract_phone_from_data(data)
         except Exception:
             pass
-            
+
     if extracted_token.lower().startswith("bearer "):
         extracted_token = extracted_token[7:].strip()
 
     if not extracted_phone and extracted_token.count(".") == 2:
-        jwt_data = parse_jwt_payload(extracted_token)
-        extracted_phone = extract_phone_from_data(jwt_data)
+        extracted_phone = extract_phone_from_data(parse_jwt_payload(extracted_token))
 
     tokens_db = load_json(TOKENS_FILE)
-    if chat_str not in tokens_db:
-        tokens_db[chat_str] = {}
-    
-    existing_phone = tokens_db[chat_str].get(slot, {}).get("phone")
-    final_phone = extracted_phone if extracted_phone else existing_phone
+    user_slots = tokens_db.setdefault(str(chat_str), {})
+    existing_phone = user_slots.get(str(slot), {}).get("phone")
+    final_phone = extracted_phone or existing_phone
 
-    tokens_db[chat_str][slot] = {
+    user_slots[str(slot)] = {
         "token": extracted_token,
         "cookies": extracted_cookies,
-        "phone": str(final_phone)[:15] if final_phone else None
+        "phone": str(final_phone)[:15] if final_phone else None,
     }
     save_json(TOKENS_FILE, tokens_db)
     return extracted_token
 
+
 async def fetch_account_phone(token, cookies):
     if token and token.count(".") == 2:
-        jwt_data = parse_jwt_payload(token)
-        phone = extract_phone_from_data(jwt_data)
+        phone = extract_phone_from_data(parse_jwt_payload(token))
         if phone:
             return phone
 
@@ -276,1349 +463,1401 @@ async def fetch_account_phone(token, cookies):
         "Content-Type": "application/json",
         "Origin": "https://chowdeck.com",
         "Referer": "https://chowdeck.com/",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
+        "User-Agent": _UA,
+        "Accept": "application/json, text/plain, */*",
     }
-    profile_url = "https://api.chowdeck.com/customer/profile"
     try:
-        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None) as client:
-            res = await client.get(profile_url, headers=headers, cookies=cookies)
-            if res.status_code == 200:
-                res_json = res.json()
-                data = res_json.get("data", {})
-                if not isinstance(data, dict):
-                    data = res_json
-                phone = extract_phone_from_data(data)
-                return phone
-    except Exception as e:
-        print(f"Profile fetch error: {e}", flush=True)
+        res = await _CD_CLIENT.get(
+            "https://api.chowdeck.com/customer/profile",
+            headers=headers,
+            cookies=cookies or None,
+        )
+        if res.status_code == 200:
+            res_json = res.json()
+            data = res_json.get("data", res_json)
+            if not isinstance(data, dict):
+                data = res_json
+            return extract_phone_from_data(data)
+    except Exception as e:  # noqa: BLE001
+        print(f"[creds] profile fetch error: {e}", flush=True)
     return None
 
-def robust_clean_code(raw):
-    if not raw:
-        return ""
-    normalized = unicodedata.normalize("NFKD", str(raw))
-    cleaned = "".join(c for c in normalized if c.isalnum()).upper()
-    return cleaned
 
-async def send_telegram(chat_id, text, reply_markup=None):
-    if not chat_id:
+# ---------------------------------------------------------------------------
+# Shared HTTP clients (connection reuse = lower latency)
+# ---------------------------------------------------------------------------
+_UA = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+
+_CD_CLIENT = httpx.AsyncClient(
+    timeout=CLAIM_TIMEOUT,
+    proxy=PROXY_URL,
+    follow_redirects=True,
+    limits=httpx.Limits(
+        max_keepalive_connections=REQUEST_CONCURRENCY,
+        max_connections=REQUEST_CONCURRENCY * 2,
+        keepalive_expiry=30.0,
+    ),
+)
+
+_TG_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(6.0, connect=4.0),
+    proxy=PROXY_URL,
+    limits=httpx.Limits(max_keepalive_connections=64, max_connections=128),
+)
+
+_REQUEST_SEM = asyncio.Semaphore(REQUEST_CONCURRENCY)
+
+_CHOW_HEADERS_BASE = {
+    "Content-Type": "application/json",
+    "Origin": "https://chowdeck.com",
+    "Referer": "https://chowdeck.com/",
+    "User-Agent": _UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
+
+
+def chow_headers(token):
+    headers = dict(_CHOW_HEADERS_BASE)
+    headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
+async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+    """Send a message. Retries once without parse_mode on formatting errors."""
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    try:
-        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            res = await temp_client.post(url, json=payload, timeout=4.0)
-            return res.json().get("result", {}).get("message_id")
-    except Exception as e:
-        print(f"Telegram send error to {chat_id}: {e}", flush=True)
-        return None
+    for attempt in range(2):
+        try:
+            res = await _TG_CLIENT.post(url, json=payload)
+            if res.status_code == 200:
+                return res.json().get("result", {}).get("message_id")
+            body = res.text.lower()
+            if attempt == 0 and ("parse" in body or "entit" in body):
+                payload.pop("parse_mode", None)
+                continue
+            return None
+        except Exception as e:  # noqa: BLE001
+            if attempt == 0:
+                continue
+            print(f"[tg] send error to {chat_id}: {e}", flush=True)
+            return None
+    return None
+
 
 async def broadcast_to_channel(text):
     if not TELEGRAM_CHANNEL_ID:
         return
     await send_telegram(TELEGRAM_CHANNEL_ID, text)
 
+
 async def answer_callback_query(callback_query_id, text=""):
+    if not TELEGRAM_BOT_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     try:
-        async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as temp_client:
-            await temp_client.post(url, json={"callback_query_id": callback_query_id, "text": text}, timeout=3.0)
-    except Exception as e:
-        print(f"Callback answer error: {e}", flush=True)
+        await _TG_CLIENT.post(
+            url, json={"callback_query_id": callback_query_id, "text": text}
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[tg] callback answer error: {e}", flush=True)
+
+
+async def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "reply_markup": reply_markup,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    for attempt in range(2):
+        try:
+            res = await _TG_CLIENT.post(url, json=payload)
+            if res.status_code == 200:
+                return
+            if attempt == 0 and ("parse" in res.text.lower() or "entit" in res.text.lower()):
+                payload.pop("parse_mode", None)
+                continue
+            return
+        except Exception as e:  # noqa: BLE001
+            if attempt == 0:
+                continue
+            print(f"[tg] edit error: {e}", flush=True)
+
 
 async def perform_ocr_on_image(image_bytes):
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            files = {"file": ("screenshot.jpg", image_bytes, "image/jpeg")}
-            data = {"apikey": "helloworld", "language": "eng", "isOverlayRequired": False}
-            res = await client.post("https://api.ocr.space/parse/image", files=files, data=data)
-            if res.status_code == 200:
-                res_json = res.json()
-                parsed_results = res_json.get("ParsedResults", [])
-                if parsed_results:
-                    return parsed_results[0].get("ParsedText", "")
-    except Exception as e:
-        print(f"OCR error: {e}", flush=True)
+        files = {"file": ("screenshot.jpg", image_bytes, "image/jpeg")}
+        data = {"apikey": OCR_API_KEY, "language": "eng", "isOverlayRequired": False}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                "https://api.ocr.space/parse/image", files=files, data=data
+            )
+        if res.status_code == 200:
+            parsed = res.json().get("ParsedResults", [])
+            if parsed:
+                return parsed[0].get("ParsedText", "")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ocr] error: {e}", flush=True)
     return ""
 
+
+# ---------------------------------------------------------------------------
+# Keyboards (prompt mode only - no mode toggle)
+# ---------------------------------------------------------------------------
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
-    current_mode = get_user_mode(chat_str).upper()
     max_slots = get_max_slots(chat_str)
-    
-    slot_row_1 = []
-    slot_row_2 = []
-    slot_row_3 = []
-    slot_row_4 = []
-    
+
+    rows = [[], [], [], []]
     for i in range(1, max_slots + 1):
         s_str = str(i)
-        is_active = is_slot_active_state(chat_str, s_str)
-        icon = "✅" if is_active else "❌"
+        icon = "✅" if is_slot_active_state(chat_str, s_str) else "❌"
         label = f"📌 S{i}" if s_str == active_slot else f"{icon} {i}"
-        
         btn = {"text": label, "callback_data": f"slot_{i}"}
         if i <= 5:
-            slot_row_1.append(btn)
+            rows[0].append(btn)
         elif i <= 10:
-            slot_row_2.append(btn)
+            rows[1].append(btn)
         elif i <= 15:
-            slot_row_3.append(btn)
+            rows[2].append(btn)
         else:
-            slot_row_4.append(btn)
-        
-    keyboard = [slot_row_1, slot_row_2]
-    if slot_row_3:
-        keyboard.append(slot_row_3)
-    if slot_row_4:
-        keyboard.append(slot_row_4)
-        
+            rows[3].append(btn)
+
+    keyboard = [rows[0], rows[1]]
+    for extra in (rows[2], rows[3]):
+        if extra:
+            keyboard.append(extra)
+
     keyboard.extend([
         [
             {"text": "👥 My Accounts", "callback_data": "btn_my_accounts"},
-            {"text": "💰 Portfolio", "callback_data": "btn_portfolio"}
+            {"text": "💰 Portfolio", "callback_data": "btn_portfolio"},
         ],
         [
-            {"text": f"⚙️ Mode: {current_mode}", "callback_data": "btn_toggle_mode"},
-            {"text": "🔄 Refresh", "callback_data": "btn_status"}
+            {"text": "🔄 Refresh", "callback_data": "btn_status"},
+            {"text": "📖 Guide / Help", "callback_data": "btn_guide"},
         ],
-        [
-            {"text": "📖 Guide / Help", "callback_data": "btn_guide"}
-        ]
     ])
-    
+
     if is_admin:
-        keyboard.insert(len(keyboard) - 1, [{"text": "🛡 Admin Stats", "callback_data": "btn_admin_stats"}, {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"}])
-        keyboard.insert(len(keyboard) - 1, [{"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"}, {"text": "🔑 Invites", "callback_data": "btn_invites_menu"}])
+        keyboard.insert(len(keyboard) - 1, [
+            {"text": "🛡 Admin Stats", "callback_data": "btn_admin_stats"},
+            {"text": "🧪 Burner Panel", "callback_data": "btn_burner_menu"},
+        ])
+        keyboard.insert(len(keyboard) - 1, [
+            {"text": "🔗 Linked Accounts", "callback_data": "btn_linked_menu"},
+            {"text": "🔑 Invites", "callback_data": "btn_invites_menu"},
+        ])
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
-            {"text": "▶️ Resume", "callback_data": "btn_resume"}
+            {"text": "▶️ Resume", "callback_data": "btn_resume"},
         ])
     return {"inline_keyboard": keyboard}
 
+
 def build_accounts_keyboard(chat_str):
-    tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+    tokens_db = load_json(TOKENS_FILE).get(str(chat_str), {})
     max_slots = get_max_slots(chat_str)
-    rows = []
-    row = []
+    rows, row = [], []
     for i in range(1, max_slots + 1):
         s_str = str(i)
-        active = is_slot_active_state(chat_str, s_str)
-        status_icon = "✅" if active else "❌"
-        
-        slot_info = tokens_db.get(s_str, {})
-        phone_label = slot_info.get("phone")
-        
-        if phone_label:
-            label = f"{status_icon} S{i}: {phone_label}"
-        else:
-            label = f"{status_icon} S{i} (Empty)"
-            
+        icon = "✅" if is_slot_active_state(chat_str, s_str) else "❌"
+        phone_label = tokens_db.get(s_str, {}).get("phone")
+        label = f"{icon} S{i}: {phone_label}" if phone_label else f"{icon} S{i} (Empty)"
         row.append({"text": label, "callback_data": f"toggle_acc_{i}"})
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([{"text": "🔄 Refresh Phones", "callback_data": "btn_refresh_phones"}, {"text": "🔙 Main Menu", "callback_data": "btn_main_menu"}])
+    rows.append([
+        {"text": "🔄 Refresh Phones", "callback_data": "btn_refresh_phones"},
+        {"text": "🔙 Main Menu", "callback_data": "btn_main_menu"},
+    ])
     return {"inline_keyboard": rows}
+
 
 def build_admin_burner_keyboard():
     return {"inline_keyboard": [
-        [{"text": "🧪 Test Code (Send via /test)", "callback_data": "burner_info"}],
-        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+        [{"text": "🧪 Test Code (send /test CODE)", "callback_data": "burner_info"}],
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
+
 
 def build_admin_linked_keyboard():
     return {"inline_keyboard": [
-        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
+
 
 def build_admin_invites_keyboard():
     return {"inline_keyboard": [
         [{"text": "➕ Generate Invite Code", "callback_data": "btn_gen_invite"}],
         [{"text": "📋 List Whitelist", "callback_data": "btn_list_whitelist"}],
-        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}]
+        [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
+
+
+# ---------------------------------------------------------------------------
+# Claim core - hedged single-slot claim (prompt mode only)
+# ---------------------------------------------------------------------------
+def _safe_json(res):
+    try:
+        return res.json()
+    except Exception:
+        return {}
+
+
+async def _raw_post(client, url, payload, headers, cookies):
+    async with _REQUEST_SEM:
+        res = await client.post(url, json=payload, headers=headers, cookies=cookies or None)
+        return res, _safe_json(res)
+
+
+async def _hedged_post(client, url, payload, headers, cookies, n):
+    """Fire N near-simultaneous identical requests; return the best response. Hedging is what lets a slot beat the "voucher is in high demand" throttle: the first successful claim wins and the duplicates are discarded. """
+    n = max(1, int(n))
+    if n == 1:
+        return await _raw_post(client, url, payload, headers, cookies)
+
+    async def one(delay):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await _raw_post(client, url, payload, headers, cookies)
+
+    tasks = [
+        asyncio.create_task(one(random.uniform(0.0, 0.08) if idx else 0.0))
+        for idx in range(n)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    best = None
+    for item in results:
+        if isinstance(item, BaseException) or item is None:
+            continue
+        res, body = item
+        if res.status_code in (200, 201):
+            return res, body
+        if best is None:
+            best = (res, body)
+    if best is not None:
+        return best
+    return None, {"message": "network error"}
+
+
+async def _apply_cart(client, headers, cookies, cart_info, code):
+    cart_id = (cart_info or {}).get("cart_id")
+    if not cart_id:
+        return ""
+    vendor_id = (cart_info or {}).get("vendor_id")
+    payload = {"cart_id": cart_id, "promo_codes": [code]}
+    if vendor_id:
+        payload["vendor_id"] = vendor_id
+    try:
+        res = await client.post(
+            "https://api.chowdeck.com/customer/discount/apply",
+            json=payload,
+            headers=headers,
+            cookies=cookies or None,
+        )
+        return f"\nCart: `{res.status_code}` {res.text[:120]}"
+    except Exception as e:  # noqa: BLE001
+        return f"\nCart apply error: `{e}`"
+
+
+async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, lockouts_db, specific_answer=None, deadline=None):
+    """Claim `code` for one slot using burst/hedged requests. With no `specific_answer` the first request probes with an empty answer so the API reveals the security question (prompt mode). With a `specific_answer` the answer is submitted immediately. """
+    chat_str = str(chat_id)
+    slot_key = str(slot_id)
+
+    if not is_slot_active_state(chat_str, slot_key):
+        return {"slot": slot_key, "status": 0, "response": {"message": "skipped (inactive)"}}
+
+    token = (token_data or {}).get("token")
+    if not token:
+        return {"slot": slot_key, "status": 0, "response": {"message": "skipped (no token)"}}
+
+    lockout_key = f"{chat_str}_{slot_key}"
+    if not specific_answer and time.time() < lockouts_db.get(lockout_key, 0):
+        return {"slot": slot_key, "status": 429, "response": {"message": "locked out"}}
+
+    cookies = (token_data or {}).get("cookies", {})
+    headers = chow_headers(token)
+    url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+
+    if specific_answer:
+        payload = {"code": code, "answer": specific_answer, "security_answer": specific_answer}
+    else:
+        payload = {"code": code, "answer": "", "security_answer": ""}
+
+    if deadline is None:
+        deadline = time.time() + CLAIM_WINDOW_SECONDS
+
+    last_res, last_json = None, {}
+    for attempt in range(CLAIM_MAX_ATTEMPTS):
+        if time.time() >= deadline:
+            break
+        try:
+            res, body = await _hedged_post(client, url, payload, headers, cookies, HEDGE_REQUESTS)
+        except Exception as e:  # noqa: BLE001
+            res, body = None, {"message": str(e)}
+
+        if res is not None:
+            last_res, last_json = res, body
+            if res.status_code in (200, 201):
+                break
+            msg = str(body.get("message", "")).lower()
+            data_obj = body.get("data", {}) if isinstance(body.get("data"), dict) else {}
+            sub_code = str(data_obj.get("code", ""))
+            congested = (
+                res.status_code in (429, 500, 502, 503, 504)
+                or sub_code == "claim_busy"
+                or "high demand" in msg
+                or "try again" in msg
+                or "server error" in msg
+            )
+            if not congested:
+                break
+        await asyncio.sleep(random.uniform(0.04, 0.14) * (attempt + 1))
+
+    if last_res is None:
+        return {"slot": slot_key, "status": 500, "response": {"message": "request failed"}}
+
+    status = last_res.status_code
+    msg_text = str(last_json.get("message", "")).lower()
+    data_obj = last_json.get("data", {}) if isinstance(last_json.get("data"), dict) else {}
+
+    # Prompt mode: surface the security question when no answer was supplied.
+    if not specific_answer:
+        question = data_obj.get("security_question") or data_obj.get("question")
+        hard_fail = any(
+            token_ in msg_text
+            for token_ in ("does not exist", "invalid", "expired", "used", "high demand")
+        )
+        needs_prompt = bool(question) or (status in (400, 422) and not hard_fail)
+        if needs_prompt:
+            if not question:
+                question = last_json.get("message") or "Security question required for this code."
+            return {
+                "slot": slot_key,
+                "status": status,
+                "needs_prompt": True,
+                "question": str(question)[:300],
+                "response": last_json,
+            }
+
+    if not specific_answer and "too many failed" in msg_text:
+        lockouts_db[lockout_key] = time.time() + 900
+        save_json(LOCKOUT_FILE, lockouts_db)
+        return {"slot": slot_key, "status": status, "response": last_json,
+                "message": "locked out after repeated failures"}
+
+    cart_suffix = ""
+    if status in (200, 201):
+        cart_suffix = await _apply_cart(
+            client, headers, cookies, carts_db.get(chat_str, {}).get(slot_key, {}), code
+        )
+        record_portfolio_win(chat_str, code, slot_key, amount=2000)
+
+    return {
+        "slot": slot_key,
+        "status": status,
+        "response": last_json,
+        "cart_str": cart_suffix,
+        "needs_prompt": False,
+    }
+
 
 async def execute_burner_test(chat_id, code):
     chat_str = str(chat_id)
     token_data = get_burner_credentials(chat_str)
-    if not token_data or not token_data.get("token"):
-        return "❌ Burner account token not configured! Use `/setburnertoken` first."
-
     token = token_data.get("token")
-    user_cookies = token_data.get("cookies", {})
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Origin": "https://chowdeck.com",
-        "Referer": "https://chowdeck.com/",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
-    }
-    
-    claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    payload_data = {"code": code, "answer": "Ismail", "security_answer": "Ismail"}
-    
+    if not token:
+        return "❌ Burner account token not configured. Use `/setburnertoken` first."
+
+    cookies = token_data.get("cookies", {})
+    headers = chow_headers(token)
+    url = f"https://api.chowdeck.com/customer/promo-code/{code}"
+    payload = {"code": code, "answer": "", "security_answer": ""}
     try:
-        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None) as client:
-            claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
-            res_json = {}
-            try:
-                res_json = claim_res.json()
-            except Exception:
-                pass
-
-            cart_info = get_burner_cart(chat_str)
-            cart_id = cart_info.get("cart_id")
-            vendor_id = cart_info.get("vendor_id")
-            
-            cart_status_str = ""
-            if cart_id and claim_res.status_code == 200:
-                apply_payload = {"cart_id": cart_id, "promo_codes": [code]}
-                if vendor_id:
-                    apply_payload["vendor_id"] = vendor_id
-                apply_res = await client.post("https://api.chowdeck.com/customer/discount/apply", json=apply_payload, headers=headers, cookies=user_cookies)
-                cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
-
+        res, body = await _hedged_post(_CD_CLIENT, url, payload, headers, cookies, 1)
+        if res is None:
+            return "❌ Burner test failed: no response from Chowdeck."
+        cart_suffix = ""
+        if res.status_code in (200, 201):
+            cart_suffix = await _apply_cart(_CD_CLIENT, headers, cookies, get_burner_cart(chat_str), code)
         return (
-            f"🧪 *Burner Test Result for `{code}`*\n"
-            f"Status Code: `{claim_res.status_code}`\n"
-            f"API Response: `{json.dumps(res_json)}`{cart_status_str}"
+            f"🧪 *Burner test for* `{code}`\n"
+            f"Status: `{res.status_code}`\n"
+            f"Response: `{json.dumps(body)[:400]}`{cart_suffix}"
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"❌ Burner test error: {e}"
 
-async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, answers_db, lockouts_db, specific_answer=None):
-    chat_str = str(chat_id)
-    slot_key = str(slot_id)
-    
-    if not is_slot_active_state(chat_str, slot_key):
-        return {"slot": slot_key, "status": 0, "message": "skipped (inactive)"}
 
-    lockout_key = f"{chat_str}_{slot_key}"
-    if time.time() < lockouts_db.get(lockout_key, 0) and not specific_answer:
-        return {"slot": slot_key, "status": 429, "message": "locked out"}
+# ---------------------------------------------------------------------------
+# Code extraction / dedupe
+# ---------------------------------------------------------------------------
+_code_queue = asyncio.Queue(maxsize=5000)
+loop_ref = None
 
-    token = token_data.get("token")
-    user_cookies = token_data.get("cookies", {})
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Origin": "https://chowdeck.com",
-        "Referer": "https://chowdeck.com/",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty"
-    }
-    
-    claim_url = f"https://api.chowdeck.com/customer/promo-code/{code}"
-    user_mode = get_user_mode(chat_str)
-    
-    max_retries = 6
-    claim_res = None
-    res_json = {}
+_recent_lock = threading.Lock()
+_recent_codes = {}
 
-    for attempt in range(max_retries + 1):
-        try:
-            master_ans_list = answers_db.get(chat_str, {}).get("master", ["Ismail"])
-            master_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
 
-            if user_mode == "prompt" and not specific_answer:
-                probe_payload = {"code": code, "answer": "", "security_answer": ""}
-                claim_res = await client.post(claim_url, json=probe_payload, headers=headers, cookies=user_cookies)
-            else:
-                ans_to_use = specific_answer if specific_answer else master_ans
-                payload_data = {"code": code, "answer": ans_to_use, "security_answer": ans_to_use}
-                claim_res = await client.post(claim_url, json=payload_data, headers=headers, cookies=user_cookies)
+def reserve_code(code, ttl=180):
+    """Return False when this code was already processed very recently."""
+    now = time.time()
+    with _recent_lock:
+        for k in [k for k, v in _recent_codes.items() if now - v > ttl]:
+            _recent_codes.pop(k, None)
+        if code in _recent_codes:
+            return False
+        _recent_codes[code] = now
+    return True
 
-            try:
-                res_json = claim_res.json()
-            except Exception:
-                res_json = {}
 
-            msg_text = res_json.get("message", "").lower()
-            data_obj = res_json.get("data", {})
-            sub_code = data_obj.get("code", "") if isinstance(data_obj, dict) else ""
+def extract_candidate_codes(text, min_len=5):
+    out = []
+    for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
+        cleaned = robust_clean_code(raw)
+        if not (min_len <= len(cleaned) <= 24):
+            continue
+        if cleaned in _IGNORE_TOKENS or cleaned.startswith("INVITE"):
+            continue
+        if cleaned.isdigit():
+            continue
+        out.append(cleaned)
+    return list(dict.fromkeys(out))
 
-            is_congested = (
-                claim_res.status_code in [429, 500, 502, 503, 504] or 
-                sub_code == "claim_busy" or 
-                "high demand" in msg_text or 
-                "try again" in msg_text or
-                "server error" in msg_text
-            )
 
-            if is_congested and attempt < max_retries:
-                backoff = random.uniform(0.08 * (attempt + 1), 0.18 * (attempt + 1))
-                await asyncio.sleep(backoff)
-                continue
-            break
-        except (httpx.RequestError, httpx.TimeoutException):
-            if attempt < max_retries:
-                await asyncio.sleep(0.05 * (attempt + 1))
-                continue
-            return {"slot": slot_key, "status": 500, "response": {"message": "Network/Timeout error"}}
-        except Exception as e:
-            return {"slot": slot_key, "status": 500, "response": {"message": str(e)}}
+def strong_code_signal(text):
+    """Stricter test used while a security prompt is open. Promo codes almost always carry a digit; a short purely alphabetic token (a typical security answer) is treated as the answer instead. """
+    cleaned = robust_clean_code(text)
+    if not (5 <= len(cleaned) <= 24):
+        return False
+    if cleaned in _IGNORE_TOKENS or cleaned.startswith("INVITE"):
+        return False
+    return any(ch.isdigit() for ch in cleaned) or len(cleaned) >= 10
 
-    if not claim_res:
-        return {"slot": slot_key, "status": 500, "response": {"message": "Request failed"}}
-
-    try:
-        msg_text = res_json.get("message", "").lower()
-        data_obj = res_json.get("data", {})
-        
-        q_text = None
-        if isinstance(data_obj, dict):
-            q_text = data_obj.get("security_question") or data_obj.get("question")
-        if not q_text and ("security question" in msg_text or "incorrect" in msg_text or "not correct" in msg_text or "question" in msg_text):
-            q_text = res_json.get("message")
-
-        if user_mode == "prompt" and not specific_answer:
-            if q_text or (claim_res.status_code in [400, 422] and not ("does not exist" in msg_text or "invalid" in msg_text or "expired" in msg_text or "used" in msg_text or "high demand" in msg_text)):
-                if not q_text:
-                    q_text = res_json.get("message") if res_json.get("message") else "Security question required for this code."
-                return {
-                    "slot": slot_key,
-                    "status": claim_res.status_code,
-                    "needs_prompt": True,
-                    "question": q_text,
-                    "response": res_json
-                }
-
-        if not specific_answer:
-            if "too many failed" in msg_text:
-                lockouts_db[lockout_key] = time.time() + 900
-                save_json(LOCKOUT_FILE, lockouts_db)
-
-        cart_info = carts_db.get(chat_str, {}).get(slot_key, {})
-        cart_id = cart_info.get("cart_id")
-        vendor_id = cart_info.get("vendor_id")
-        
-        cart_status_str = ""
-        if cart_id and claim_res.status_code == 200:
-            apply_payload = {
-                "cart_id": cart_id,
-                "promo_codes": [code]
-            }
-            if vendor_id:
-                apply_payload["vendor_id"] = vendor_id
-                
-            apply_res = await client.post("https://api.chowdeck.com/customer/discount/apply", json=apply_payload, headers=headers, cookies=user_cookies)
-            cart_status_str = f"\nCart Apply Status: `{apply_res.status_code}` | Response: `{apply_res.text}`"
-
-        if claim_res.status_code in [200, 201]:
-            record_portfolio_win(chat_str, code, slot_key, amount=2000)
-
-        return {
-            "slot": slot_key,
-            "status": claim_res.status_code,
-            "response": res_json,
-            "cart_str": cart_status_str,
-            "needs_prompt": False
-        }
-    except Exception as e:
-        return {"slot": slot_key, "status": 500, "response": {"message": str(e)}}
 
 def format_slot_range(slots):
-    slots = sorted(list(set(int(s) for s in slots)))
-    if not slots:
-        return ""
-    if len(slots) == 1:
-        return f"Slot {slots[0]}"
-    if slots == list(range(slots[0], slots[-1] + 1)):
-        return f"Slots {slots[0]} to {slots[-1]}"
-    return ", ".join(map(str, slots))
+    vals = sorted({int(s) for s in slots if str(s).isdigit()})
+    if not vals:
+        return "Slots"
+    if len(vals) == 1:
+        return f"Slot {vals[0]}"
+    if vals == list(range(vals[0], vals[-1] + 1)):
+        return f"Slots {vals[0]}-{vals[-1]}"
+    return "Slots " + ", ".join(map(str, vals))
 
-async def claim_code_global(raw_code):
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Claim orchestration
+# ---------------------------------------------------------------------------
+async def _run_slots(chat_str, code, tokens_db, carts_db, lockouts_db, specific_answer=None):
+    user_slots = tokens_db.get(chat_str, {}) or {}
+    pending = [
+        (str(sid), td) for sid, td in user_slots.items()
+        if (td or {}).get("token") and is_slot_active_state(chat_str, str(sid))
+    ]
+    if not pending:
+        return []
+
+    chat_id = _to_int(chat_str)
+    if chat_id is None:
+        return []
+
+    deadline = time.time() + CLAIM_WINDOW_SECONDS
+    tasks = [
+        claim_slot_worker(_CD_CLIENT, chat_id, sid, td, code, carts_db, lockouts_db,
+                          specific_answer, deadline)
+        for sid, td in pending
+    ]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for r in raw:
+        if isinstance(r, BaseException):
+            results.append({"slot": "?", "status": 500, "response": {"message": str(r)}})
+        else:
+            results.append(r)
+    return results
+
+
+async def _report_user_results(chat_str, code, results, mirror=False, tag=""):
+    """At most one prompt message and/or one result message per user per code."""
+    chat_id = _to_int(chat_str)
+    if chat_id is None or not results:
+        return
+
+    prompts = [r for r in results if r.get("needs_prompt")]
+    others = [r for r in results if r.get("status") != 0 and not r.get("needs_prompt")]
+    successes = [r for r in others if r.get("status") in (200, 201)]
+    head = "🔗 [Mirrored] " if mirror else ""
+
+    if prompts:
+        question = str(prompts[0].get("question") or "Security question required.")
+        slots = [str(r.get("slot")) for r in prompts]
+        entry = {"code": code, "question": question, "slots": slots, "ts": time.time()}
+        msg = (
+            f"{head}🔒 *Security question for* `{code}` ({format_slot_range(slots)})\n\n"
+            f"Q: *\"{question}\"*\n\n"
+            f"⚡ Reply with the answer right here — it is claimed instantly.\n"
+            f"If you also have a new code, send it and it will be treated as a code."
+        )
+        msg_id = await send_telegram(chat_id, msg)
+        if msg_id:
+            entry["msg_id"] = msg_id
+        add_or_update_pending(chat_str, entry)
+
+    if others and (successes or not prompts):
+        lines = [f"{head}🎯 `{code}` {tag}".rstrip()]
+        if successes:
+            lines.append(f"✅ Claimed on {format_slot_range([r['slot'] for r in successes])}")
+        failures = [r for r in others if r not in successes]
+        grouped = {}
+        for r in failures:
+            resp = r.get("response", {}) if isinstance(r.get("response"), dict) else {}
+            label = f"{r.get('status')} {str(resp.get('message', ''))[:60]}".strip()
+            grouped.setdefault(label, []).append(str(r.get("slot")))
+        for label, slots in list(grouped.items())[:4]:
+            lines.append(f"• {label} → {format_slot_range(slots)}")
+        if len(grouped) > 4:
+            lines.append(f"• …and {len(grouped) - 4} more result type(s)")
+        cart = next((r.get("cart_str") for r in successes if r.get("cart_str")), "")
+        if cart:
+            lines.append(cart.strip())
+        await send_telegram(chat_id, "\n".join(lines))
+
+
+async def claim_code_global(raw_code, announce=True):
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
-
-    claimed_history = load_json(CLAIMED_FILE)
-    if code in claimed_history:
+    if not get_bot_active():
+        return
+    if not reserve_code(code):
         return
 
-    await broadcast_to_channel(
-        f"🚨 *New Chowdeck Code Detected!*\n\n"
-        f"Code: `{code}`\n"
-        f"⚡ *Rush to your bot now before it flies away!*"
-    )
+    if announce:
+        await broadcast_to_channel(
+            f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
+            f"⚡ *Rush to your bot now — it will not wait.*"
+        )
 
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
-    answers_db = load_json(ANSWER_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
-    
-    if not tokens_db:
+    targets = [c for c, slots in tokens_db.items() if slots and is_user_whitelisted(c)]
+    if not targets:
         return
 
-    all_tasks = []
-    task_meta = []
+    sem = asyncio.Semaphore(USER_CONCURRENCY)
 
-    limits = httpx.Limits(max_keepalive_connections=1500, max_connections=3000)
-    async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-        for chat_str, user_slots in tokens_db.items():
-            if not user_slots or not is_user_whitelisted(chat_str):
-                continue
-            for slot_id, t_data in user_slots.items():
-                all_tasks.append(
-                    claim_slot_worker(
-                        client=client,
-                        chat_id=int(chat_str), 
-                        slot_id=slot_id, 
-                        token_data=t_data, 
-                        code=code, 
-                        carts_db=carts_db, 
-                        answers_db=answers_db, 
-                        lockouts_db=lockouts_db
-                    )
-                )
-                task_meta.append((chat_str, slot_id))
+    async def run_user(c_str):
+        async with sem:
+            try:
+                results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
+                if results:
+                    await _report_user_results(c_str, code, results)
+            except Exception as e:  # noqa: BLE001
+                print(f"[claim] user {c_str} error: {e}", flush=True)
 
-        if not all_tasks:
-            return
+    await asyncio.gather(*(run_user(c) for c in targets))
 
-        results = await asyncio.gather(*all_tasks)
 
-    user_prompts = {}
-    telegram_tasks = []
-    
-    for (chat_str, slot), res in zip(task_meta, results):
-        if res.get("status") == 0:
-            continue
-            
-        status = res["status"]
-        resp_data = res.get("response", {})
-        cart_suffix = res.get("cart_str", "")
-        
-        if res.get("needs_prompt"):
-            q_text = res["question"]
-            pending = load_json(PENDING_PROMPT_FILE)
-            pending[chat_str] = {"code": code, "slot": slot}
-            save_json(PENDING_PROMPT_FILE, pending)
-            
-            if chat_str not in user_prompts:
-                user_prompts[chat_str] = {"slots": [], "question": q_text}
-            user_prompts[chat_str]["slots"].append(slot)
-        else:
-            if status == 500:
-                summary_msg = (
-                    f"⚠️ *Code Target:* `{code}` (Slot {slot})\n"
-                    f"Status: `500 (Internal Server Error)`\n"
-                    f"💡 *Note:* Chowdeck server congested, auto-retries completed!"
-                )
-            else:
-                summary_msg = f"🎯 *Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-            
-            telegram_tasks.append(send_telegram(chat_id=int(chat_str), text=summary_msg))
-
-    for chat_str, p_data in user_prompts.items():
-        slot_range_str = format_slot_range(p_data["slots"])
-        q_text = p_data["question"]
-        prompt_msg = (
-            f"🔒 *Security Question Detected for `{code}` ({slot_range_str})!*\n"
-            f"Question: *\"{q_text}\"*\n\n"
-            f"⚡ *Type the answer right here in chat* to respond!"
-        )
-        telegram_tasks.append(send_telegram(chat_id=int(chat_str), text=prompt_msg))
-
-    if telegram_tasks:
-        await asyncio.gather(*telegram_tasks)
-
-async def claim_code_isolated(chat_str, raw_code):
+async def claim_code_for_chat(chat_str, raw_code):
+    chat_str = str(chat_str)
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
+        await send_telegram(_to_int(chat_str), "⚠️ That does not look like a valid promo code.")
         return
 
-    is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
-
+    is_admin = is_admin_chat(chat_str)
     if is_admin:
         await broadcast_to_channel(
-            f"🚨 *New Chowdeck Code Detected!*\n\n"
-            f"Code: `{code}`\n"
-            f"⚡ *Rush to your bot now before it flies away!*"
+            f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
+            f"⚡ *Rush to your bot now — it will not wait.*"
         )
-
-    target_chats = [chat_str]
-    if is_admin:
-        linked = get_linked_accounts(chat_str)
-        for l_chat in linked:
-            if l_chat not in target_chats:
-                target_chats.append(l_chat)
 
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
-    answers_db = load_json(ANSWER_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
 
-    limits = httpx.Limits(max_keepalive_connections=800, max_connections=1500)
-    async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-        for c_str in target_chats:
-            user_slots = tokens_db.get(c_str, {})
-            if not user_slots or not is_user_whitelisted(c_str):
-                if c_str == chat_str:
-                    await send_telegram(int(chat_str), "❌ You have no accounts configured to claim this code.")
-                continue
+    targets = [chat_str]
+    if is_admin:
+        for linked in get_linked_accounts(chat_str):
+            if linked not in targets:
+                targets.append(linked)
 
-            if c_str == chat_str:
-                await send_telegram(int(chat_str), f"🔍 Processing personal code `{code}` across your active slots...")
-            else:
-                await send_telegram(int(c_str), f"🔗 *[Mirrored Admin Code]* Processing code `{code}` across secondary slots...")
-
-            tasks = [
-                claim_slot_worker(client=client, chat_id=int(c_str), slot_id=slot_id, token_data=t_data, code=code, 
-                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db)
-                for slot_id, t_data in user_slots.items()
-            ]
-            results = await asyncio.gather(*tasks)
-
-            prompt_slots = []
-            prompt_q = None
-            telegram_tasks = []
-
-            for res in results:
-                slot = res["slot"]
-                if res.get("status") == 0:
-                    continue
-                status = res["status"]
-                resp_data = res.get("response", {})
-                cart_suffix = res.get("cart_str", "")
-
-                if res.get("needs_prompt"):
-                    prompt_q = res["question"]
-                    prompt_slots.append(slot)
-                    pending = load_json(PENDING_PROMPT_FILE)
-                    pending[c_str] = {"code": code, "slot": slot}
-                    save_json(PENDING_PROMPT_FILE, pending)
-                else:
-                    if status == 500:
-                        summary_msg = (
-                            f"⚠️ *Personal Code Target:* `{code}` (Slot {slot})\n"
-                            f"Status: `500 (Internal Server Error)`\n"
-                            f"💡 *Note:* Server congested, auto-retries completed!"
-                        )
-                    else:
-                        summary_msg = f"🎯 *Personal Code Target:* `{code}` (Slot {slot})\nStatus: `{status}`\nResponse: `{json.dumps(resp_data)}`{cart_suffix}"
-                    telegram_tasks.append(send_telegram(chat_id=int(c_str), text=summary_msg))
-
-            if prompt_q:
-                slot_range_str = format_slot_range(prompt_slots)
-                prompt_msg = (
-                    f"🔒 *Security Question Detected for `{code}` ({slot_range_str})!*\n"
-                    f"Question: *\"{prompt_q}\"*\n\n"
-                    f"⚡ *Type the answer right here in chat* to respond!"
+    for c_str in targets:
+        mirror = c_str != chat_str
+        results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
+        if not results:
+            if not mirror:
+                await send_telegram(
+                    _to_int(chat_str),
+                    "❌ No enabled accounts to claim with. Add a token with `/settoken <token>` "
+                    "and make sure the slot is ✅ enabled.",
                 )
-                telegram_tasks.append(send_telegram(chat_id=int(c_str), text=prompt_msg))
+            continue
+        await _report_user_results(c_str, code, results, mirror=mirror, tag="(manual)")
 
-            if telegram_tasks:
-                await asyncio.gather(*telegram_tasks)
+
+async def handle_answer(chat_str, answer_text, pending_entry):
+    """Fire the user's pasted answer at their slots immediately, no storage."""
+    chat_str = str(chat_str)
+    answer_text = str(answer_text).strip()
+    code = (pending_entry or {}).get("code")
+    if not answer_text or not code:
+        return
+
+    is_admin = is_admin_chat(chat_str)
+    tokens_db = load_json(TOKENS_FILE)
+    carts_db = load_json(CARTS_FILE)
+    lockouts_db = load_json(LOCKOUT_FILE)
+
+    targets = [chat_str]
+    if is_admin:
+        for linked in get_linked_accounts(chat_str):
+            if linked not in targets:
+                targets.append(linked)
+
+    for c_str in targets:
+        mirror = c_str != chat_str
+        results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db,
+                                   specific_answer=answer_text)
+        if not results:
+            if not mirror:
+                await send_telegram(
+                    _to_int(chat_str),
+                    f"❌ No enabled accounts to submit the answer for `{code}`.",
+                )
+            continue
+        await _report_user_results(c_str, code, results, mirror=mirror, tag="(answer submitted)")
+
 
 async def worker():
     while True:
         try:
-            item = await code_queue.get()
-            try:
-                if isinstance(item, tuple):
-                    source_type, data = item
-                    if source_type == "global":
-                        await claim_code_global(data)
-                    elif source_type == "isolated":
-                        chat_str, code = data
-                        await claim_code_isolated(chat_str, code)
-                else:
-                    await claim_code_global(item)
-            except Exception as e:
-                print(f"Worker error: {e}", flush=True)
-            finally:
-                code_queue.task_done()
-                await asyncio.sleep(0.01)
+            item = await _code_queue.get()
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            await asyncio.sleep(0.5)
+        try:
+            kind, payload = item
+            if kind == "global":
+                await claim_code_global(payload)
+            elif kind == "isolated":
+                c_str, code = payload
+                await claim_code_for_chat(c_str, code)
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker] error: {e}", flush=True)
+        finally:
+            _code_queue.task_done()
+
 
 async def process_text_global(text):
-    if not text:
-        return
-    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
-    codes = re.findall(pattern, text)
-    ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
-    
-    valid = []
-    for c in codes:
-        cleaned = robust_clean_code(c)
-        if cleaned and cleaned not in ignore and not cleaned.startswith("TEST"):
-            valid.append(cleaned)
-            
-    for code in list(dict.fromkeys(valid)):
-        await code_queue.put(("global", code))
+    codes = extract_candidate_codes(text, min_len=5)
+    for code in codes:
+        try:
+            _code_queue.put_nowait(("global", code))
+        except asyncio.QueueFull:
+            print("[queue] full, dropping code", flush=True)
+    return codes
+
 
 async def process_text_isolated(chat_str, text):
-    if not text:
-        return
-    pattern = r'\b(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}\b'
-    codes = re.findall(pattern, text)
-    ignore = {"CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL"}
-    
-    valid = []
-    for c in codes:
-        cleaned = robust_clean_code(c)
-        if cleaned and cleaned not in ignore:
-            valid.append(cleaned)
-            
-    for code in list(dict.fromkeys(valid)):
-        await code_queue.put(("isolated", (chat_str, code)))
+    codes = extract_candidate_codes(text, min_len=4)
+    for code in codes:
+        try:
+            _code_queue.put_nowait(("isolated", (str(chat_str), code)))
+        except asyncio.QueueFull:
+            print("[queue] full, dropping code", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# HTTP webhook server (bridge receiver)
+# ---------------------------------------------------------------------------
 class WebhookHandler(BaseHTTPRequestHandler):
+    server_version = "ChowdeckBridge/2.0"
+    protocol_version = "HTTP/1.1"
+
+    def _authorized(self):
+        if not WEBHOOK_SECRET:
+            return bool(ALLOW_INSECURE_WEBHOOK)
+        provided = (self.headers.get("X-Webhook-Secret") or "").strip()
+        if not provided:
+            auth = self.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                provided = auth[7:].strip()
+        return bool(provided) and hmac.compare_digest(provided, WEBHOOK_SECRET)
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == "/status" or self.path == "/":
-            try:
-                active = get_bot_active()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "online", "active": active}).encode('utf-8'))
-            except Exception:
-                self.send_response(500)
-                self.end_headers()
-        else:
-            self.send_response(404)
-            self.end_headers()
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/health"):
+            # Liveness only - no sensitive state, safe for platform healthchecks.
+            self._send_json(200, {"status": "online"})
+            return
+        if path == "/status":
+            if not self._authorized():
+                self._send_json(401, {"status": "unauthorized"})
+                return
+            self._send_json(200, {"status": "online", "active": get_bot_active()})
+            return
+        self._send_json(404, {"status": "not_found"})
 
     def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8')
+        path = self.path.split("?", 1)[0]
+        if path not in ("/", "/tweet", "/webhook"):
+            self._send_json(404, {"status": "not_found"})
+            return
+        if not self._authorized():
+            self._send_json(401, {"status": "unauthorized"})
+            return
         try:
-            data = json.loads(body)
-            text = data.get("text", "")
-            if text and loop_ref:
-                asyncio.run_coroutine_threadsafe(process_text_global(text), loop_ref)
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict):
+                raise ValueError("body must be a JSON object")
         except Exception:
-            self.send_response(400)
-            self.end_headers()
+            self._send_json(400, {"status": "bad_request"})
+            return
 
-    def log_message(self, format, *args):
+        text = str(data.get("text") or data.get("code") or "").strip()
+        if not text:
+            self._send_json(400, {"status": "no_text"})
+            return
+        if loop_ref is not None:
+            asyncio.run_coroutine_threadsafe(process_text_global(text), loop_ref)
+        self._send_json(200, {"status": "ok"})
+
+    def log_message(self, fmt, *args):
         return
 
+
 def run_http_server():
-    server = HTTPServer(('0.0.0.0', 8080), WebhookHandler)
-    print("🌐 Railway HTTP webhook server running on port 8080...", flush=True)
-    server.serve_forever()
+    if not WEBHOOK_SECRET and not ALLOW_INSECURE_WEBHOOK:
+        print(
+            "[http] WEBHOOK_SECRET is NOT set - /status and /tweet (POST) will reject every "
+            "request until it is configured. Set the same WEBHOOK_SECRET on the bot and the "
+            "bridge service. (ALLOW_INSECURE_WEBHOOK=true disables this check for local tests.)",
+            flush=True,
+        )
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), WebhookHandler)
+    except OSError as e:
+        print(f"[http] could not bind port {PORT}: {e}", flush=True)
+        return
+    server.daemon_threads = True
+    print(f"[http] listening on 0.0.0.0:{PORT}", flush=True)
+    try:
+        server.serve_forever()
+    except Exception as e:  # noqa: BLE001
+        print(f"[http] server stopped: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Telegram menu / command handling
+# ---------------------------------------------------------------------------
+def menu_text(chat_str):
+    chat_str = str(chat_str)
+    max_slots = get_max_slots(chat_str)
+    tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
+    enabled = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
+    return (
+        f"🤖 *Chowdeck Multi-Account Sniper (1-{max_slots})*\n\n"
+        f"• Active Slot: `Slot {get_active_slot(chat_str)}`\n"
+        f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
+        f"• Enabled Slots: `{enabled}`\n"
+        f"• Mode: `PROMPT` — you supply the security answer on demand\n\n"
+        "Pick an option below."
+    )
+
+
+GUIDE_TEXT = (
+    "📖 *How this bot works*\n\n"
+    "1️⃣ `/settoken <token or cookie string>` — link a Chowdeck account to the active slot.\n"
+    "2️⃣ `👥 My Accounts` — toggle slots ✅/❌ and review linked phones.\n"
+    "3️⃣ When a promo code drops, the bot tries it on every enabled slot.\n"
+    "4️⃣ If a code needs a security answer, the question is relayed to you — "
+    "*reply with the answer and it is submitted instantly*. No stored answers are used.\n\n"
+    "*Useful commands*\n"
+    "• `/code <CODE>` — force a code through now\n"
+    "• `/ans <answer>` — force an answer for the newest pending question\n"
+    "• `/ans <CODE> <answer>` — answer a specific code\n"
+    "• `/pending` — show open questions\n"
+    "• `/cancel` — drop open questions\n"
+    "• `/portfolio` — your claim history\n"
+    "• `/setcart <cart_id> [vendor_id]` — auto-apply won codes to a cart"
+)
+
+
+async def refresh_all_phones(chat_str):
+    chat_str = str(chat_str)
+    tokens_db = load_json(TOKENS_FILE)
+    user_slots = tokens_db.get(chat_str, {})
+    updated = 0
+    for slot_id, s_data in list(user_slots.items()):
+        token = (s_data or {}).get("token")
+        if not token:
+            continue
+        phone = await fetch_account_phone(token, (s_data or {}).get("cookies", {}))
+        if phone:
+            s_data["phone"] = str(phone)[:15]
+            updated += 1
+    if updated:
+        save_json(TOKENS_FILE, tokens_db)
+    return updated
+
+
+async def handle_command(chat_id, chat_str, text, is_admin):
+    parts = text.split(" ", 1)
+    cmd = parts[0].split("@", 1)[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("/start", "/help", "/guide"):
+        await send_telegram(chat_id, menu_text(chat_str),
+                            reply_markup=build_control_keyboard(chat_str, is_admin))
+        await send_telegram(chat_id, GUIDE_TEXT)
+    elif cmd == "/admin":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        u, s, c = get_admin_stats()
+        await send_telegram(chat_id,
+            f"🛡️ *Admin panel*\n\n"
+            f"• Bot: {'🟢 active' if get_bot_active() else '⏸️ paused'}\n"
+            f"• Users: `{u}`\n• Configured slots: `{s}`\n• Carts linked: `{c}`")
+    elif cmd == "/geninvite":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        code_val = "INVITE-" + "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+        inv = load_json(INVITE_CODES_FILE)
+        inv[code_val] = True
+        save_json(INVITE_CODES_FILE, inv)
+        await send_telegram(chat_id, f"✅ New invite code:\n`{code_val}`\n\nShare it privately.")
+    elif cmd == "/listwhitelist":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        wl = load_json(WHITELIST_FILE)
+        snippet = "\n".join(f"• `{uid}`" for uid in wl) if wl else "Nobody yet."
+        await send_telegram(chat_id, f"📋 *Whitelist:*\n{snippet}")
+    elif cmd == "/revokeinvite":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/revokeinvite <code_or_chat_id>`")
+            return
+        inv = load_json(INVITE_CODES_FILE)
+        if arg in inv:
+            del inv[arg]
+            save_json(INVITE_CODES_FILE, inv)
+            await send_telegram(chat_id, f"✅ Invite `{arg}` revoked.")
+        else:
+            wl = load_json(WHITELIST_FILE)
+            if arg in wl:
+                remove_from_whitelist(arg)
+                await send_telegram(chat_id, f"✅ `{arg}` removed from whitelist.")
+            else:
+                await send_telegram(chat_id, "⚠️ Not found in invites or whitelist.")
+    elif cmd == "/linkaccount":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/linkaccount <chat_id>`")
+            return
+        add_linked_account(chat_str, arg)
+        await send_telegram(chat_id, f"✅ Linked `{arg}`. Codes and answers mirror there instantly.")
+    elif cmd == "/unlinkaccount":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/unlinkaccount <chat_id>`")
+            return
+        remove_linked_account(chat_str, arg)
+        await send_telegram(chat_id, f"✅ Unlinked `{arg}`.")
+    elif cmd == "/listlinked":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        linked = get_linked_accounts(chat_str)
+        snippet = "\n".join(f"• `{a}`" for a in linked) if linked else "None linked."
+        await send_telegram(chat_id, f"🔗 *Linked accounts:*\n{snippet}")
+    elif cmd == "/settoken":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/settoken <token or cookie string>`")
+            return
+        slot = get_active_slot(chat_str)
+        parse_and_store_credentials(arg, chat_str, slot)
+        slot_data = load_json(TOKENS_FILE).get(chat_str, {}).get(slot, {})
+        await send_telegram(chat_id,
+            f"✅ Credentials saved to *Slot {slot}*.\n"
+            f"📞 Linked phone: `{slot_data.get('phone') or 'unknown'}`")
+    elif cmd == "/setphone":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/setphone <phone_or_label>`")
+            return
+        slot = get_active_slot(chat_str)
+        tokens_db = load_json(TOKENS_FILE)
+        tokens_db.setdefault(chat_str, {}).setdefault(slot, {})["phone"] = arg[:15]
+        save_json(TOKENS_FILE, tokens_db)
+        await send_telegram(chat_id, f"✅ Slot {slot} label set to `{arg[:15]}`.")
+    elif cmd == "/refreshphones":
+        await send_telegram(chat_id, "🔄 Reading profiles…")
+        updated = await refresh_all_phones(chat_str)
+        await send_telegram(chat_id, f"✅ Refreshed `{updated}` slot phone(s).")
+    elif cmd == "/setcart":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/setcart <cart_id> [vendor_id]`")
+            return
+        sub = arg.split()
+        carts_db = load_json(CARTS_FILE)
+        carts_db.setdefault(chat_str, {})[get_active_slot(chat_str)] = {
+            "cart_id": sub[0], "vendor_id": sub[1] if len(sub) > 1 else None,
+        }
+        save_json(CARTS_FILE, carts_db)
+        await send_telegram(chat_id, f"✅ Cart `{sub[0]}` linked to Slot {get_active_slot(chat_str)}.")
+    elif cmd == "/portfolio" or cmd == "/vouchers":
+        data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
+        items = data.get("items", [])
+        snippet = "\n".join(
+            f"• `{i.get('code', '?')}` (S{i.get('slot', '?')}) — ₦{i.get('amount', 2000):,}"
+            for i in items[-15:]
+        ) if items else "No claims recorded yet."
+        await send_telegram(chat_id,
+            f"💰 *Your claim portfolio*\n\n"
+            f"• Slot wins: `{len(items)}`\n• Value saved: `₦{data.get('total_value', 0):,}`\n\n"
+            f"📜 *Recent:*\n{snippet}")
+    elif cmd == "/code":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/code <CODE>`")
+            return
+        forced = robust_clean_code(arg) or arg.strip().upper()
+        await send_telegram(chat_id, f"🔍 Forcing code `{forced}` now…")
+        await claim_code_for_chat(chat_str, forced)
+    elif cmd == "/ans" or cmd == "/answer":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/ans <answer>` or `/ans <CODE> <answer>`")
+            return
+        sub = arg.split(None, 1)
+        target_code = None
+        answer = arg
+        if len(sub) == 2 and robust_clean_code(sub[0]) and sub[0].upper() == sub[0]:
+            target_code = robust_clean_code(sub[0])
+            answer = sub[1].strip()
+        entry = pop_pending(chat_str, code=target_code)
+        if not entry:
+            await send_telegram(chat_id, "⚠️ No open security question to answer.")
+            return
+        await handle_answer(chat_str, answer, entry)
+    elif cmd == "/pending":
+        items = list_pending(chat_str)
+        if not items:
+            await send_telegram(chat_id, "📭 No open questions.")
+            return
+        snippet = "\n".join(f"• `{e.get('code')}` — \"{e.get('question', '')}\"" for e in items)
+        await send_telegram(chat_id, f"🔒 *Open questions:*\n{snippet}\n\nAnswer with `/ans <answer>`.")
+    elif cmd == "/cancel":
+        clear_pending(chat_str, robust_clean_code(arg) if arg else None)
+        await send_telegram(chat_id, "🗑️ Open question(s) cleared.")
+    elif cmd == "/setburnertoken":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/setburnertoken <token or cookies>`")
+            return
+        token = arg
+        cookies = {}
+        if ";" in arg and "=" in arg:
+            for p in arg.split(";"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+                    if k.strip() == "user":
+                        try:
+                            token = json.loads(urllib.parse.unquote(v.strip())).get("token", token)
+                        except Exception:
+                            pass
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        save_burner_credentials(chat_str, {"token": token, "cookies": cookies})
+        await send_telegram(chat_id, "✅ Burner token linked.")
+    elif cmd == "/setburnercart":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/setburnercart <cart_id> [vendor_id]`")
+            return
+        sub = arg.split()
+        save_burner_cart(chat_str, {"cart_id": sub[0], "vendor_id": sub[1] if len(sub) > 1 else None})
+        await send_telegram(chat_id, f"✅ Burner cart `{sub[0]}` linked.")
+    elif cmd == "/test":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/test <CODE>`")
+            return
+        test_code = robust_clean_code(arg)
+        await send_telegram(chat_id, f"🔬 Testing `{test_code}` on the burner account…")
+        await send_telegram(chat_id, await execute_burner_test(chat_chat_id_guard(chat_id), test_code))
+    elif cmd == "/pause":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        set_bot_active(False)
+        await send_telegram(chat_id, "⏸️ Global claiming paused.")
+    elif cmd == "/resume":
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        set_bot_active(True)
+        await send_telegram(chat_id, "▶️ Global claiming resumed.")
+    else:
+        await send_telegram(chat_id, "ℹ️ Unknown command. Send /help for the guide.")
+
+
+def chat_chat_id_guard(chat_id):
+    return chat_id
+
+
+async def handle_callback(update, tg_client):
+    cq = update["callback_query"]
+    cq_id = cq["id"]
+    chat_id = cq["message"]["chat"]["id"]
+    msg_id = cq["message"]["message_id"]
+    action = cq.get("data", "")
+    chat_str = str(chat_id)
+    is_admin = is_admin_chat(chat_str)
+    max_slots = get_max_slots(chat_str)
+
+    if not is_user_whitelisted(chat_str):
+        await answer_callback_query(cq_id, "Access denied: invite code required.")
+        return
+
+    if action.startswith("slot_"):
+        slot_num = action.split("_", 1)[1]
+        set_active_slot(chat_str, slot_num)
+        await answer_callback_query(cq_id, f"Slot {slot_num} active")
+        await edit_message_text(chat_id, msg_id, menu_text(chat_str),
+                                build_control_keyboard(chat_str, is_admin))
+    elif action.startswith("toggle_acc_"):
+        s_num = action.split("_")[2]
+        toggle_slot_state(chat_str, s_num)
+        await answer_callback_query(cq_id, f"Slot {s_num} toggled")
+        await show_accounts(chat_id, msg_id, chat_str, max_slots)
+    elif action == "btn_my_accounts":
+        await answer_callback_query(cq_id, "Accounts")
+        await show_accounts(chat_id, msg_id, chat_str, max_slots)
+    elif action == "btn_refresh_phones":
+        await answer_callback_query(cq_id, "Refreshing…")
+        await refresh_all_phones(chat_str)
+        await show_accounts(chat_id, msg_id, chat_str, max_slots, refreshed=True)
+    elif action == "btn_portfolio":
+        await answer_callback_query(cq_id, "Portfolio")
+        data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
+        items = data.get("items", [])
+        snippet = "\n".join(
+            f"• `{i.get('code', '?')}` (S{i.get('slot', '?')}) — ₦{i.get('amount', 2000):,}"
+            for i in items[-10:]
+        ) if items else "No claims recorded yet."
+        await send_telegram(chat_id,
+            f"💰 *Your claim portfolio*\n\n"
+            f"• Slot wins: `{len(items)}`\n• Value saved: `₦{data.get('total_value', 0):,}`\n\n"
+            f"📜 *Recent:*\n{snippet}")
+    elif action == "btn_status":
+        await answer_callback_query(cq_id, "Refreshed")
+        await send_telegram(chat_id, menu_text(chat_str))
+    elif action == "btn_guide":
+        await answer_callback_query(cq_id, "Guide")
+        await send_telegram(chat_id, GUIDE_TEXT)
+    elif action == "btn_main_menu":
+        await answer_callback_query(cq_id, "Main menu")
+        await edit_message_text(chat_id, msg_id, menu_text(chat_str),
+                                build_control_keyboard(chat_str, is_admin))
+    elif action == "btn_admin_stats":
+        await answer_callback_query(cq_id, "Stats")
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+        else:
+            u, s, c = get_admin_stats()
+            await send_telegram(chat_id,
+                f"🛡️ *Admin panel*\n\n"
+                f"• Bot: {'🟢 active' if get_bot_active() else '⏸️ paused'}\n"
+                f"• Users: `{u}`\n• Configured slots: `{s}`\n• Carts linked: `{c}`")
+    elif action == "btn_pause":
+        await answer_callback_query(cq_id, "Paused")
+        if is_admin:
+            set_bot_active(False)
+            await send_telegram(chat_id, "⏸️ Global claiming paused.")
+    elif action == "btn_resume":
+        await answer_callback_query(cq_id, "Resumed")
+        if is_admin:
+            set_bot_active(True)
+            await send_telegram(chat_id, "▶️ Global claiming resumed.")
+    elif action == "btn_burner_menu":
+        await answer_callback_query(cq_id, "Burner panel")
+        if is_admin:
+            b_status = "🟢 linked" if get_burner_credentials(chat_str).get("token") else "🔴 not configured"
+            await edit_message_text(chat_id, msg_id,
+                f"🧪 *Burner account panel*\n\n• Status: {b_status}\n\n"
+                "• `/setburnertoken <token>`\n• `/setburnercart <cart_id> [vendor_id]`\n• `/test <CODE>`",
+                build_admin_burner_keyboard())
+    elif action == "btn_linked_menu":
+        await answer_callback_query(cq_id, "Linked accounts")
+        if is_admin:
+            linked = get_linked_accounts(chat_str)
+            snippet = "\n".join(f"• `{a}`" for a in linked) if linked else "None linked yet."
+            await edit_message_text(chat_id, msg_id,
+                f"🔗 *Linked secondary accounts*\n\n{snippet}\n\n"
+                "• `/linkaccount <chat_id>`\n• `/unlinkaccount <chat_id>`\n• `/listlinked`",
+                build_admin_linked_keyboard())
+    elif action == "btn_invites_menu":
+        await answer_callback_query(cq_id, "Invites")
+        if is_admin:
+            inv = load_json(INVITE_CODES_FILE)
+            snippet = "\n".join(f"• `{c}`" for c in inv) if inv else "No active invite codes."
+            await edit_message_text(chat_id, msg_id,
+                f"🔑 *Invite codes*\n\n{snippet}\n\n"
+                "• `/geninvite`\n• `/revokeinvite <code>`\n• `/listwhitelist`",
+                build_admin_invites_keyboard())
+    elif action == "btn_gen_invite":
+        await answer_callback_query(cq_id, "Generated")
+        if is_admin:
+            code_val = "INVITE-" + "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+            inv = load_json(INVITE_CODES_FILE)
+            inv[code_val] = True
+            save_json(INVITE_CODES_FILE, inv)
+            await send_telegram(chat_id, f"✅ New invite code:\n`{code_val}`")
+    elif action == "btn_list_whitelist":
+        await answer_callback_query(cq_id, "Whitelist")
+        if is_admin:
+            wl = load_json(WHITELIST_FILE)
+            snippet = "\n".join(f"• `{uid}`" for uid in wl) if wl else "Nobody yet."
+            await send_telegram(chat_id, f"📋 *Whitelist:*\n{snippet}")
+    elif action == "burner_info":
+        await answer_callback_query(cq_id, "Use /test <CODE>")
+    else:
+        await answer_callback_query(cq_id, "Unknown action")
+
+
+async def show_accounts(chat_id, msg_id, chat_str, max_slots, refreshed=False):
+    enabled = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
+    extra = "\nPhones refreshed." if refreshed else "\n✅ = enabled & claiming | ❌ = disabled"
+    await edit_message_text(
+        chat_id, msg_id,
+        f"💼 *My Chowdeck accounts (1-{max_slots})*\n"
+        f"Enabled: `{enabled}`{extra}",
+        build_accounts_keyboard(chat_str),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Telegram long polling
+# ---------------------------------------------------------------------------
+async def handle_text_update(update):
+    msg = update.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+    chat_str = str(chat_id)
+    is_admin = is_admin_chat(chat_str)
+
+    if not is_user_whitelisted(chat_str):
+        inv = load_json(INVITE_CODES_FILE)
+        if text in inv:
+            del inv[text]
+            save_json(INVITE_CODES_FILE, inv)
+            add_to_whitelist(chat_str)
+            await send_telegram(chat_id, "🎉 *Invite accepted!*\n\nWelcome. Send /start to begin.")
+        else:
+            await send_telegram(
+                chat_id,
+                "🔒 *Access denied — private bot.*\n\n"
+                "Send a valid *invite code* in this chat to unlock access.",
+            )
+        return
+
+    if text.startswith("/"):
+        await handle_command(chat_id, chat_str, text, is_admin)
+        return
+
+    pending = list_pending(chat_str)
+    reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+
+    if pending:
+        if reply_to is not None and any(e.get("msg_id") == reply_to for e in pending):
+            entry = pop_pending(chat_str, reply_to=reply_to)
+            await handle_answer(chat_str, text, entry)
+            return
+        if strong_code_signal(text):
+            await process_text_isolated(chat_str, text)
+            await send_telegram(
+                chat_id,
+                f"🔍 That looks like a code — claiming `{robust_clean_code(text)}` now.\n"
+                f"If you meant it as the security answer, send `/ans {text}` "
+                f"or reply to the question message.",
+            )
+            return
+        entry = pop_pending(chat_str)
+        await handle_answer(chat_str, text, entry)
+        return
+
+    if looks_like_code(text):
+        await process_text_isolated(chat_str, text)
+        return
+
+    await send_telegram(
+        chat_id,
+        "ℹ️ That does not look like a promo code. Send the code as text "
+        "(e.g. `CHOW5K`), or paste a screenshot to OCR it.",
+    )
+
+
+async def handle_photo_update(update, tg_client):
+    msg = update["message"]
+    chat_id = msg["chat"]["id"]
+    chat_str = str(chat_id)
+    if not is_user_whitelisted(chat_str):
+        await send_telegram(chat_id, "🔒 Access denied — private bot.")
+        return
+    file_id = msg["photo"][-1]["file_id"]
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    try:
+        file_res = await tg_client.get(f"{base}/getFile", params={"file_id": file_id})
+        if file_res.status_code != 200:
+            return
+        file_path = file_res.json().get("result", {}).get("file_path")
+        if not file_path:
+            return
+        img_res = await tg_client.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}")
+        if img_res.status_code != 200:
+            await send_telegram(chat_id, "❌ Could not download that image.")
+            return
+        await send_telegram(chat_id, "🔍 Screenshot received — reading text…")
+        extracted = await perform_ocr_on_image(img_res.content)
+        if extracted:
+            await process_text_isolated(chat_str, extracted)
+        else:
+            await send_telegram(chat_id, "❌ No text found in that screenshot. Please send it as text.")
+    except Exception as e:  # noqa: BLE001
+        print(f"[photo] error: {e}", flush=True)
+
 
 async def telegram_poller():
     global last_update_id
+    if not TELEGRAM_BOT_TOKEN:
+        print("[tg] TELEGRAM_BOT_TOKEN missing - Telegram polling disabled.", flush=True)
+        while True:
+            await asyncio.sleep(3600)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    async with httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None) as tg_client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0), proxy=PROXY_URL) as tg_client:
         while True:
             try:
-                res = await tg_client.get(url, params={"offset": last_update_id + 1, "timeout": 25}, timeout=30.0)
+                res = await tg_client.get(
+                    url, params={"offset": last_update_id + 1, "timeout": 25,
+                                 "allowed_updates": json.dumps(["message", "callback_query"])}
+                )
                 if res.status_code == 200:
                     for update in res.json().get("result", []):
-                        last_update_id = update["update_id"]
-                        
-                        if "callback_query" in update:
-                            cq = update["callback_query"]
-                            cq_id = cq["id"]
-                            chat_id = cq["message"]["chat"]["id"]
-                            msg_id = cq["message"]["message_id"]
-                            data_action = cq["data"]
-                            chat_str = str(chat_id)
-                            is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
-                            
-                            if not is_user_whitelisted(chat_str):
-                                await answer_callback_query(cq_id, "Access Denied: Invite code required.")
-                                await send_telegram(
-                                    chat_id,
-                                    "🔒 *Strictly Private Bot*\n\n"
-                                    "This bot is currently invite-only.\n"
-                                    "Please enter your valid **Invite Code** right here in chat to unlock access."
-                                )
-                                continue
-
-                            max_slots = get_max_slots(chat_str)
-                            
-                            if data_action.startswith("slot_"):
-                                await answer_callback_query(cq_id, f"Switched slots")
-                                slot_num = data_action.split("_")[1]
-                                set_active_slot(chat_str, slot_num)
-                                
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                user_m = get_user_mode(chat_str)
-                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
-                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
-                                updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
-                                    f"• Active Slot: `Slot {slot_num}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
-                                    f"• Mode: `{user_m.upper()}`\n"
-                                    f"• Master Answer: `{m_ans}`\n\n"
-                                    "Select an option below:"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": updated_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                })
-                            elif data_action.startswith("toggle_acc_"):
-                                await answer_callback_query(cq_id, f"Toggled account")
-                                s_num = data_action.split("_")[2]
-                                toggle_slot_state(chat_str, s_num)
-                                
-                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
-                                acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
-                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n\n"
-                                    f"Click a button below to toggle its active state:\n"
-                                    f"✅ = Active & Sniping | ❌ = Disabled"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": acc_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_accounts_keyboard(chat_str)
-                                })
-                            elif data_action == "btn_my_accounts":
-                                await answer_callback_query(cq_id, "Accounts manager")
-                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
-                                acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
-                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n\n"
-                                    f"Click a button below to toggle its active state:\n"
-                                    f"✅ = Active & Sniping | ❌ = Disabled"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": acc_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_accounts_keyboard(chat_str)
-                                })
-                            elif data_action == "btn_portfolio":
-                                await answer_callback_query(cq_id, "Portfolio loaded!")
-                                portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
-                                items = portfolio_data.get("items", [])
-                                total_val = portfolio_data.get("total_value", 0)
-                                
-                                items_snippet = "\n".join([f"• `{i.get('code', 'UNKNOWN')}` (S{i.get('slot', '1')}) — ₦{i.get('amount', 2000):,}" for i in items[-10:]]) if items else "No claims recorded yet."
-                                portfolio_text = (
-                                    f"💰 *Your Claim Portfolio*\n\n"
-                                    f"• Total Slot Wins: `{len(items)}`\n"
-                                    f"• Total Value Saved: `₦{total_val:,}`\n\n"
-                                    f"📜 *Recent Slot Claims:*\n{items_snippet}"
-                                )
-                                await send_telegram(chat_id, portfolio_text)
-                            elif data_action == "btn_refresh_phones":
-                                await answer_callback_query(cq_id, "Refreshing profiles...")
-                                user_slots = load_json(TOKENS_FILE).get(chat_str, {})
-                                updated_count = 0
-                                for slot_id, s_data in user_slots.items():
-                                    token = s_data.get("token")
-                                    cookies = s_data.get("cookies", {})
-                                    if token:
-                                        phone = await fetch_account_phone(token, cookies)
-                                        if phone:
-                                            s_data["phone"] = str(phone)[:15]
-                                            updated_count += 1
-                                tokens_db = load_json(TOKENS_FILE)
-                                tokens_db[chat_str] = user_slots
-                                save_json(TOKENS_FILE, tokens_db)
-                                
-                                active_count = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
-                                acc_text = (
-                                    f"💼 *My Chowdeck Accounts (1-{max_slots})*\n"
-                                    f"Total Slots: `{max_slots}` | Active: `{active_count}`\n"
-                                    f"Refreshed phones for `{updated_count}` slots!\n\n"
-                                    f"Click a button below to toggle its active state:"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": acc_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_accounts_keyboard(chat_str)
-                                })
-                            elif data_action == "btn_burner_menu":
-                                await answer_callback_query(cq_id, "Burner panel opened")
-                                if is_admin:
-                                    burner_data = get_burner_credentials(chat_str)
-                                    b_status = "🟢 Linked" if burner_data.get("token") else "🔴 Not Configured"
-                                    burner_text = (
-                                        f"🧪 *Admin Burner Account Panel*\n\n"
-                                        f"• Burner Status: {b_status}\n\n"
-                                        "Use commands to configure:\n"
-                                        "• `/setburnertoken <token>`\n"
-                                        "• `/setburnercart <cart_id> <vendor_id>`\n"
-                                        "• `/test <CODE>`"
-                                    )
-                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    await tg_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": burner_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_admin_burner_keyboard()
-                                    })
-                            elif data_action == "btn_linked_menu":
-                                await answer_callback_query(cq_id, "Linked accounts panel opened")
-                                if is_admin:
-                                    linked = get_linked_accounts(chat_str)
-                                    linked_snippet = "\n".join([f"• `{acc}`" for acc in linked]) if linked else "None linked yet."
-                                    linked_text = (
-                                        f"🔗 *Linked Secondary Telegram Accounts*\n\n"
-                                        f"{linked_snippet}\n\n"
-                                        "Use commands to manage:\n"
-                                        "• `/linkaccount <chat_id>`\n"
-                                        "• `/unlinkaccount <chat_id>`\n"
-                                        "• `/listlinked`"
-                                    )
-                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    await tg_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": linked_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_admin_linked_keyboard()
-                                    })
-                            elif data_action == "btn_invites_menu":
-                                await answer_callback_query(cq_id, "Invites panel opened")
-                                if is_admin:
-                                    inv_codes = load_json(INVITE_CODES_FILE)
-                                    codes_snippet = "\n".join([f"• `{c}`" for c in inv_codes.keys()]) if inv_codes else "No active invite codes."
-                                    inv_text = (
-                                        f"🔑 *Invite Code Management*\n\n"
-                                        f"Active Codes:\n{codes_snippet}\n\n"
-                                        "Commands:\n"
-                                        "• `/geninvite` — Generate a new invite code\n"
-                                        "• `/revokeinvite <code>` — Remove a code\n"
-                                        "• `/listwhitelist` — View authorized users"
-                                    )
-                                    url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                    await tg_client.post(url_edit, json={
-                                        "chat_id": chat_id,
-                                        "message_id": msg_id,
-                                        "text": inv_text,
-                                        "parse_mode": "Markdown",
-                                        "reply_markup": build_admin_invites_keyboard()
-                                    })
-                            elif data_action == "btn_gen_invite":
-                                await answer_callback_query(cq_id, "Code generated!")
-                                if is_admin:
-                                    code_val = "INVITE-" + ''.join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
-                                    inv_codes = load_json(INVITE_CODES_FILE)
-                                    inv_codes[code_val] = True
-                                    save_json(INVITE_CODES_FILE, inv_codes)
-                                    await send_telegram(chat_id, f"✅ New Invite Code Generated:\n`{code_val}`\n\nShare this privately with your user.")
-                            elif data_action == "btn_list_whitelist":
-                                await answer_callback_query(cq_id, "Whitelist loaded")
-                                if is_admin:
-                                    wl = load_json(WHITELIST_FILE)
-                                    wl_snippet = "\n".join([f"• `{uid}`" for uid in wl.keys()]) if wl else "No whitelisted users yet."
-                                    await send_telegram(chat_id, f"📋 *Authorized Users Whitelist:*\n{wl_snippet}")
-                            elif data_action == "burner_info":
-                                await answer_callback_query(cq_id, "Type /test <CODE>")
-                            elif data_action == "btn_main_menu":
-                                await answer_callback_query(cq_id, "Main menu")
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                active_s = get_active_slot(chat_str)
-                                user_m = get_user_mode(chat_str)
-                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
-                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
-                                menu_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
-                                    f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
-                                    f"• Mode: `{user_m.upper()}`\n"
-                                    f"• Master Answer: `{m_ans}`\n\n"
-                                    "Select an option below:"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": menu_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                })
-                            elif data_action == "btn_toggle_mode":
-                                current_m = get_user_mode(chat_str)
-                                new_m = "prompt" if current_m == "auto" else "auto"
-                                set_user_mode(chat_str, new_m)
-                                await answer_callback_query(cq_id, f"Mode: {new_m.upper()}")
-                                
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                active_s = get_active_slot(chat_str)
-                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
-                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
-                                updated_text = (
-                                    f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
-                                    f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
-                                    f"• Mode: `{new_m.upper()}`\n"
-                                    f"• Master Answer: `{m_ans}`\n\n"
-                                    "Select an option below:"
-                                )
-                                url_edit = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-                                await tg_client.post(url_edit, json={
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                    "text": updated_text,
-                                    "parse_mode": "Markdown",
-                                    "reply_markup": build_control_keyboard(chat_str, is_admin)
-                                })
-                            elif data_action == "btn_admin_stats":
-                                await answer_callback_query(cq_id, "Stats loaded")
-                                if is_admin:
-                                    u_count, s_count, c_count = get_admin_stats()
-                                    bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
-                                    admin_text = (
-                                        f"🛡️ *Admin Control Panel*\n\n"
-                                        f"• Bot Status: {bot_status}\n"
-                                        f"• Total Unique Users: `{u_count}`\n"
-                                        f"• Total Configured Slots: `{s_count}`\n"
-                                        f"• Total Carts Linked: `{c_count}`"
-                                    )
-                                    await send_telegram(chat_id, admin_text)
-                            elif data_action == "btn_status":
-                                await answer_callback_query(cq_id, "Status refreshed")
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                active_s = get_active_slot(chat_str)
-                                user_m = get_user_mode(chat_str)
-                                master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
-                                m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
-                                
-                                status_msg = (
-                                    f"📊 *Portfolio Status*\n\n"
-                                    f"• Active Slot: `Slot {active_s}`\n"
-                                    f"• Configured Accounts: `{len(tokens_db)} / {max_slots}`\n"
-                                    f"• Sniper Mode: `{user_m.upper()}`\n"
-                                    f"• Master Answer: `{m_ans}`"
-                                )
-                                await send_telegram(chat_id, status_msg)
-                            elif data_action == "btn_guide":
-                                await answer_callback_query(cq_id, "Guide opened")
-                                guide_msg = (
-                                    f"📖 *Multi-Account Sniper Guide (1-{max_slots})*\n\n"
-                                    f"1️⃣ *Switch Slot:*\nTap `Slot 1` to `Slot {max_slots}` on the keyboard.\n\n"
-                                    "2️⃣ *Manage Accounts:*\nTap `👥 My Accounts` to activate/deactivate specific slots with ✅/❌ toggles.\n\n"
-                                    "3️⃣ *Link Token:*\n`/settoken <token>`\n\n"
-                                    "4️⃣ *Set Phone/Label Manually:*\n`/setphone <phone_or_label>`\n\n"
-                                    "5️⃣ *Refresh Phones:*\n`/refreshphones` or use the menu button.\n\n"
-                                    "6️⃣ *Master Answer:*\n`/setanswer <answer>`\n\n"
-                                    "7️⃣ *Toggle Mode:*\nTap `⚙️ Mode` button!"
-                                )
-                                await send_telegram(chat_id, guide_msg)
-                            elif data_action == "btn_pause":
-                                await answer_callback_query(cq_id, "Paused")
-                                if is_admin:
-                                    set_bot_active(False)
-                                    await send_telegram(chat_id, "⏸️ *Bridge Paused* via inline button.")
-                            elif data_action == "btn_resume":
-                                await answer_callback_query(cq_id, "Resumed")
-                                if is_admin:
-                                    set_bot_active(True)
-                                    await send_telegram(chat_id, "▶️ *Bridge Resumed* via inline button.")
-                            continue
-
-                        # Handle Photo / Screenshots sent to bot
-                        if "photo" in update.get("message", {}):
-                            msg = update["message"]
-                            chat_id = msg["chat"]["id"]
-                            chat_str = str(chat_id)
-                            is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
-
-                            if not is_user_whitelisted(chat_str):
-                                await send_telegram(
-                                    chat_id,
-                                    "🔒 *Strictly Private Bot*\n\n"
-                                    "This bot is currently invite-only.\n"
-                                    "Please enter your valid **Invite Code** right here in chat to unlock access."
-                                )
-                                continue
-
-                            photos = msg["photo"]
-                            file_id = photos[-1]["file_id"]
-                            
-                            file_res = await tg_client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile", params={"file_id": file_id})
-                            if file_res.status_code == 200:
-                                file_path = file_res.json().get("result", {}).get("file_path")
-                                if file_path:
-                                    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                                    img_res = await tg_client.get(download_url)
-                                    if img_res.status_code == 200:
-                                        await send_telegram(chat_id, "🔍 *Screenshot received!* Reading text via OCR...")
-                                        extracted_text = await perform_ocr_on_image(img_res.content)
-                                        if extracted_text:
-                                            await process_text_isolated(chat_str, extracted_text)
-                                        else:
-                                            await send_telegram(chat_id, "❌ Could not extract text from this screenshot. Please send it as text.")
-                            continue
-
-                        msg = update.get("message", {})
-                        chat_id = msg.get("chat", {}).get("id")
-                        text = msg.get("text", "").strip()
-                        if not chat_id or not text:
-                            continue
-                        
-                        chat_str = str(chat_id)
-                        is_admin = (not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID)
-
-                        if not is_user_whitelisted(chat_str):
-                            inv_codes = load_json(INVITE_CODES_FILE)
-                            clean_text = text.strip()
-                            if clean_text in inv_codes:
-                                del inv_codes[clean_text]
-                                save_json(INVITE_CODES_FILE, inv_codes)
-                                add_to_whitelist(chat_str)
-                                await send_telegram(
-                                    chat_id,
-                                    "🎉 *Invite Code Accepted!*\n\n"
-                                    "You have been successfully whitelisted. Welcome to the private sniper bot!\n\n"
-                                    "Send `/start` to begin."
-                                )
-                            else:
-                                await send_telegram(
-                                    chat_id,
-                                    "🔒 *Strictly Private Bot - Access Denied*\n\n"
-                                    "This bot is invite-only and restricted.\n"
-                                    "Please enter a valid **Invite Code** right here in chat to get access."
-                                )
-                            continue
-
-                        active_slot = get_active_slot(chat_str)
-                        max_slots = get_max_slots(chat_str)
-
-                        cleaned_input = robust_clean_code(text)
-                        is_new_code = (len(cleaned_input) >= 5 and re.match(r'^[A-Z0-9]{5,20}$', cleaned_input) and cleaned_input not in ["ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY", "TRUE", "FALSE"])
-                        
-                        pending_prompts = load_json(PENDING_PROMPT_FILE)
-                        if chat_str in pending_prompts and not text.startswith("/"):
-                            prompt_data = pending_prompts.pop(chat_str, None)
-                            save_json(PENDING_PROMPT_FILE, pending_prompts)
-                            
-                            if prompt_data:
-                                target_code = prompt_data["code"]
-                                user_ans = text
-                                
-                                chats_to_answer = [chat_str]
-                                if is_admin:
-                                    linked = get_linked_accounts(chat_str)
-                                    for l_chat in linked:
-                                        if l_chat not in chats_to_answer:
-                                            chats_to_answer.append(l_chat)
-                                
-                                async def execute_answer_burst(c_str, code_val, ans_val, is_mirror=False):
-                                    answers_db = load_json(ANSWER_FILE)
-                                    if c_str not in answers_db:
-                                        answers_db[c_str] = {}
-                                    answers_db[c_str]["master"] = [ans_val]
-                                    save_json(ANSWER_FILE, answers_db)
-
-                                    broadcast_coro = broadcast_to_channel(
-                                        f"💡 *Admin Answer Dropped!*\n\n"
-                                        f"Code: `{code_val}`\n"
-                                        f"Answer: `{ans_val}`\n\n"
-                                        f"⚡ *Copy and paste fast!*"
-                                    ) if (is_admin and not is_mirror) else asyncio.sleep(0)
-                                    
-                                    notif_text = f"🔗 *[Mirrored Admin Answer]* Blasting `{ans_val}` instantly across your secondary slots for `{code_val}`..." if is_mirror else f"⚡ *Emergency Answer Captured!* Blasting `{ans_val}` instantly across your active slots for `{code_val}`..."
-                                    local_notif_coro = send_telegram(int(c_str), notif_text)
-                                    
-                                    tokens_db = load_json(TOKENS_FILE).get(c_str, {})
-                                    carts_db = load_json(CARTS_FILE)
-                                    lockouts_db = load_json(LOCKOUT_FILE)
-                                    
-                                    slot_result_tasks = []
-                                    if tokens_db:
-                                        limits = httpx.Limits(max_keepalive_connections=300, max_connections=600)
-                                        async with httpx.AsyncClient(timeout=4.0, proxy=PROXY_URL if PROXY_URL else None, limits=limits) as client:
-                                            tasks = [
-                                                claim_slot_worker(client=client, chat_id=int(c_str), slot_id=s_id, token_data=t_data, code=code_val,
-                                                                  carts_db=carts_db, answers_db=answers_db, lockouts_db=lockouts_db, specific_answer=ans_val)
-                                                for s_id, t_data in tokens_db.items()
-                                            ]
-                                            results = await asyncio.gather(*tasks)
-                                        
-                                        for res in results:
-                                            if res.get("status") == 0:
-                                                continue
-                                            s_id = res["slot"]
-                                            st = res["status"]
-                                            rp = res.get("response", {})
-                                            cs = res.get("cart_str", "")
-                                            slot_result_tasks.append(send_telegram(int(c_str), f"🎯 *Code Target:* `{code_val}` (Slot {s_id})\nStatus: `{st}`\nResponse: `{json.dumps(rp)}`{cs}"))
-
-                                    await asyncio.gather(
-                                        broadcast_coro,
-                                        local_notif_coro,
-                                        *slot_result_tasks
-                                    )
-
-                                burst_tasks = [execute_answer_burst(c_s, target_code, user_ans, is_mirror=(c_s != chat_str)) for c_s in chats_to_answer]
-                                asyncio.create_task(asyncio.gather(*burst_tasks))
-                            continue
-
-                        if text.startswith("/start"):
-                            tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                            user_m = get_user_mode(chat_str)
-                            master_ans_list = load_json(ANSWER_FILE).get(chat_str, {}).get("master", ["Ismail"])
-                            m_ans = master_ans_list[0] if isinstance(master_ans_list, list) and master_ans_list else "Ismail"
-                            
-                            help_text = (
-                                f"🤖 *Chowdeck Multi-Account Sniper Active (1-{max_slots})*\n\n"
-                                f"• Active Slot: `Slot {active_slot}`\n"
-                                f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
-                                f"• Mode: `{user_m.upper()}`\n"
-                                f"• Master Answer: `{m_ans}`\n\n"
-                                "Select an option below:"
-                            )
-                            await send_telegram(chat_id, help_text, reply_markup=build_control_keyboard(chat_str, is_admin))
-                        elif text.startswith("/admin") and is_admin:
-                            u_count, s_count, c_count = get_admin_stats()
-                            bot_status = "🟢 Active" if get_bot_active() else "⏸️ Paused"
-                            admin_text = (
-                                f"🛡️ *Admin Control Panel*\n\n"
-                                f"• Bot Status: {bot_status}\n"
-                                f"• Total Unique Users: `{u_count}`\n"
-                                f"• Total Configured Slots: `{s_count}`\n"
-                                f"• Total Carts Linked: `{c_count}`"
-                            )
-                            await send_telegram(chat_id, admin_text, reply_markup=build_control_keyboard(chat_str, is_admin))
-                        elif text.startswith("/geninvite") and is_admin:
-                            code_val = "INVITE-" + ''.join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
-                            inv_codes = load_json(INVITE_CODES_FILE)
-                            inv_codes[code_val] = True
-                            save_json(INVITE_CODES_FILE, inv_codes)
-                            await send_telegram(chat_id, f"✅ New Invite Code Generated:\n`{code_val}`\n\nShare this privately with your user.")
-                        elif text.startswith("/listwhitelist") and is_admin:
-                            wl = load_json(WHITELIST_FILE)
-                            wl_snippet = "\n".join([f"• `{uid}`" for uid in wl.keys()]) if wl else "No whitelisted users yet."
-                            await send_telegram(chat_id, f"📋 *Authorized Users Whitelist:*\n{wl_snippet}")
-                        elif text.startswith("/revokeinvite") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                c_target = parts[1].strip()
-                                inv_codes = load_json(INVITE_CODES_FILE)
-                                if c_target in inv_codes:
-                                    del inv_codes[c_target]
-                                    save_json(INVITE_CODES_FILE, inv_codes)
-                                    await send_telegram(chat_id, f"✅ Invite code `{c_target}` revoked.")
-                                else:
-                                    wl = load_json(WHITELIST_FILE)
-                                    if c_target in wl:
-                                        remove_from_whitelist(c_target)
-                                        await send_telegram(chat_id, f"✅ User `{c_target}` removed from whitelist.")
-                                    else:
-                                        await send_telegram(chat_id, "⚠️ Code or Chat ID not found in invites/whitelist.")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/revokeinvite <code>` or `/revokeinvite <chat_id>`")
-                        elif text.startswith("/portfolio") or text.startswith("/vouchers"):
-                            portfolio_data = load_json(PORTFOLIO_FILE).get(chat_str, {"items": [], "total_value": 0})
-                            items = portfolio_data.get("items", [])
-                            total_val = portfolio_data.get("total_value", 0)
-                            items_snippet = "\n".join([f"• `{i.get('code', 'UNKNOWN')}` (S{i.get('slot', '1')}) — ₦{i.get('amount', 2000):,}" for i in items[-15:]]) if items else "No claims recorded yet."
-                            portfolio_text = (
-                                f"💰 *Your Claim Portfolio*\n\n"
-                                f"• Total Slot Wins: `{len(items)}`\n"
-                                f"• Total Value Saved: `₦{total_val:,}`\n\n"
-                                f"📜 *Recent Slot Claims:*\n{items_snippet}"
-                            )
-                            await send_telegram(chat_id, portfolio_text)
-                        elif text.startswith("/acc"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1 and parts[1].strip() in [str(i) for i in range(1, max_slots + 1)]:
-                                set_active_slot(chat_str, parts[1].strip())
-                                await send_telegram(chat_id, f"✅ Switched to *Slot {parts[1].strip()}*.", reply_markup=build_control_keyboard(chat_str, is_admin))
-                            else:
-                                await send_telegram(chat_id, f"📌 Active Slot: *Slot {active_slot}*\nUse `/acc <1-{max_slots}>` or tap buttons above.")
-                        elif text.startswith("/linkaccount") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                sec_id = parts[1].strip()
-                                add_linked_account(chat_str, sec_id)
-                                await send_telegram(chat_id, f"✅ Successfully linked secondary Telegram Chat ID: `{sec_id}`.\nAll manual codes and security answers will now mirror to this account instantly!")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/linkaccount <secondary_chat_id>`")
-                        elif text.startswith("/unlinkaccount") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                sec_id = parts[1].strip()
-                                remove_linked_account(chat_str, sec_id)
-                                await send_telegram(chat_id, f"✅ Unlinked secondary Telegram Chat ID: `{sec_id}`.")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/unlinkaccount <secondary_chat_id>`")
-                        elif text.startswith("/listlinked") and is_admin:
-                            linked = get_linked_accounts(chat_str)
-                            if linked:
-                                linked_str = "\n".join([f"• `{acc}`" for acc in linked])
-                                await send_telegram(chat_id, f"🔗 *Linked Secondary Telegram Accounts:*\n{linked_str}")
-                            else:
-                                await send_telegram(chat_id, "📌 No secondary accounts linked yet. Use `/linkaccount <chat_id>` to add one.")
-                        elif text.startswith("/settoken"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                parse_and_store_credentials(parts[1], chat_str, active_slot)
-                                
-                                tokens_db = load_json(TOKENS_FILE).get(chat_str, {})
-                                slot_data = tokens_db.get(active_slot, {})
-                                phone_found = slot_data.get("phone", "Unknown")
-                                
-                                await send_telegram(chat_id, f"✅ Token & session cookies saved to *Slot {active_slot}*!\n📞 Linked Phone/User: `{phone_found}`")
-                        elif text.startswith("/setphone"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                custom_phone = parts[1].strip()[:15]
-                                tokens_db = load_json(TOKENS_FILE)
-                                if chat_str not in tokens_db:
-                                    tokens_db[chat_str] = {}
-                                if active_slot not in tokens_db[chat_str]:
-                                    tokens_db[chat_str][active_slot] = {}
-                                tokens_db[chat_str][active_slot]["phone"] = custom_phone
-                                save_json(TOKENS_FILE, tokens_db)
-                                await send_telegram(chat_id, f"✅ Phone/Label for *Slot {active_slot}* set to: `{custom_phone}`")
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/setphone <phone_number_or_label>`")
-                        elif text.startswith("/refreshphones"):
-                            tokens_db = load_json(TOKENS_FILE)
-                            user_slots = tokens_db.get(chat_str, {})
-                            
-                            if not user_slots:
-                                await send_telegram(chat_id, "❌ No accounts configured yet.")
-                            else:
-                                await send_telegram(chat_id, "🔄 Querying Chowdeck profiles & JWT claims...")
-                                updated_count = 0
-                                
-                                for slot_id, s_data in user_slots.items():
-                                    token = s_data.get("token")
-                                    cookies = s_data.get("cookies", {})
-                                    if token:
-                                        phone = await fetch_account_phone(token, cookies)
-                                        if phone:
-                                            s_data["phone"] = str(phone)[:15]
-                                            updated_count += 1
-                                            
-                                save_json(TOKENS_FILE, tokens_db)
-                                await send_telegram(
-                                    chat_id, 
-                                    f"✅ *Phone Number Sync Complete!*\nSuccessfully updated phone numbers for `{updated_count}` configured slots. Open `👥 My Accounts` to view them."
-                                )
-                        elif text.startswith("/setcart"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                subparts = parts[1].strip().split()
-                                c_id = subparts[0]
-                                v_id = subparts[1] if len(subparts) > 1 else None
-                                
-                                carts_db = load_json(CARTS_FILE)
-                                if chat_str not in carts_db:
-                                    carts_db[chat_str] = {}
-                                carts_db[chat_str][active_slot] = {"cart_id": c_id, "vendor_id": v_id}
-                                save_json(CARTS_FILE, carts_db)
-                                await send_telegram(chat_id, f"✅ Cart ID (`{c_id}`) & Vendor ID (`{v_id}`) saved to *Slot {active_slot}*.")
-                        elif text.startswith("/setanswer"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                single_ans = parts[1].strip()
-                                answers_db = load_json(ANSWER_FILE)
-                                if chat_str not in answers_db:
-                                    answers_db[chat_str] = {}
-                                answers_db[chat_str]["master"] = [single_ans]
-                                save_json(ANSWER_FILE, answers_db)
-                                await send_telegram(chat_id, f"✅ Master Security Answer Saved: `{single_ans}`")
-                        elif text.startswith("/mode"):
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1 and parts[1].strip().lower() in ["auto", "prompt"]:
-                                new_mode = parts[1].strip().lower()
-                                set_user_mode(chat_str, new_mode)
-                                await send_telegram(chat_id, f"✅ Mode switched to: *{new_mode.upper()}*", reply_markup=build_control_keyboard(chat_str, is_admin))
-                            else:
-                                current_m = get_user_mode(chat_str)
-                                await send_telegram(chat_id, f"📌 Current Mode: *{current_m.upper()}*")
-                        elif text.startswith("/setburnertoken") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                raw_input = parts[1].strip()
-                                extracted_token = raw_input
-                                extracted_cookies = {}
-                                if "user=" in raw_input or ";" in raw_input:
-                                    try:
-                                        for p in raw_input.split(";"):
-                                            p = p.strip()
-                                            if "=" in p:
-                                                k, v = p.split("=", 1)
-                                                extracted_cookies[k.strip()] = v.strip()
-                                                if k.strip() == "user":
-                                                    decoded = urllib.parse.unquote(v.strip())
-                                                    data = json.loads(decoded)
-                                                    if "token" in data:
-                                                        extracted_token = data["token"]
-                                    except Exception:
-                                        pass
-                                if extracted_token.lower().startswith("bearer "):
-                                    extracted_token = extracted_token[7:].strip()
-                                
-                                save_burner_credentials(chat_str, {"token": extracted_token, "cookies": extracted_cookies})
-                                await send_telegram(chat_id, "✅ *Admin Burner Account Token* successfully linked!")
-                        elif text.startswith("/setburnercart") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                subparts = parts[1].strip().split()
-                                c_id = subparts[0]
-                                v_id = subparts[1] if len(subparts) > 1 else None
-                                save_burner_cart(chat_str, {"cart_id": c_id, "vendor_id": v_id})
-                                await send_telegram(chat_id, f"✅ *Burner Cart Linked* — Cart ID: `{c_id}`, Vendor ID: `{v_id}`")
-                        elif text.startswith("/test") and is_admin:
-                            parts = text.split(" ", 1)
-                            if len(parts) > 1:
-                                test_code = robust_clean_code(parts[1])
-                                await send_telegram(chat_id, f"🔬 Testing code `{test_code}` on burner account...")
-                                result_msg = await execute_burner_test(chat_id, test_code)
-                                await send_telegram(chat_id, result_msg)
-                            else:
-                                await send_telegram(chat_id, "⚠️ Usage: `/test <CODE>`")
-                        elif text.startswith("/pause") and is_admin:
-                            set_bot_active(False)
-                            await send_telegram(chat_id, "⏸️ Bridge Paused.")
-                        elif text.startswith("/resume") and is_admin:
-                            set_bot_active(True)
-                            await send_telegram(chat_id, "▶️ Bridge Resumed.")
-                        else:
-                            await process_text_isolated(chat_str, text)
+                        last_update_id = update.get("update_id", last_update_id)
+                        try:
+                            if "callback_query" in update:
+                                await handle_callback(update, tg_client)
+                            elif "message" in update and "photo" in update["message"]:
+                                await handle_photo_update(update, tg_client)
+                            elif "message" in update:
+                                await handle_text_update(update)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[tg] update error: {e}", flush=True)
+                elif res.status_code == 409:
+                    print("[tg] 409 conflict - another poller/webhook is active.", flush=True)
+                    await asyncio.sleep(5)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                print(f"Poller error: {e}", flush=True)
-            await asyncio.sleep(0.05)
+            except Exception as e:  # noqa: BLE001
+                print(f"[tg] poller error: {e}", flush=True)
+                await asyncio.sleep(2)
+            await asyncio.sleep(0.02)
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+last_update_id = 0
+WORKER_COUNT = max(1, int(os.getenv("WORKER_COUNT", "3")))
+
 
 async def main():
     global loop_ref
     loop_ref = asyncio.get_running_loop()
+    start_store_writer()
     threading.Thread(target=run_http_server, daemon=True).start()
-    worker_task = asyncio.create_task(worker())
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("[boot] WARNING: TELEGRAM_BOT_TOKEN is not set.", flush=True)
+    if not ADMIN_CHAT_ID:
+        print("[boot] WARNING: ADMIN_CHAT_ID is not set - no user will have admin rights.", flush=True)
+
+    workers = [asyncio.create_task(worker()) for _ in range(WORKER_COUNT)]
     try:
         await telegram_poller()
     finally:
-        worker_task.cancel()
+        for w in workers:
+            w.cancel()
+        flush_store()
+        try:
+            await _CD_CLIENT.aclose()
+            await _TG_CLIENT.aclose()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     try:
