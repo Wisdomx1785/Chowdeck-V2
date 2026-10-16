@@ -70,6 +70,11 @@ _IGNORE_TOKENS = {
     "ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY",
     "TRUE", "FALSE", "PROMO", "CODE", "VOUCHER", "ANSWER", "HELP",
     "START", "STOP", "YES", "NO",
+    # Ordinary chatter that can show up in ALL CAPS. Only consulted for
+    # digit-free tokens, so real codes such as CHOW5K are never affected.
+    "PLANS", "SLIGHT", "DROPS", "WILD", "SECONDS", "TOMORROW", "TONIGHT",
+    "MAYBE", "LATER", "SOON", "SAME", "TIME", "NEXT", "CHANGE", "FIRST",
+    "LATEST", "NEW", "POST", "VOUCHERS", "CODES", "PROMOS",
 }
 
 # ---------------------------------------------------------------------------
@@ -977,9 +982,12 @@ def reserve_code(code, ttl=180):
     return True
 
 
-def extract_candidate_codes(text, min_len=5):
+def extract_candidate_codes(text, min_len=5, require_caps=False):
+    """Extract promo-code candidates from free text. require_caps=True is used for X (Twitter) input only: Chowdeck posts its real codes in ALL CAPS (ENDEAVOR26, FIVEFORFIVE) while ordinary chatter is sentence-case ("Slight change of plans."), so a token must be typed in caps with at least one letter to qualify. Manual Telegram pastes and OCR text stay case-insensitive (require_caps=False) so a user can still paste a lower-case code by hand. """
     out = []
     for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
+        if require_caps and (not any(c.isalpha() for c in raw) or raw != raw.upper()):
+            continue
         cleaned = robust_clean_code(raw)
         if not (min_len <= len(cleaned) <= 24):
             continue
@@ -1241,8 +1249,9 @@ async def worker():
             _code_queue.task_done()
 
 
-async def process_text_global(text):
-    codes = extract_candidate_codes(text, min_len=5)
+async def process_text_global(text, require_caps=True):
+    """X (Twitter) intake path - caps-only, see extract_candidate_codes."""
+    codes = extract_candidate_codes(text, min_len=5, require_caps=require_caps)
     for code in codes:
         try:
             _code_queue.put_nowait(("global", code))
@@ -1322,7 +1331,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "no_text"})
             return
         if loop_ref is not None:
-            asyncio.run_coroutine_threadsafe(process_text_global(text), loop_ref)
+            asyncio.run_coroutine_threadsafe(
+                process_text_global(text, require_caps=True), loop_ref
+            )
         self._send_json(200, {"status": "ok"})
 
     def log_message(self, fmt, *args):
