@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, trimmed Telegram chatter. * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. """
+""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, trimmed Telegram chatter. * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. * X detection is admin-only: a code detected on the bridge is auto-served to the admin chat plus the admin's linked accounts (all enabled slots fire in parallel, no per-user throttle) and any security question is relayed immediately. Regular users copy the code from the channel broadcast and claim it themselves; the channel broadcast can be toggled from the admin panel. """
 
 import asyncio
 import base64
@@ -37,6 +37,8 @@ CLAIM_MAX_ATTEMPTS = max(1, int(os.getenv("CLAIM_MAX_ATTEMPTS", "6")))
 CLAIM_WINDOW_SECONDS = float(os.getenv("CLAIM_WINDOW_SECONDS", "4.0"))
 HEDGE_REQUESTS = max(1, int(os.getenv("HEDGE_REQUESTS", "3")))
 REQUEST_CONCURRENCY = max(10, int(os.getenv("REQUEST_CONCURRENCY", "150")))
+# Legacy knob: retained for env compatibility. X detection is admin-only now,
+# so there is no multi-user fanout left to throttle.
 USER_CONCURRENCY = max(1, int(os.getenv("USER_CONCURRENCY", "12")))
 CLAIM_TIMEOUT = float(os.getenv("CLAIM_TIMEOUT", "4.0"))
 
@@ -202,7 +204,20 @@ def get_bot_active():
 
 
 def set_bot_active(val):
-    save_json(STATE_FILE, {"active": bool(val)})
+    state = load_json(STATE_FILE)
+    state["active"] = bool(val)
+    save_json(STATE_FILE, state)
+
+
+def get_channel_announce():
+    """Whether detected codes are announced to the public Telegram channel."""
+    return bool(load_json(STATE_FILE).get("channel_announce", True))
+
+
+def set_channel_announce(val):
+    state = load_json(STATE_FILE)
+    state["channel_announce"] = bool(val)
+    save_json(STATE_FILE, state)
 
 
 def get_active_slot(chat_str):
@@ -566,6 +581,25 @@ async def broadcast_to_channel(text):
     await send_telegram(TELEGRAM_CHANNEL_ID, text)
 
 
+async def announce_channel(text):
+    """Post to the public channel only when channel announcements are enabled. The admin can flip this off from the admin panel (btn_toggle_channel) so detected codes are served only to the admin without a public broadcast. """
+    if not get_channel_announce():
+        return
+    await broadcast_to_channel(text)
+
+
+def get_admin_claim_targets():
+    """Admin chat plus the admin's linked secondary accounts. These are the ONLY accounts an X-detected code is auto-claimed for. Regular whitelisted users grab the code from the channel broadcast and claim it themselves (paste the code, or /code <CODE>). """
+    targets = []
+    if ADMIN_CHAT_ID:
+        targets.append(ADMIN_CHAT_ID)
+        for linked in get_linked_accounts(ADMIN_CHAT_ID):
+            linked = str(linked)
+            if linked not in targets:
+                targets.append(linked)
+    return targets
+
+
 async def answer_callback_query(callback_query_id, text=""):
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -672,6 +706,11 @@ def build_control_keyboard(chat_str, is_admin):
         keyboard.append([
             {"text": "⏸️ Pause", "callback_data": "btn_pause"},
             {"text": "▶️ Resume", "callback_data": "btn_resume"},
+        ])
+        chan_on = get_channel_announce()
+        keyboard.append([
+            {"text": f"📣 Channel: {'ON' if chan_on else 'OFF'}",
+             "callback_data": "btn_toggle_channel"},
         ])
     return {"inline_keyboard": keyboard}
 
@@ -1060,6 +1099,7 @@ async def _report_user_results(chat_str, code, results, mirror=False, tag=""):
 
 
 async def claim_code_global(raw_code, announce=True):
+    """Serve an X/bridge-detected code to the ADMIN only, instantly. Regular whitelisted users are NOT auto-served any more. They copy the code from the channel broadcast and claim it themselves (paste the code, or `/code <CODE>`), which runs through claim_code_for_chat on their own slots. Only the admin chat and the admin's linked secondary accounts are fired, all enabled slots in parallel with no per-user throttle so the claim lands before the crowd. Any attached security question is relayed immediately. """
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -1068,31 +1108,47 @@ async def claim_code_global(raw_code, announce=True):
     if not reserve_code(code):
         return
 
-    if announce:
-        await broadcast_to_channel(
-            f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
-            f"⚡ *Rush to your bot now — it will not wait.*"
-        )
-
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
     lockouts_db = load_json(LOCKOUT_FILE)
-    targets = [c for c, slots in tokens_db.items() if slots and is_user_whitelisted(c)]
-    if not targets:
-        return
 
-    sem = asyncio.Semaphore(USER_CONCURRENCY)
+    # Admin + linked accounts are the only auto-serve targets.
+    targets = [c for c in get_admin_claim_targets() if tokens_db.get(c)]
 
-    async def run_user(c_str):
-        async with sem:
-            try:
-                results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
-                if results:
-                    await _report_user_results(c_str, code, results)
-            except Exception as e:  # noqa: BLE001
-                print(f"[claim] user {c_str} error: {e}", flush=True)
+    announce_text = (
+        f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
+        f"⚡ *Rush to your bot now — it will not wait.*"
+    )
+    # Announce concurrently so the public channel post never delays the claims.
+    announce_task = (
+        asyncio.create_task(announce_channel(announce_text)) if announce else None
+    )
 
-    await asyncio.gather(*(run_user(c) for c in targets))
+    try:
+        if targets:
+            async def run_admin(c_str):
+                # No semaphore: admin slots all fire at once.
+                try:
+                    results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
+                    if results:
+                        await _report_user_results(
+                            c_str, code, results,
+                            mirror=(str(c_str) != ADMIN_CHAT_ID), tag="(X)",
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"[claim] admin target {c_str} error: {e}", flush=True)
+
+            await asyncio.gather(*(run_admin(c) for c in targets))
+        elif ADMIN_CHAT_ID:
+            # Detected, but the admin has nothing to claim with - tell them.
+            await send_telegram(
+                _to_int(ADMIN_CHAT_ID),
+                f"🚨 Code `{code}` detected on X, but you have no configured slots.\n"
+                f"Add a token with `/settoken <token>` to auto-claim future codes.",
+            )
+    finally:
+        if announce_task is not None:
+            await announce_task
 
 
 async def claim_code_for_chat(chat_str, raw_code):
@@ -1104,7 +1160,7 @@ async def claim_code_for_chat(chat_str, raw_code):
 
     is_admin = is_admin_chat(chat_str)
     if is_admin:
-        await broadcast_to_channel(
+        await announce_channel(
             f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
             f"⚡ *Rush to your bot now — it will not wait.*"
         )
@@ -1325,6 +1381,7 @@ GUIDE_TEXT = (
     "• `/ans <CODE> <answer>` — answer a specific code\n"
     "• `/pending` — show open questions\n"
     "• `/cancel` — drop open questions\n"
+    "• `/announce on|off` — toggle channel code broadcasts (admin)\n"
     "• `/portfolio` — your claim history\n"
     "• `/setcart <cart_id> [vendor_id]` — auto-apply won codes to a cart"
 )
@@ -1368,6 +1425,7 @@ async def handle_command(chat_id, chat_str, text, is_admin):
         await send_telegram(chat_id,
             f"🛡️ *Admin panel*\n\n"
             f"• Bot: {'🟢 active' if get_bot_active() else '⏸️ paused'}\n"
+            f"• Channel broadcast: {'📣 ON' if get_channel_announce() else '🔇 OFF'}\n"
             f"• Users: `{u}`\n• Configured slots: `{s}`\n• Carts linked: `{c}`")
     elif cmd == "/geninvite":
         if not is_admin:
@@ -1561,6 +1619,22 @@ async def handle_command(chat_id, chat_str, text, is_admin):
             return
         set_bot_active(True)
         await send_telegram(chat_id, "▶️ Global claiming resumed.")
+    elif cmd in ("/announce", "/channel"):
+        if not is_admin:
+            await send_telegram(chat_id, "⛔ Admin only.")
+            return
+        val = arg.strip().lower()
+        if val in ("on", "off"):
+            set_channel_announce(val == "on")
+        elif val:
+            await send_telegram(chat_id, "⚠️ Usage: `/announce on` or `/announce off`")
+            return
+        state = "ON" if get_channel_announce() else "OFF"
+        await send_telegram(
+            chat_id,
+            f"📣 *Code-detection channel notifications:* `{state}`\n"
+            f"Usage: `/announce on` or `/announce off`",
+        )
     else:
         await send_telegram(chat_id, "ℹ️ Unknown command. Send /help for the guide.")
 
@@ -1632,6 +1706,7 @@ async def handle_callback(update, tg_client):
             await send_telegram(chat_id,
                 f"🛡️ *Admin panel*\n\n"
                 f"• Bot: {'🟢 active' if get_bot_active() else '⏸️ paused'}\n"
+                f"• Channel broadcast: {'📣 ON' if get_channel_announce() else '🔇 OFF'}\n"
                 f"• Users: `{u}`\n• Configured slots: `{s}`\n• Carts linked: `{c}`")
     elif action == "btn_pause":
         await answer_callback_query(cq_id, "Paused")
@@ -1643,6 +1718,23 @@ async def handle_callback(update, tg_client):
         if is_admin:
             set_bot_active(True)
             await send_telegram(chat_id, "▶️ Global claiming resumed.")
+    elif action == "btn_toggle_channel":
+        if not is_admin:
+            await answer_callback_query(cq_id, "Admin only")
+            return
+        new_val = not get_channel_announce()
+        set_channel_announce(new_val)
+        await answer_callback_query(cq_id, f"Channel {'ON' if new_val else 'OFF'}")
+        await send_telegram(
+            chat_id,
+            "📣 *Code-detection channel notifications are now "
+            f"{'ON' if new_val else 'OFF'}.*\n\n"
+            + ("Detected codes will be broadcast to the channel so users can copy and claim."
+               if new_val else
+               "Detected codes will be served to your admin slots only — no public broadcast."),
+        )
+        await edit_message_text(chat_id, msg_id, menu_text(chat_str),
+                                build_control_keyboard(chat_str, is_admin))
     elif action == "btn_burner_menu":
         await answer_callback_query(cq_id, "Burner panel")
         if is_admin:
