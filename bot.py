@@ -329,13 +329,15 @@ def record_portfolio_win(chat_str, code, slot_id, amount=2000):
 
 
 # ---------------------------------------------------------------------------
-# Pending security-question prompts (FIFO queue per chat)
+# Pending security-question prompt (only ONE live question per chat)
 # ---------------------------------------------------------------------------
 def add_or_update_pending(chat_str, entry):
+    """Register the security question that is currently shown to the user. Only one question is live per chat. Registering a question for a new code drops any older prompt for a *different* code, and re-registering the same code replaces its entry. This guarantees a pasted answer is always bound to the question the user is actually looking at; without it an answer could be applied to a previously-pending code instead of the one just claimed. """
     store = load_json(PENDING_PROMPT_FILE)
-    bucket = [e for e in store.get(str(chat_str), []) if e.get("code") != entry.get("code")]
-    bucket.append(entry)
-    store[str(chat_str)] = bucket[-10:]
+    # Exactly one question is live per chat: registering a question (for any
+    # code) replaces whatever was pending, so a pasted answer is always bound
+    # to the question the user is actually looking at.
+    store[str(chat_str)] = [entry]
     save_json(PENDING_PROMPT_FILE, store)
 
 
@@ -344,7 +346,7 @@ def list_pending(chat_str):
 
 
 def pop_pending(chat_str, code=None, reply_to=None):
-    """Remove and return the prompt a user is answering. Resolution order: explicit code -> Telegram reply target -> oldest pending. """
+    """Remove and return the prompt a user is answering. Resolution order: explicit code -> Telegram reply target -> newest prompt. The fallback must be the NEWEST question: that is the one currently on screen, so a plain pasted answer is bound to the code the user just claimed. """
     store = load_json(PENDING_PROMPT_FILE)
     bucket = list(store.get(str(chat_str), []))
     target = None
@@ -353,7 +355,7 @@ def pop_pending(chat_str, code=None, reply_to=None):
     elif reply_to is not None:
         target = next((e for e in bucket if e.get("msg_id") == reply_to), None)
     if target is None and bucket:
-        target = bucket[0]
+        target = bucket[-1]
     if target is not None:
         bucket = [e for e in bucket if e is not target]
         store[str(chat_str)] = bucket
