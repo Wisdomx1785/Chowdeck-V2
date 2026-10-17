@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, trimmed Telegram chatter. * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. * X detection is admin-only: a code detected on the bridge is auto-served to the admin chat plus the admin's linked accounts (all enabled slots fire in parallel, no per-user throttle) and any security question is relayed immediately. Regular users copy the code from the channel broadcast and claim it themselves; the channel broadcast can be toggled from the admin panel. """
+""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, per-slot result streaming as each slot finishes (no waiting on the slowest slot). * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Claim UX: instant "🔍 Processing ..." ack, one "🎯 ... (Slot N)" message per slot (so an expired/inactive/congested slot never hides another), and the security question is surfaced immediately with a paste-in-chat answer. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. * X detection is admin-only: a code detected on the bridge is auto-served to the admin chat plus the admin's linked accounts (all enabled slots fire in parallel, no per-user throttle) and any security question is relayed immediately. Regular users copy the code from the channel broadcast and claim it themselves; the channel broadcast can be toggled from the admin panel. """
 
 import asyncio
 import base64
@@ -75,6 +75,11 @@ _IGNORE_TOKENS = {
     "PLANS", "SLIGHT", "DROPS", "WILD", "SECONDS", "TOMORROW", "TONIGHT",
     "MAYBE", "LATER", "SOON", "SAME", "TIME", "NEXT", "CHANGE", "FIRST",
     "LATEST", "NEW", "POST", "VOUCHERS", "CODES", "PROMOS",
+    # Everyday greetings / courtesy words: harmless chatter that must never be
+    # mistaken for a code now that a lone mixed-case token is accepted.
+    "HELLO", "HI", "HEY", "PLEASE", "THANKS", "THANK", "SORRY", "WELCOME",
+    "OKAY", "NICE", "GREAT", "COOL", "MORNING", "EVENING", "NIGHT",
+    "HAHA", "LOL", "CONGRATS", "CONGRATULATIONS",
 }
 
 # ---------------------------------------------------------------------------
@@ -982,11 +987,50 @@ def reserve_code(code, ttl=180):
     return True
 
 
-def extract_candidate_codes(text, min_len=5, require_caps=False):
-    """Extract promo-code candidates from free text. require_caps=True is used for X (Twitter) input only: Chowdeck posts its real codes in ALL CAPS (ENDEAVOR26, FIVEFORFIVE) while ordinary chatter is sentence-case ("Slight change of plans."), so a token must be typed in caps with at least one letter to qualify. Manual Telegram pastes and OCR text stay case-insensitive (require_caps=False) so a user can still paste a lower-case code by hand. """
+# Money amounts (N2000, #5000, 20K) and clock times (5:50pm -> 50pm) are the
+# two things that most often masquerade as a promo code in casual text.
+_AMOUNT_RE = re.compile(r"^(?:[N\u20a6#]?\d+)(?:\.\d+)?[KM]?$", re.IGNORECASE)
+_CLOCK_RE = re.compile(r"^\d{1,2}(?:AM|PM)$", re.IGNORECASE)
+
+
+def _is_paste_code_token(raw):
+    """True when a pasted token looks like something a human typed as a code. Voucher codes are always written in upper case. A pasted token qualifies when it is mixed (a digit AND a letter - CHOW5K, ENDEAVOR26, 5FOR5), when it was typed in ALL CAPS by the user (FIVEFORFIVE), or when it is a long alphabetic token that is clearly not ordinary chatter (a lower-case paste of a real code such as mrbeeistesting). Ordinary sentence words such as "grab" or "now" are rejected, so pasting "grab CHOW5K now" only claims CHOW5K instead of inventing GRABCHOW5KNOW. """
+    if not raw or not any(c.isalpha() for c in raw):
+        return False
+    if _AMOUNT_RE.match(raw) or _CLOCK_RE.match(raw):
+        return False
+    has_digit = any(c.isdigit() for c in raw)
+    if has_digit:
+        return True
+    if raw == raw.upper():
+        return len(raw) >= 5
+    # Lower-case, alphabetic only: accept only clearly code-sized tokens so a
+    # hand-pasted lower-case code is still caught while "grab"/"now"/"please"
+    # and similar chatter never claim.
+    return len(raw) >= 10
+
+
+def extract_candidate_codes(text, min_len=5, require_caps=False, paste_mode=False):
+    """Extract promo-code candidates from free text. require_caps=True is used for X (Twitter) input only: Chowdeck posts its real codes in ALL CAPS (ENDEAVOR26, FIVEFORFIVE) while ordinary chatter is sentence-case ("Slight change of plans."), so a token must be typed in caps with at least one letter to qualify. paste_mode=True is used for Telegram pastes and OCR text: tokens are taken from the message individually (never the whole message as one code) and must be mixed or typed in ALL CAPS, so a lower-case code such as "chow5k" still works while random lower-case words never trigger a claim. One extra case is honoured for paste input: when the whole message is a single token, a *mixed-case* letters-only code (MrBee, Endeavor) is accepted even though it is short and has no digit, because people often retype a letters-only code in mixed case. Ordinary all-lowercase chatter ("hello") is still filtered, and a *sentence* such as "I am MRBEE of lagos" keeps the strict per-token rule so only the ALL-CAPS MRBEE is grabbed. """
+    tokens = re.findall(r"[A-Za-z0-9]+", text or "")
+    # A lone, mixed-case alphabetic token is an explicit code paste: accept it so
+    # a letters-only code retyped as "MrBee" is never missed, while all-lowercase
+    # words and multi-word sentences keep the stricter per-token gate below.
+    solo_mixed = (
+        paste_mode
+        and not require_caps
+        and len(tokens) == 1
+        and tokens[0].isalpha()
+        and tokens[0] != tokens[0].upper()
+        and tokens[0] != tokens[0].lower()
+    )
     out = []
-    for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
+    for raw in tokens:
         if require_caps and (not any(c.isalpha() for c in raw) or raw != raw.upper()):
+            continue
+        if paste_mode and not solo_mixed and not _is_paste_code_token(raw):
+            continue
+        if (require_caps or paste_mode) and (_AMOUNT_RE.match(raw) or _CLOCK_RE.match(raw)):
             continue
         cleaned = robust_clean_code(raw)
         if not (min_len <= len(cleaned) <= 24):
@@ -1000,13 +1044,18 @@ def extract_candidate_codes(text, min_len=5, require_caps=False):
 
 
 def strong_code_signal(text):
-    """Stricter test used while a security prompt is open. Promo codes almost always carry a digit; a short purely alphabetic token (a typical security answer) is treated as the answer instead. """
-    cleaned = robust_clean_code(text)
-    if not (5 <= len(cleaned) <= 24):
-        return False
-    if cleaned in _IGNORE_TOKENS or cleaned.startswith("INVITE"):
-        return False
-    return any(ch.isdigit() for ch in cleaned) or len(cleaned) >= 10
+    """Stricter test used while a security prompt is open. Uses the same paste gate as the normal path, then additionally requires the winning token to carry a digit or to have been typed in ALL CAPS. That way a freshly pasted code still hijacks the claim (code priority), while a plain alphabetic word - a typical security answer - is passed to the answer handler instead of being mistaken for a code. """
+    for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
+        if not _is_paste_code_token(raw):
+            continue
+        cleaned = robust_clean_code(raw)
+        if not (5 <= len(cleaned) <= 24):
+            continue
+        if cleaned in _IGNORE_TOKENS or cleaned.startswith("INVITE") or cleaned.isdigit():
+            continue
+        if any(ch.isdigit() for ch in cleaned) or raw == raw.upper():
+            return True
+    return False
 
 
 def format_slot_range(slots):
@@ -1030,80 +1079,153 @@ def _to_int(value):
 # ---------------------------------------------------------------------------
 # Claim orchestration
 # ---------------------------------------------------------------------------
-async def _run_slots(chat_str, code, tokens_db, carts_db, lockouts_db, specific_answer=None):
+ACK_PROCESSING = "🔍 Processing personal code `{code}` across your active slots..."
+ACK_PROCESSING_MIRROR = "🔗 *[Mirrored Admin Code]* Processing code `{code}` across secondary slots..."
+ACK_ANSWER = (
+    "⚡ *Emergency Answer Captured!* Blasting `{answer}` instantly across your "
+    "active slots for `{code}`..."
+)
+ACK_ANSWER_MIRROR = (
+    "🔗 *[Mirrored Admin Answer]* Blasting `{answer}` instantly across your "
+    "secondary slots for `{code}`..."
+)
+
+
+def _safe_resp_text(resp_data):
+    """JSON of a slot response, safe to embed inside a Markdown code span."""
+    try:
+        text = json.dumps(resp_data, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(resp_data)
+    return text.replace("`", "'")
+
+
+async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mirror=False, ack_text=None, specific_answer=None, notify_empty=False, rearm_hint=None):
+    """Fire `code` at every enabled slot and stream old-repo style messages. Each slot is reported on its own line so a slow, expired, inactive or congested slot can never hide another slot's result: * ``status == 0`` (inactive / expired / no token) is skipped silently and never blocks or hooks the rest of the claim. * a security question is surfaced immediately, grouped across every slot that asked for it, with a single paste-in-chat answer flow. * 500 / "high demand" congestion is reported gracefully after the burst retries complete instead of surfacing as a bare error. Returns ``{"ok": bool, "prompted": bool, "results": [...]}``. """
+    chat_str = str(chat_str)
+    chat_id = _to_int(chat_str)
+    if chat_id is None:
+        return {"ok": False, "prompted": False, "results": []}
+
+    if ack_text:
+        await send_telegram(chat_id, ack_text)
+
+    tokens_db = load_json(TOKENS_FILE)
+    carts_db = load_json(CARTS_FILE)
+    lockouts_db = load_json(LOCKOUT_FILE)
+
     user_slots = tokens_db.get(chat_str, {}) or {}
     pending = [
         (str(sid), td) for sid, td in user_slots.items()
         if (td or {}).get("token") and is_slot_active_state(chat_str, str(sid))
     ]
     if not pending:
-        return []
+        if notify_empty and not mirror:
+            await send_telegram(
+                chat_id,
+                "❌ No enabled accounts to claim with. Add a token with `/settoken <token>` "
+                "and make sure the slot is ✅ enabled.",
+            )
+        return {"ok": False, "prompted": False, "results": []}
 
-    chat_id = _to_int(chat_str)
-    if chat_id is None:
-        return []
-
+    head = "🔗 *[Mirrored]* " if mirror else ""
     deadline = time.time() + CLAIM_WINDOW_SECONDS
     tasks = [
-        claim_slot_worker(_CD_CLIENT, chat_id, sid, td, code, carts_db, lockouts_db,
-                          specific_answer, deadline)
+        asyncio.create_task(
+            claim_slot_worker(_CD_CLIENT, chat_id, sid, td, code, carts_db,
+                              lockouts_db, specific_answer, deadline)
+        )
         for sid, td in pending
     ]
-    raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-    results = []
-    for r in raw:
-        if isinstance(r, BaseException):
-            results.append({"slot": "?", "status": 500, "response": {"message": str(r)}})
-        else:
-            results.append(r)
-    return results
+    collected = []
+    prompt_slots = []
+    question = None
+    state = {"sent": False}
 
-
-async def _report_user_results(chat_str, code, results, mirror=False, tag=""):
-    """At most one prompt message and/or one result message per user per code."""
-    chat_id = _to_int(chat_str)
-    if chat_id is None or not results:
-        return
-
-    prompts = [r for r in results if r.get("needs_prompt")]
-    others = [r for r in results if r.get("status") != 0 and not r.get("needs_prompt")]
-    successes = [r for r in others if r.get("status") in (200, 201)]
-    head = "🔗 [Mirrored] " if mirror else ""
-
-    if prompts:
-        question = str(prompts[0].get("question") or "Security question required.")
-        slots = [str(r.get("slot")) for r in prompts]
-        entry = {"code": code, "question": question, "slots": slots, "ts": time.time()}
-        msg = (
-            f"{head}🔒 *Security question for* `{code}` ({format_slot_range(slots)})\n\n"
-            f"Q: *\"{question}\"*\n\n"
-            f"⚡ Reply with the answer right here — it is claimed instantly.\n"
-            f"If you also have a new code, send it and it will be treated as a code."
+    async def flush_prompt():
+        """Send the grouped security question as soon as a slot reports one."""
+        await asyncio.sleep(0.12)  # group near-simultaneous prompts from the same burst
+        if state["sent"] or not prompt_slots:
+            return
+        state["sent"] = True
+        slot_range_str = format_slot_range(prompt_slots)
+        prompt_msg = (
+            f"{head}🔒 *Security Question Detected for `{code}` ({slot_range_str})!*\n"
+            f"Question: *\"{question}\"*\n\n"
+            f"⚡ *Type the answer right here in chat* to respond!"
         )
-        msg_id = await send_telegram(chat_id, msg)
-        if msg_id:
-            entry["msg_id"] = msg_id
-        add_or_update_pending(chat_str, entry)
+        msg_id = await send_telegram(chat_id, prompt_msg)
+        add_or_update_pending(chat_str, {
+            "code": code,
+            "question": question,
+            "slots": list(prompt_slots),
+            "ts": time.time(),
+            "msg_id": msg_id,
+        })
 
-    if others and (successes or not prompts):
-        lines = [f"{head}🎯 `{code}` {tag}".rstrip()]
-        if successes:
-            lines.append(f"✅ Claimed on {format_slot_range([r['slot'] for r in successes])}")
-        failures = [r for r in others if r not in successes]
-        grouped = {}
-        for r in failures:
-            resp = r.get("response", {}) if isinstance(r.get("response"), dict) else {}
-            label = f"{r.get('status')} {str(resp.get('message', ''))[:60]}".strip()
-            grouped.setdefault(label, []).append(str(r.get("slot")))
-        for label, slots in list(grouped.items())[:4]:
-            lines.append(f"• {label} → {format_slot_range(slots)}")
-        if len(grouped) > 4:
-            lines.append(f"• …and {len(grouped) - 4} more result type(s)")
-        cart = next((r.get("cart_str") for r in successes if r.get("cart_str")), "")
-        if cart:
-            lines.append(cart.strip())
-        await send_telegram(chat_id, "\n".join(lines))
+    for fut in asyncio.as_completed(tasks):
+        try:
+            res = await fut
+        except Exception as e:  # noqa: BLE001
+            res = {"slot": "?", "status": 500, "response": {"message": str(e)}}
+        if not isinstance(res, dict):
+            continue
+        status = res.get("status")
+        if status == 0:
+            continue  # inactive / expired / no token: never hook the claim
+        slot = res.get("slot")
+        collected.append({"slot": slot, "status": status,
+                          "response": res.get("response", {})})
+
+        if res.get("needs_prompt"):
+            if question is None:
+                question = str(res.get("question") or "Security question required.")
+            if str(slot) not in prompt_slots:
+                prompt_slots.append(str(slot))
+            if not state["sent"]:
+                asyncio.create_task(flush_prompt())
+            continue
+
+        resp_data = res.get("response", {})
+        msg_lower = str(resp_data.get("message", "")).lower() if isinstance(resp_data, dict) else ""
+        cart_suffix = res.get("cart_str", "")
+        if status in (429, 500, 502, 503, 504) or "high demand" in msg_lower:
+            summary_msg = (
+                f"{head}⚠️ *{label}:* `{code}` (Slot {slot})\n"
+                f"Status: `{status} (Server congested)`\n"
+                f"💡 *Note:* Chowdeck throttled this claim — burst retries completed!"
+            )
+        else:
+            summary_msg = (
+                f"{head}🎯 *{label}:* `{code}` (Slot {slot})\n"
+                f"Status: `{status}`\n"
+                f"Response: `{_safe_resp_text(resp_data)}`{cart_suffix}"
+            )
+        await send_telegram(chat_id, summary_msg)
+
+    # A slow slot may have been the one holding the question: never leave it unshown.
+    if prompt_slots and not state["sent"]:
+        await flush_prompt()
+
+    ok = any(r["status"] in (200, 201) for r in collected)
+    if rearm_hint and not ok and not prompt_slots:
+        # The answer was likely rejected: re-arm the question so a retry is one paste away.
+        if any(
+            r["status"] in (400, 401, 422)
+            and any(w in str(r["response"].get("message", "")).lower()
+                    for w in ("answer", "question", "incorrect", "wrong"))
+            for r in collected
+            if isinstance(r.get("response"), dict)
+        ):
+            add_or_update_pending(chat_str, {
+                "code": code,
+                "question": rearm_hint,
+                "slots": [],
+                "ts": time.time(),
+            })
+
+    return {"ok": ok, "prompted": bool(prompt_slots), "results": collected}
 
 
 async def claim_code_global(raw_code, announce=True):
@@ -1117,8 +1239,6 @@ async def claim_code_global(raw_code, announce=True):
         return
 
     tokens_db = load_json(TOKENS_FILE)
-    carts_db = load_json(CARTS_FILE)
-    lockouts_db = load_json(LOCKOUT_FILE)
 
     # Admin + linked accounts are the only auto-serve targets.
     targets = [c for c in get_admin_claim_targets() if tokens_db.get(c)]
@@ -1136,13 +1256,18 @@ async def claim_code_global(raw_code, announce=True):
         if targets:
             async def run_admin(c_str):
                 # No semaphore: admin slots all fire at once.
+                mirror = str(c_str) != ADMIN_CHAT_ID
                 try:
-                    results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
-                    if results:
-                        await _report_user_results(
-                            c_str, code, results,
-                            mirror=(str(c_str) != ADMIN_CHAT_ID), tag="(X)",
-                        )
+                    await _claim_and_report(
+                        c_str, code,
+                        label="Code Target",
+                        mirror=mirror,
+                        ack_text=(
+                            ACK_PROCESSING_MIRROR.format(code=code) if mirror
+                            else ACK_PROCESSING.format(code=code)
+                        ),
+                        notify_empty=not mirror,
+                    )
                 except Exception as e:  # noqa: BLE001
                     print(f"[claim] admin target {c_str} error: {e}", flush=True)
 
@@ -1173,10 +1298,6 @@ async def claim_code_for_chat(chat_str, raw_code):
             f"⚡ *Rush to your bot now — it will not wait.*"
         )
 
-    tokens_db = load_json(TOKENS_FILE)
-    carts_db = load_json(CARTS_FILE)
-    lockouts_db = load_json(LOCKOUT_FILE)
-
     targets = [chat_str]
     if is_admin:
         for linked in get_linked_accounts(chat_str):
@@ -1185,16 +1306,16 @@ async def claim_code_for_chat(chat_str, raw_code):
 
     for c_str in targets:
         mirror = c_str != chat_str
-        results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db)
-        if not results:
-            if not mirror:
-                await send_telegram(
-                    _to_int(chat_str),
-                    "❌ No enabled accounts to claim with. Add a token with `/settoken <token>` "
-                    "and make sure the slot is ✅ enabled.",
-                )
-            continue
-        await _report_user_results(c_str, code, results, mirror=mirror, tag="(manual)")
+        await _claim_and_report(
+            c_str, code,
+            label="Personal Code Target",
+            mirror=mirror,
+            ack_text=(
+                ACK_PROCESSING_MIRROR.format(code=code) if mirror
+                else ACK_PROCESSING.format(code=code)
+            ),
+            notify_empty=not mirror,
+        )
 
 
 async def handle_answer(chat_str, answer_text, pending_entry):
@@ -1206,9 +1327,6 @@ async def handle_answer(chat_str, answer_text, pending_entry):
         return
 
     is_admin = is_admin_chat(chat_str)
-    tokens_db = load_json(TOKENS_FILE)
-    carts_db = load_json(CARTS_FILE)
-    lockouts_db = load_json(LOCKOUT_FILE)
 
     targets = [chat_str]
     if is_admin:
@@ -1218,16 +1336,18 @@ async def handle_answer(chat_str, answer_text, pending_entry):
 
     for c_str in targets:
         mirror = c_str != chat_str
-        results = await _run_slots(c_str, code, tokens_db, carts_db, lockouts_db,
-                                   specific_answer=answer_text)
-        if not results:
-            if not mirror:
-                await send_telegram(
-                    _to_int(chat_str),
-                    f"❌ No enabled accounts to submit the answer for `{code}`.",
-                )
-            continue
-        await _report_user_results(c_str, code, results, mirror=mirror, tag="(answer submitted)")
+        await _claim_and_report(
+            c_str, code,
+            label="Code Target",
+            mirror=mirror,
+            ack_text=(
+                ACK_ANSWER_MIRROR.format(answer=answer_text, code=code) if mirror
+                else ACK_ANSWER.format(answer=answer_text, code=code)
+            ),
+            specific_answer=answer_text,
+            notify_empty=not mirror,
+            rearm_hint=(pending_entry or {}).get("question") or "Security question required.",
+        )
 
 
 async def worker():
@@ -1261,7 +1381,7 @@ async def process_text_global(text, require_caps=True):
 
 
 async def process_text_isolated(chat_str, text):
-    codes = extract_candidate_codes(text, min_len=4)
+    codes = extract_candidate_codes(text, min_len=4, paste_mode=True)
     for code in codes:
         try:
             _code_queue.put_nowait(("isolated", (str(chat_str), code)))
@@ -1548,7 +1668,6 @@ async def handle_command(chat_id, chat_str, text, is_admin):
             await send_telegram(chat_id, "⚠️ Usage: `/code <CODE>`")
             return
         forced = robust_clean_code(arg) or arg.strip().upper()
-        await send_telegram(chat_id, f"🔍 Forcing code `{forced}` now…")
         await claim_code_for_chat(chat_str, forced)
     elif cmd == "/ans" or cmd == "/answer":
         if not arg:
@@ -1843,19 +1962,16 @@ async def handle_text_update(update):
             await handle_answer(chat_str, text, entry)
             return
         if strong_code_signal(text):
+            # A fresh code arrived while a question is open: claim it. The
+            # "Processing personal code ..." acknowledgement comes from the
+            # claim path, and the pending question stays open for one paste.
             await process_text_isolated(chat_str, text)
-            await send_telegram(
-                chat_id,
-                f"🔍 That looks like a code — claiming `{robust_clean_code(text)}` now.\n"
-                f"If you meant it as the security answer, send `/ans {text}` "
-                f"or reply to the question message.",
-            )
             return
         entry = pop_pending(chat_str)
         await handle_answer(chat_str, text, entry)
         return
 
-    if looks_like_code(text):
+    if extract_candidate_codes(text, min_len=4, paste_mode=True):
         await process_text_isolated(chat_str, text)
         return
 
