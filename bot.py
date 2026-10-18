@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, per-slot result streaming as each slot finishes (no waiting on the slowest slot). * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Claim UX: instant "🔍 Processing ..." ack, one "🎯 ... (Slot N)" message per slot (so an expired/inactive/congested slot never hides another), and the security question is surfaced immediately with a paste-in-chat answer. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. * X detection is admin-only: a code detected on the bridge is auto-served to the admin chat plus the admin's linked accounts (all enabled slots fire in parallel, no per-user throttle) and any security question is relayed immediately. Regular users copy the code from the channel broadcast and claim it themselves; the channel broadcast can be toggled from the admin panel. """
+""" Chowdeck Multi-Account Promo Sniper - Telegram bot + HTTP bridge receiver. Rewrite notes ------------- * PROMPT MODE ONLY. The legacy "auto" mode and every stored / pre-configured security answer are gone. When a security-question-enabled code is detected the bot relays the question and captures the user's pasted answer instantly. * Code-priority parsing: a pasted promo code is never swallowed as a security answer. Explicit /ans and /code overrides exist for edge cases. * Fixed admin check: admins are only admins when ADMIN_CHAT_ID is set AND matches (the old logic granted admin to everyone when the var was missing). * Authenticated inbound webhook: POST /tweet and GET /status require WEBHOOK_SECRET (fail closed unless ALLOW_INSECURE_WEBHOOK=true). * Low latency: shared keep-alive HTTP clients, in-memory JSON cache with debounced write-behind to disk, per-slot result streaming as each slot finishes (no waiting on the slowest slot). * Burst / hedged claiming (CLAIM_MAX_ATTEMPTS, CLAIM_WINDOW_SECONDS, HEDGE_REQUESTS) to punch through "voucher is in high demand" responses. * Anti self-throttle pacing, per chat: every outbound claim request passes through the *claiming chat's own* token bucket (CLAIM_RATE / CLAIM_RATE_BURST) and each slot's first request is staggered (SLOT_STAGGER_SECONDS), so a 19-slot fanout no longer fires ~340 requests in ~4s and makes Chowdeck 429/500 the bot itself. A 429 drains only that chat's bucket via Retry-After, so one user's cooldown never stalls another. Telegram sends are paced per chat too (TG_RATE / TG_RATE_BURST). An optional CLAIM_GLOBAL_RATE adds a cross-user ceiling for the shared egress IP. * Claim UX: instant "🔍 Processing ..." ack, one "🎯 ... (Slot N)" message per slot (so an expired/inactive/congested slot never hides another), and the security question is surfaced immediately with a paste-in-chat answer. * Hardened error handling: bounded concurrency, per-request timeouts, no unbounded retry loops, Markdown-safe Telegram sends. * X detection is admin-only: a code detected on the bridge is auto-served to the admin chat plus the admin's linked accounts (all enabled slots fire in parallel, no per-user throttle) and any security question is relayed immediately. Regular users copy the code from the channel broadcast and claim it themselves; the channel broadcast can be toggled from the admin panel. """
 
 import asyncio
 import base64
+import contextvars
+import datetime
+import email.utils
 import hmac
 import json
 import os
@@ -33,10 +36,37 @@ OCR_API_KEY = os.getenv("OCR_API_KEY", "helloworld").strip() or "helloworld"
 ADMIN_MAX_SLOTS = max(1, int(os.getenv("ADMIN_MAX_SLOTS", "20")))
 USER_MAX_SLOTS = max(1, int(os.getenv("USER_MAX_SLOTS", "10")))
 
-CLAIM_MAX_ATTEMPTS = max(1, int(os.getenv("CLAIM_MAX_ATTEMPTS", "6")))
+CLAIM_MAX_ATTEMPTS = max(1, int(os.getenv("CLAIM_MAX_ATTEMPTS", "3")))
 CLAIM_WINDOW_SECONDS = float(os.getenv("CLAIM_WINDOW_SECONDS", "4.0"))
-HEDGE_REQUESTS = max(1, int(os.getenv("HEDGE_REQUESTS", "3")))
+HEDGE_REQUESTS = max(1, int(os.getenv("HEDGE_REQUESTS", "1")))
 REQUEST_CONCURRENCY = max(10, int(os.getenv("REQUEST_CONCURRENCY", "150")))
+
+# --- Outbound pacing -------------------------------------------------------
+# A 19-slot fanout used to fire ~340 requests inside ~4s (19 slots x 3 hedges x
+# 6 attempts), which made Chowdeck throttle *us*: self-inflicted 429/500 storms.
+# Pacing is *per chat*: each user gets their own token bucket, so one user's
+# claim burst (or 429 cooldown) can never stall another user. The fleet keeps
+# its concurrency but not its burst stampede.
+CLAIM_RATE = max(1.0, float(os.getenv("CLAIM_RATE", "14")))
+CLAIM_RATE_BURST = max(1, int(os.getenv("CLAIM_RATE_BURST", "24")))
+# Slot N waits N * SLOT_STAGGER_SECONDS before its first request, so slots do
+# not all land on the same millisecond. Kept tiny: every extra millisecond here
+# is a millisecond the last slot is not yet racing.
+SLOT_STAGGER_SECONDS = float(os.getenv("SLOT_STAGGER_SECONDS", "0.02"))
+# Telegram send pacing, also per chat (avoids flood-control 429s from per-slot
+# report bursts without one user's reports delaying another user's).
+TG_RATE = max(1.0, float(os.getenv("TG_RATE", "18")))
+TG_RATE_BURST = max(1, int(os.getenv("TG_RATE_BURST", "6")))
+# Optional cross-user ceiling (requests/second) for the shared Railway egress
+# IP. 0 = disabled: each chat is paced only by its own CLAIM_RATE bucket. Set
+# e.g. CLAIM_GLOBAL_RATE=40 to cap the *sum* of all users when the upstream
+# throttle is known to be IP-scoped.
+CLAIM_GLOBAL_RATE = max(0.0, float(os.getenv("CLAIM_GLOBAL_RATE", "0")))
+CLAIM_GLOBAL_RATE_BURST = max(1, int(os.getenv("CLAIM_GLOBAL_RATE_BURST", "24")))
+# Debug aid: dump the real Chowdeck response body (never masked) to stdout.
+LOG_RAW_CLAIM = os.getenv("LOG_RAW_CLAIM", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 # Legacy knob: retained for env compatibility. X detection is admin-only now,
 # so there is no multi-user fanout left to throttle.
 USER_CONCURRENCY = max(1, int(os.getenv("USER_CONCURRENCY", "12")))
@@ -63,6 +93,44 @@ PORTFOLIO_FILE = _data_file("portfolio.json")
 LINKED_ACCOUNTS_FILE = _data_file("linked_accounts.json")
 WHITELIST_FILE = _data_file("whitelist.json")
 INVITE_CODES_FILE = _data_file("invite_codes.json")
+LOGIN_FLOW_FILE = _data_file("login_flows.json")
+
+# --- Feature 1: phone -> OTP login (a session token the BOT owns) ----------
+# The bot signs in with its own POST /auth/login + /auth/login/validate-otp
+# call, exactly like a second device signing in. The token it receives is a
+# normal bearer JWT that is independent of whatever token the user's browser
+# already holds, so linking/refreshing the bot's token never disturbs a web
+# session, and a web login never invalidates the bot's token.
+CHOW_API_BASE = os.getenv("CHOW_API_BASE", "https://api.chowdeck.com").strip().rstrip("/")
+CHOW_AUTH_ROLE = os.getenv("CHOW_AUTH_ROLE", "customer").strip() or "customer"
+CHOW_COUNTRY_CODE = os.getenv("CHOW_COUNTRY_CODE", "NG").strip().upper() or "NG"
+LOGIN_ENABLED = os.getenv("LOGIN_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+OTP_FLOW_TTL = max(30.0, float(os.getenv("OTP_FLOW_TTL", "600")))
+OTP_RESEND_COOLDOWN = max(5.0, float(os.getenv("OTP_RESEND_COOLDOWN", "30")))
+# off = never auto-refresh (identical to the old behaviour)
+# safe = refresh only tokens this bot minted itself via /login (default)
+# on = also refresh tokens the user pasted from their own browser session
+CHOW_AUTO_REFRESH = os.getenv("CHOW_AUTO_REFRESH", "safe").strip().lower() or "safe"
+TOKEN_REFRESH_SKEW = float(os.getenv("TOKEN_REFRESH_SKEW", "120"))
+AUTH_TIMEOUT = float(os.getenv("AUTH_TIMEOUT", "6.0"))
+# Debug aid: dump the raw auth API response body to stdout (never masked).
+LOG_RAW_AUTH = os.getenv("LOG_RAW_AUTH", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# --- Feature 2: AI security-answer assist (real-time web search) -----------
+# auto = enabled when any provider key is present, disabled otherwise.
+AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "auto").strip().lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "").strip().lower()
+AI_MODEL = os.getenv("AI_MODEL", "").strip()
+AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "25.0"))
+AI_MAX_ANSWERS = max(1, min(8, int(os.getenv("AI_MAX_ANSWERS", "4"))))
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 
 # Codes / words that must never be treated as promo codes.
 _IGNORE_TOKENS = {
@@ -537,6 +605,85 @@ _TG_CLIENT = httpx.AsyncClient(
 
 _REQUEST_SEM = asyncio.Semaphore(REQUEST_CONCURRENCY)
 
+
+class _TokenBucket:
+    """Async token bucket that bounds outbound rate without serialising I/O. Callers ``await acquire()`` immediately before a request. The bucket refills at ``rate`` tokens/second up to ``burst`` tokens, so concurrency is preserved (many in-flight requests) while the *average* request rate stays under the ceiling that makes the upstream throttle us. """
+
+    def __init__(self, rate, burst):
+        self.rate = max(0.1, float(rate))
+        self.capacity = max(1.0, float(burst))
+        self._tokens = self.capacity
+        self._updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.capacity, self._tokens + (now - self._updated) * self.rate
+                )
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate
+            await asyncio.sleep(wait)
+
+    async def backoff(self, seconds):
+        """Drain the bucket so the whole fleet honours a Retry-After window."""
+        seconds = max(0.0, min(float(seconds or 0.0), 30.0))
+        if seconds <= 0:
+            return
+        async with self._lock:
+            self._tokens = -seconds * self.rate
+            self._updated = time.monotonic()
+
+
+_PACERS = {}
+_PACERS_LOCK = threading.Lock()
+
+
+def _pacer_for(scope, rate, burst):
+    """Return a token bucket unique to ``scope`` (created on first use). Keying the bucket by scope -- ``claim:<chat>`` for Chowdeck requests and ``tg:<chat>`` for Telegram sends -- is what keeps users isolated: a chat that fires 19 slot requests, or trips a 429 cooldown, drains only its own bucket and never delays anyone else's traffic. """
+    key = (str(scope), float(rate), int(burst))
+    with _PACERS_LOCK:
+        bucket = _PACERS.get(key)
+        if bucket is None:
+            bucket = _TokenBucket(rate, burst)
+            _PACERS[key] = bucket
+        return bucket
+
+
+# Per-task claim scope, set by the slot worker to its chat id so ``_raw_post``
+# (and the hedged helpers it spawns) know which bucket to draw from.
+_CLAIM_SCOPE = contextvars.ContextVar("claim_scope", default="")
+
+# Optional IP-level guard; disabled unless CLAIM_GLOBAL_RATE > 0.
+_GLOBAL_CLAIM_PACER = (
+    _TokenBucket(CLAIM_GLOBAL_RATE, CLAIM_GLOBAL_RATE_BURST)
+    if CLAIM_GLOBAL_RATE > 0
+    else None
+)
+
+
+def _claim_pacer(scope):
+    return _pacer_for("claim:" + str(scope or "_default"), CLAIM_RATE, CLAIM_RATE_BURST)
+
+
+async def _acquire_claim(scope):
+    """Take one claim token, applying the optional global (IP-level) guard."""
+    if _GLOBAL_CLAIM_PACER is not None:
+        await _GLOBAL_CLAIM_PACER.acquire()
+    await _claim_pacer(scope).acquire()
+
+
+async def _claim_backoff(scope, wait):
+    """Drain this chat's bucket (and the global one) for a Retry-After window."""
+    await _claim_pacer(scope).backoff(wait)
+    if _GLOBAL_CLAIM_PACER is not None:
+        await _GLOBAL_CLAIM_PACER.backoff(wait)
+
 _CHOW_HEADERS_BASE = {
     "Content-Type": "application/json",
     "Origin": "https://chowdeck.com",
@@ -557,10 +704,956 @@ def chow_headers(token):
 
 
 # ---------------------------------------------------------------------------
+# Feature 1 - Chowdeck auth client: phone -> OTP -> bot-owned session token
+# ---------------------------------------------------------------------------
+# Endpoints/payloads mirror the storefront bundle:
+# POST /auth/phone/validate {phone, country_code} -> data.is_valid
+# POST /auth/login {country_code, phone, role} -> sends the OTP
+# POST /auth/login/validate-otp {otp, phone, role} -> data.token (+ id, exp, ...)
+# POST /auth/resend-otp {phone, role, country_code, type} -> sends the OTP again
+# POST /auth/refresh-token {token} -> data.token
+# The validate-otp token is used exactly like a pasted token. It is minted by a
+# *separate* sign-in from the one the user's browser performed, so it is an
+# independent session: refreshing it never touches the web session, and a web
+# login never invalidates it.
+_bg_tasks = set()
+
+
+def spawn_bg(coro):
+    """Run a coroutine as fire-and-forget, keeping a strong task reference. Claim latency is sacred: every optional extra (token refresh, AI lookup) runs here, so it can never sit in front of a claim request. """
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+
+    def _done(t):
+        _bg_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            print(f"[bg] background task failed: {exc}", flush=True)
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _auth_url(path):
+    return f"{CHOW_API_BASE}{path}"
+
+
+async def _auth_post(path, payload, token=None):
+    """POST to the Chowdeck auth API. Returns (response|None, body dict)."""
+    headers = dict(_CHOW_HEADERS_BASE)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        # Auth rides the shared connection pool but its per-request timeout is
+        # the auth one: a sign-in is allowed to be slower than a claim.
+        res = await _CD_CLIENT.post(
+            _auth_url(path), json=payload, headers=headers, timeout=AUTH_TIMEOUT
+        )
+        body = _safe_json(res)
+    except Exception as e:  # noqa: BLE001
+        return None, {"message": str(e)}
+    if LOG_RAW_AUTH:
+        print(f"[auth-raw] {path} -> {res.status_code} {json.dumps(body)[:400]}", flush=True)
+    return res, body
+
+
+def _failure_reason(body):
+    """Best-effort reason string from either {message} or {data:{...}} shapes."""
+    for src in (body or {}, (body or {}).get("data") or {}):
+        if not isinstance(src, dict):
+            continue
+        for key in ("failureReason", "failure_reason", "reason", "code", "error"):
+            val = src.get(key)
+            if val:
+                return str(val)
+    return ""
+
+
+def _normalise_phone(raw, country_code=None):
+    """Return (ISO country_code, national digits) for a user-typed phone number."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    cc = (country_code or CHOW_COUNTRY_CODE).upper()
+    if cc == "NG":
+        if len(digits) == 11 and digits.startswith("0"):
+            digits = digits[1:]
+        elif len(digits) == 13 and digits.startswith("234"):
+            digits = digits[3:]
+    return cc, digits
+
+
+def mask_phone(digits):
+    """Never echo a full phone number back into a chat."""
+    d = str(digits or "")
+    if len(d) <= 4:
+        return d
+    return f"{d[:3]}****{d[-3:]}"
+
+
+# --- login-flow store (one pending phone login per chat) -------------------
+def get_login_flow(chat_str):
+    flow = load_json(LOGIN_FLOW_FILE).get(str(chat_str))
+    if not isinstance(flow, dict):
+        return None
+    if time.time() - float(flow.get("ts") or 0) > OTP_FLOW_TTL:
+        clear_login_flow(chat_str)
+        return None
+    return flow
+
+
+def set_login_flow(chat_str, flow):
+    store = load_json(LOGIN_FLOW_FILE)
+    store[str(chat_str)] = flow
+    save_json(LOGIN_FLOW_FILE, store)
+
+
+def clear_login_flow(chat_str):
+    store = load_json(LOGIN_FLOW_FILE)
+    if str(chat_str) in store:
+        del store[str(chat_str)]
+        save_json(LOGIN_FLOW_FILE, store)
+
+
+# --- token helpers ---------------------------------------------------------
+def token_exp_ts(token):
+    """`exp` claim of a JWT session token, as a unix timestamp (or None)."""
+    try:
+        payload = parse_jwt_payload(token) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    exp = payload.get("exp")
+    try:
+        return float(exp) if exp is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def token_seconds_left(token):
+    exp = token_exp_ts(token)
+    if exp is None:
+        return None
+    return exp - time.time()
+
+
+def human_seconds(seconds):
+    seconds = int(max(0, seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def set_slot_active_state(chat_str, slot_id, value):
+    """Force a slot's enabled/disabled flag (used to lock in a fresh login)."""
+    toggles = load_json(ACCOUNT_TOGGLES_FILE)
+    user_toggles = toggles.setdefault(str(chat_str), {})
+    user_toggles[str(slot_id)] = bool(value)
+    save_json(ACCOUNT_TOGGLES_FILE, toggles)
+    return bool(value)
+
+
+def set_slot_phone(chat_str, slot_id, phone):
+    tokens_db = load_json(TOKENS_FILE)
+    entry = (tokens_db.get(str(chat_str)) or {}).get(str(slot_id))
+    if isinstance(entry, dict) and phone:
+        entry["phone"] = str(phone)[:15]
+        save_json(TOKENS_FILE, tokens_db)
+
+
+def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin="login"):
+    """Write a slot's session token (+ metadata) without touching other slots. `origin` records where the token came from: "login" for a token this bot minted with its own OTP sign-in, "paste" for a token the user copied out of their browser. `CHOW_AUTO_REFRESH=safe` (the default) only ever refreshes bot-owned tokens, so a live browser session can never be rotated away. """
+    tokens_db = load_json(TOKENS_FILE)
+    user_slots = tokens_db.setdefault(str(chat_str), {})
+    entry = user_slots.get(str(slot))
+    if not isinstance(entry, dict):
+        entry = {}
+    entry["token"] = token
+    if cookies is not None:
+        entry["cookies"] = cookies
+    if phone:
+        entry["phone"] = str(phone)[:15]
+    entry["origin"] = origin
+    entry["token_exp"] = token_exp_ts(token)
+    entry["linked_at"] = time.time()
+    user_slots[str(slot)] = entry
+    save_json(TOKENS_FILE, tokens_db)
+    return entry
+
+
+# --- auth API calls --------------------------------------------------------
+async def chow_validate_phone(phone, country_code):
+    """Optional pre-check. Returns True/False, or None when unknown."""
+    res, body = await _auth_post(
+        "/auth/phone/validate", {"phone": phone, "country_code": country_code}
+    )
+    if res is None or res.status_code != 200:
+        return None
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    val = data.get("is_valid")
+    if val is None and isinstance(data.get("data"), dict):
+        val = data["data"].get("is_valid")
+    return bool(val) if val is not None else None
+
+
+async def chow_request_otp(phone, country_code):
+    """Ask Chowdeck to send a sign-in OTP. Returns (ok, message, reason)."""
+    res, body = await _auth_post(
+        "/auth/login",
+        {"country_code": country_code, "phone": phone, "role": CHOW_AUTH_ROLE},
+    )
+    if res is None:
+        return False, "Could not reach Chowdeck. Please try again.", "network"
+    msg = str((body or {}).get("message") or "")
+    reason = _failure_reason(body)
+    if res.status_code in (200, 201):
+        return True, msg or "Verification code sent.", ""
+    return False, msg or f"Request rejected (HTTP {res.status_code}).", reason
+
+
+async def chow_validate_otp(phone, otp):
+    """Submit the OTP. Returns (ok, message, data)."""
+    res, body = await _auth_post(
+        "/auth/login/validate-otp",
+        {"otp": str(otp).strip(), "phone": phone, "role": CHOW_AUTH_ROLE},
+    )
+    if res is None:
+        return False, "Could not reach Chowdeck. Please try again.", {}
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    if res.status_code in (200, 201) and data.get("token"):
+        return True, str((body or {}).get("message") or "Signed in."), data
+    msg = str((body or {}).get("message") or "")
+    return False, msg or f"Code rejected (HTTP {res.status_code}).", data
+
+
+async def chow_resend_otp(phone, country_code, otp_type="sign_in"):
+    res, body = await _auth_post(
+        "/auth/resend-otp",
+        {
+            "phone": phone,
+            "role": CHOW_AUTH_ROLE,
+            "country_code": country_code,
+            "type": otp_type,
+        },
+    )
+    if res is None:
+        return False, "Could not reach Chowdeck. Please try again."
+    if res.status_code in (200, 201):
+        return True, str((body or {}).get("message") or "Code resent.")
+    msg = str((body or {}).get("message") or "")
+    return False, msg or f"Resend rejected (HTTP {res.status_code})."
+
+
+async def chow_refresh_token(token):
+    """Exchange a (possibly expired) session token for a fresh one."""
+    if not token:
+        return None
+    res, body = await _auth_post("/auth/refresh-token", {"token": token})
+    if res is None or res.status_code not in (200, 201):
+        return None
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    new = data.get("token") or (body or {}).get("token")
+    return str(new) if new else None
+
+
+# --- refresh policy + deduplicated background refresh ----------------------
+_refresh_tasks = {}
+_refresh_lock = threading.Lock()
+
+
+def _auto_refresh_mode():
+    mode = (CHOW_AUTO_REFRESH or "safe").lower()
+    if mode in ("0", "false", "no", "off", "never"):
+        return "off"
+    if mode in ("on", "true", "yes", "all", "always"):
+        return "on"
+    return "safe"
+
+
+def _refresh_allowed(entry):
+    """Whether this slot's token may be auto-refreshed under the current mode."""
+    mode = _auto_refresh_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return bool((entry or {}).get("token"))
+    return str((entry or {}).get("origin") or "") == "login"
+
+
+def _token_needs_refresh(entry):
+    if not _refresh_allowed(entry):
+        return False
+    left = token_seconds_left((entry or {}).get("token"))
+    if left is None:
+        return False  # opaque token: nothing to reason about locally
+    return left <= TOKEN_REFRESH_SKEW
+
+
+async def refresh_slot_token(chat_str, slot, entry=None, force=False):
+    """Refresh one slot's token in place. Returns the new token, or None."""
+    chat_str, slot = str(chat_str), str(slot)
+    if entry is None:
+        entry = ((load_json(TOKENS_FILE).get(chat_str) or {}).get(slot)) or {}
+    token = (entry or {}).get("token")
+    if not token or (not force and not _token_needs_refresh(entry)):
+        return token
+    new_token = await chow_refresh_token(token)
+    if not new_token:
+        return None
+    store_slot_token(
+        chat_str, slot, new_token,
+        phone=(entry or {}).get("phone"),
+        origin=(entry or {}).get("origin") or "login",
+    )
+    return new_token
+
+
+async def _refresh_worker(chat_str, slot, entry):
+    key = (str(chat_str), str(slot))
+    try:
+        return await refresh_slot_token(chat_str, slot, entry, force=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[auth] refresh {chat_str}/{slot} failed: {e}", flush=True)
+        return None
+    finally:
+        with _refresh_lock:
+            if _refresh_tasks.get(key) is asyncio.current_task():
+                _refresh_tasks.pop(key, None)
+
+
+def start_token_refresh(chat_str, slot, entry):
+    """Kick off a de-duplicated background refresh for one slot's token."""
+    key = (str(chat_str), str(slot))
+    with _refresh_lock:
+        task = _refresh_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(_refresh_worker(chat_str, slot, entry))
+            _refresh_tasks[key] = task
+    return task
+
+
+# --- health check ----------------------------------------------------------
+async def chow_profile(token, cookies=None):
+    """GET /customer/profile. Returns (status|None, phone, data)."""
+    if not token:
+        return None, None, {}
+    try:
+        res = await _CD_CLIENT.get(
+            f"{CHOW_API_BASE}/customer/profile",
+            headers=chow_headers(token),
+            cookies=cookies or None,
+            timeout=AUTH_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001
+        return None, None, {}
+    body = _safe_json(res)
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    if not isinstance(data, dict):
+        data = {}
+    phone = extract_phone_from_data(data) or extract_phone_from_data(body)
+    return res.status_code, phone, data
+
+
+async def probe_slot_token(chat_str, slot, allow_refresh=True):
+    """Live health of one slot: refresh if needed, then probe the profile."""
+    chat_str, slot = str(chat_str), str(slot)
+    entry = ((load_json(TOKENS_FILE).get(chat_str) or {}).get(slot)) or {}
+    token = (entry or {}).get("token")
+    if not token:
+        return {"slot": slot, "state": "empty", "status": None, "entry": entry}
+    if allow_refresh and _token_needs_refresh(entry):
+        new_token = await refresh_slot_token(chat_str, slot, entry, force=True)
+        if new_token:
+            entry = {**entry, "token": new_token}
+            token = new_token
+    status, phone, _data = await chow_profile(token, (entry or {}).get("cookies"))
+    if status in (401, 403) and allow_refresh and _refresh_allowed(entry):
+        new_token = await refresh_slot_token(chat_str, slot, entry, force=True)
+        if new_token:
+            entry = {**entry, "token": new_token}
+            token = new_token
+            status, phone, _data = await chow_profile(token, (entry or {}).get("cookies"))
+    if phone and str(phone) != str((entry or {}).get("phone") or ""):
+        set_slot_phone(chat_str, slot, phone)
+        entry = {**entry, "phone": str(phone)[:15]}
+    if status == 200:
+        state = "active"
+    elif status in (401, 403):
+        state = "expired"
+    elif status is None:
+        state = "unreachable"
+    else:
+        state = "error"
+    return {
+        "slot": slot, "state": state, "status": status,
+        "phone": phone or (entry or {}).get("phone"), "entry": entry,
+    }
+
+
+async def check_all_slots(chat_str, concurrency=4):
+    """Probe every configured slot (bounded concurrency) for the health view."""
+    chat_str = str(chat_str)
+    max_slots = get_max_slots(chat_str)
+    configured = load_json(TOKENS_FILE).get(chat_str, {}) or {}
+    slot_ids = [str(i) for i in range(1, max_slots + 1)]
+    for sid in configured:
+        if str(sid) not in slot_ids:
+            slot_ids.append(str(sid))
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def one(sid):
+        async with sem:
+            try:
+                return await probe_slot_token(chat_str, sid)
+            except Exception as e:  # noqa: BLE001
+                return {"slot": sid, "state": "error", "status": None,
+                        "entry": {}, "error": str(e)}
+
+    return list(await asyncio.gather(*(one(sid) for sid in slot_ids)))
+
+
+_STATE_ICON = {
+    "active": "🟢", "expired": "🔴", "expiring": "🟡",
+    "empty": "⚫", "unreachable": "🟠", "error": "🟠",
+}
+
+
+def format_accounts_health(results, chat_str=None):
+    """Render the multi-line accounts-health report (one line per slot)."""
+    lines = ["🩺 *Account health check*", ""]
+    active = 0
+    for r in results:
+        state = r.get("state")
+        if state == "active":
+            active += 1
+        icon = _STATE_ICON.get(state, "⚪")
+        phone = r.get("phone") or ((r.get("entry") or {}).get("phone"))
+        label = f"{icon} S{r.get('slot')}"
+        if phone:
+            label += f": `{phone}`"
+        detail = {
+            "active": "active",
+            "expired": "token expired — sign in again with /login",
+            "empty": "empty — link with /login or /settoken",
+            "unreachable": "no response",
+            "error": "unexpected response",
+        }.get(state, state or "unknown")
+        if state == "active":
+            left = token_seconds_left((r.get("entry") or {}).get("token"))
+            if left is not None:
+                detail += f" · {human_seconds(left)} left"
+        if chat_str is not None and state != "empty" and not is_slot_active_state(chat_str, r.get("slot")):
+            detail += " · ⏸️ disabled"
+        lines.append(f"{label} — {detail}")
+    lines.append("")
+    lines.append(f"🟢 active: `{active}` / `{len(results)}` slot(s)")
+    return "\n".join(lines)
+
+
+# --- phone -> OTP login flow ----------------------------------------------
+def _phone_taken_by_other_slot(chat_str, phone, slot):
+    """Return the other slot id already linked to `phone`, else None. One account can only claim a code once, so the same phone must not be linked to two slots of the same user. """
+    tokens_db = load_json(TOKENS_FILE).get(str(chat_str), {}) or {}
+    target = re.sub(r"\D", "", str(phone or ""))
+    for sid, td in tokens_db.items():
+        if str(sid) == str(slot):
+            continue
+        other = re.sub(r"\D", "", str((td or {}).get("phone") or ""))
+        if target and other == target:
+            return str(sid)
+    return None
+
+
+async def start_otp_login(chat_id, chat_str, arg):
+    """`/login <phone>` - request a Chowdeck OTP and arm the code capture."""
+    chat_str = str(chat_str)
+    if not LOGIN_ENABLED:
+        await send_telegram(chat_id, "🔐 Phone login is disabled on this deployment. Use `/settoken`.")
+        return
+    if not arg:
+        await send_telegram(
+            chat_id,
+            "🔐 *Login with phone (OTP)*\n\n"
+            "Usage: `/login <phone>`\n"
+            "Example: `/login 08031234567`\n\n"
+            "The bot signs in on its own (a second session, separate from your "
+            "browser). You then send the code here and the account is linked to "
+            "the active slot.",
+        )
+        return
+    country_code, phone = _normalise_phone(arg)
+    if len(phone) < 7:
+        await send_telegram(chat_id, "⚠️ That phone number does not look valid. Usage: `/login <phone>`")
+        return
+    slot = get_active_slot(chat_str)
+    dup = _phone_taken_by_other_slot(chat_str, phone, slot)
+    if dup:
+        await send_telegram(
+            chat_id,
+            f"⚠️ That phone is already linked to *Slot {dup}*. An account can only "
+            f"claim a code once, so remove it (`/settoken` on that slot) before "
+            f"re-linking it here.",
+        )
+        return
+    # A pre-check is only a courtesy: a false answer must never block a login.
+    plausible = await chow_validate_phone(phone, country_code)
+    if plausible is False:
+        await send_telegram(
+            chat_id,
+            f"⚠️ Chowdeck does not recognise `{mask_phone(phone)}`. Check the "
+            f"number and try `/login <phone>` again.",
+        )
+        return
+    await send_telegram(chat_id, f"📲 Requesting a Chowdeck verification code for `{mask_phone(phone)}`…")
+    ok, message, reason = await chow_request_otp(phone, country_code)
+    if not ok:
+        hint = ""
+        low = f"{message} {reason}".lower()
+        if "exist" in low or "not found" in low or "invalid" in low:
+            hint = "\n\nCheck the number and try again with `/login <phone>`."
+        await send_telegram(chat_id, f"❌ {message}{hint}")
+        return
+    set_login_flow(chat_str, {
+        "phone": phone,
+        "country_code": country_code,
+        "slot": str(slot),
+        "ts": time.time(),
+        "otp_type": "sign_in",
+        "attempts": 0,
+        "resends": 0,
+        "last_resend": time.time(),
+    })
+    await send_telegram(
+        chat_id,
+        f"✅ *Code sent to* `{mask_phone(phone)}`\n\n"
+        f"👉 Send the *code* in this chat to finish signing in (Slot {slot}).\n"
+        f"• `/otp <code>` if you prefer to be explicit\n"
+        f"• `/resendotp` to send a new code\n"
+        f"• `/cancelotp` to abort\n\n"
+        f"_While this login is open, a bare 4- or 6-digit message is treated as the code._",
+    )
+
+
+async def complete_otp_login(chat_id, chat_str, code, flow):
+    """Submit the OTP, link the resulting token, and enable (lock in) the slot."""
+    chat_str = str(chat_str)
+    flow = dict(flow or {})
+    phone = flow.get("phone")
+    slot = str(flow.get("slot") or get_active_slot(chat_str))
+    ok, message, data = await chow_validate_otp(phone, code)
+    if not ok:
+        flow["attempts"] = int(flow.get("attempts") or 0) + 1
+        if flow["attempts"] >= 5:
+            clear_login_flow(chat_str)
+            await send_telegram(
+                chat_id,
+                f"❌ {message}\n\nToo many attempts — login cancelled. "
+                f"Start again with `/login <phone>`.",
+            )
+            return False
+        flow["ts"] = time.time()
+        set_login_flow(chat_str, flow)
+        await send_telegram(
+            chat_id,
+            f"❌ {message}\n\nTry again (attempt {flow['attempts']}/5), "
+            f"`/resendotp`, or `/cancelotp`.",
+        )
+        return False
+    token = str(data.get("token"))
+    linked_phone = data.get("phone") or phone
+    store_slot_token(chat_str, slot, token, phone=linked_phone, origin="login")
+    set_slot_active_state(chat_str, slot, True)
+    set_active_slot(chat_str, slot)
+    clear_login_flow(chat_str)
+
+    left = token_seconds_left(token)
+    name_bits = [str(data.get(k) or "").strip() for k in ("first_name", "last_name")]
+    name = " ".join(b for b in name_bits if b)
+    masked = mask_phone(re.sub(r"\D", "", str(linked_phone or "")))
+    expiry_txt = f"\n• Token valid for: `{human_seconds(left)}`" if left is not None else ""
+    refresh_txt = (
+        "\n• Auto-refresh: `ON` (bot-owned session)"
+        if _refresh_allowed({"origin": "login", "token": token})
+        else "\n• Auto-refresh: `OFF` (set `CHOW_AUTO_REFRESH=safe` or `on`)"
+    )
+    await send_telegram(
+        chat_id,
+        f"🔓 *Account locked in — Slot {slot}*\n\n"
+        f"• Phone: `{masked}`"
+        + (f"\n• Name: {name}" if name else "")
+        + expiry_txt + refresh_txt +
+        "\n\nThis is the bot's *own* session. Your browser session (if any) is "
+        "untouched, and vice-versa. The slot is now ✅ enabled and will claim "
+        "codes immediately.",
+    )
+    return True
+
+
+async def resend_login_otp(chat_id, chat_str):
+    flow = get_login_flow(chat_str)
+    if not flow:
+        await send_telegram(chat_id, "ℹ️ No login is waiting for a code. Start one with `/login <phone>`.")
+        return
+    now = time.time()
+    wait = OTP_RESEND_COOLDOWN - (now - float(flow.get("last_resend") or 0))
+    if wait > 0:
+        await send_telegram(chat_id, f"⏳ Please wait `{int(wait) + 1}s` before requesting another code.")
+        return
+    ok, message = await chow_resend_otp(
+        flow.get("phone"), flow.get("country_code"), flow.get("otp_type") or "sign_in"
+    )
+    if not ok:
+        await send_telegram(chat_id, f"❌ {message}")
+        return
+    flow["resends"] = int(flow.get("resends") or 0) + 1
+    flow["last_resend"] = now
+    flow["ts"] = now
+    set_login_flow(chat_str, flow)
+    await send_telegram(
+        chat_id,
+        f"✅ New code sent to `{mask_phone(flow.get('phone'))}`. Send the code here.",
+    )
+
+
+def looks_like_otp(text):
+    """A bare 4- or 6-digit message: the shapes a Chowdeck OTP can take."""
+    return bool(re.fullmatch(r"\d{4}|\d{6}", str(text or "").strip()))
+
+
+async def maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
+    """Feature 1: a bare code completes an open OTP login. Only fires while THIS chat has a login awaiting a code, and never for a message that is a direct reply to a security-question prompt (that is an answer, not an OTP). Returns True when the message was consumed. """
+    if not LOGIN_ENABLED:
+        return False
+    flow = get_login_flow(chat_str)
+    if not flow:
+        return False
+    if not looks_like_otp(text):
+        return False
+    answering = (
+        reply_to is not None
+        and any((e or {}).get("msg_id") == reply_to for e in (pending or []))
+    )
+    if answering:
+        return False
+    await complete_otp_login(chat_id, chat_str, str(text).strip(), flow)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Feature 2 - AI security-answer assist (real-time web search)
+# ---------------------------------------------------------------------------
+# The claim path is untouched. When a slot reports a security question the
+# existing prompt is sent immediately and this lookup is spawned in the
+# BACKGROUND: its answer is only ever a suggestion, so a slow or failing AI can
+# never delay a claim, and the user still decides what gets submitted.
+_AI_MODELS = {
+    "perplexity": "sonar",
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.0-flash",
+}
+
+_AI_CLIENT = httpx.AsyncClient(
+    timeout=httpx.Timeout(AI_TIMEOUT, connect=8.0),
+    proxy=PROXY_URL,
+    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+)
+
+_AI_PROMPT = (
+    "You answer Chowdeck promo-code security questions. Chowdeck is a Nigerian "
+    "food-delivery app; its security questions are short factual questions about "
+    "Chowdeck itself, its vendors or partners, Nigerian and world events, sports "
+    "clubs, or popular culture. Search the web and put the single most likely "
+    "answer first.\n"
+    "Reply with up to {n} candidate answers, one per line, most likely first. "
+    "Each answer must be under 40 characters, with no numbering, no bullets, no "
+    "explanation, no full sentences and no quotes.\n\n"
+    "Question: {question}"
+)
+
+
+def _ai_enabled():
+    """`AI_ASSIST_ENABLED=auto` means: on as soon as any provider key exists."""
+    if AI_ASSIST_ENABLED in ("0", "false", "no", "off", "never"):
+        return False
+    if AI_ASSIST_ENABLED in ("1", "true", "yes", "on", "always"):
+        return True
+    return bool(PERPLEXITY_API_KEY or OPENAI_API_KEY or GEMINI_API_KEY or TAVILY_API_KEY)
+
+
+def _ai_provider_order():
+    """Providers to try, best-first. `AI_PROVIDER` pins the preferred one."""
+    available = []
+    if PERPLEXITY_API_KEY:
+        available.append("perplexity")
+    if OPENAI_API_KEY:
+        available.append("openai")
+    if GEMINI_API_KEY:
+        available.append("gemini")
+    if TAVILY_API_KEY:
+        available.append("tavily")
+    if AI_PROVIDER and AI_PROVIDER in available:
+        available.remove(AI_PROVIDER)
+        available.insert(0, AI_PROVIDER)
+    return available
+
+
+def _parse_ai_answers(text, limit=None):
+    """Turn a line-per-answer model reply into a clean, de-duplicated list."""
+    limit = int(limit or AI_MAX_ANSWERS)
+    out, seen = [], set()
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", line).strip()
+        line = line.strip("'\"`*_ ").replace("`", "'").strip()
+        if not line or len(line) > 60:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line[:40])
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _ai_perplexity(question):
+    model = AI_MODEL or _AI_MODELS["perplexity"]
+    res = await _AI_CLIENT.post(
+        "https://api.perplexity.ai/chat/completions",
+        headers={
+            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "temperature": 0.2,
+            "messages": [{
+                "role": "user",
+                "content": _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question),
+            }],
+        },
+    )
+    if res.status_code != 200:
+        return []
+    choices = res.json().get("choices") or []
+    if not choices:
+        return []
+    return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
+
+
+async def _ai_openai(question):
+    model = AI_MODEL or _AI_MODELS["openai"]
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
+    # Preferred: the Responses API with the built-in web-search tool (live web).
+    try:
+        res = await _AI_CLIENT.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json={
+                "model": model,
+                "tools": [{"type": "web_search_preview"}],
+                "input": prompt,
+            },
+        )
+        if res.status_code == 200:
+            body = res.json()
+            text = body.get("output_text")
+            if not text:
+                chunks = []
+                for item in body.get("output") or []:
+                    for part in (item or {}).get("content") or []:
+                        if isinstance(part, dict) and part.get("text"):
+                            chunks.append(str(part["text"]))
+                text = "\n".join(chunks)
+            answers = _parse_ai_answers(text)
+            if answers:
+                return answers
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] openai responses error: {e}", flush=True)
+    # Fallback: classic chat completions (model knowledge, still useful).
+    try:
+        res = await _AI_CLIENT.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": model,
+                "temperature": 0.2,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        if res.status_code == 200:
+            choices = res.json().get("choices") or []
+            if choices:
+                return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] openai chat error: {e}", flush=True)
+    return []
+
+
+async def _ai_gemini(question):
+    model = AI_MODEL or _AI_MODELS["gemini"]
+    res = await _AI_CLIENT.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent",
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "contents": [{
+                "parts": [{
+                    "text": _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question),
+                }],
+            }],
+            "tools": [{"google_search": {}}],
+        },
+    )
+    if res.status_code != 200:
+        return []
+    chunks = []
+    for cand in res.json().get("candidates") or []:
+        for part in ((cand or {}).get("content") or {}).get("parts") or []:
+            if isinstance(part, dict) and part.get("text"):
+                chunks.append(str(part["text"]))
+    return _parse_ai_answers("\n".join(chunks))
+
+
+async def _ai_tavily(question):
+    """Tavily is a search API: its `answer` field is the grounded suggestion."""
+    res = await _AI_CLIENT.post(
+        "https://api.tavily.com/search",
+        headers={"Content-Type": "application/json"},
+        json={
+            "api_key": TAVILY_API_KEY,
+            "query": question,
+            "search_depth": "basic",
+            "include_answer": True,
+            "max_results": 5,
+        },
+    )
+    if res.status_code != 200:
+        return []
+    body = res.json()
+    lines = []
+    if body.get("answer"):
+        lines.append(str(body["answer"]).strip())
+    for item in body.get("results") or []:
+        title = str((item or {}).get("title") or "").strip()
+        if title:
+            lines.append(title)
+    return _parse_ai_answers("\n".join(lines))
+
+
+_AI_PROVIDER_FUNCS = {
+    "perplexity": _ai_perplexity,
+    "openai": _ai_openai,
+    "gemini": _ai_gemini,
+    "tavily": _ai_tavily,
+}
+
+_AI_PROVIDER_LABELS = {
+    "perplexity": "Perplexity",
+    "openai": "OpenAI",
+    "gemini": "Gemini",
+    "tavily": "Tavily",
+}
+
+
+async def ai_answer_candidates(question):
+    """Return (provider, [candidate answers]) from the first working provider."""
+    question = str(question or "").strip()
+    if not question or not _ai_enabled():
+        return None, []
+    for name in _ai_provider_order():
+        func = _AI_PROVIDER_FUNCS.get(name)
+        if func is None:
+            continue
+        try:
+            answers = await func(question)
+        except Exception as e:  # noqa: BLE001
+            print(f"[ai] {name} failed: {e}", flush=True)
+            answers = []
+        if answers:
+            return name, answers
+    return None, []
+
+
+def set_pending_ai(chat_str, code, provider, answers):
+    """Attach AI suggestions to the live prompt for `code` (no-op if gone)."""
+    store = load_json(PENDING_PROMPT_FILE)
+    bucket = list(store.get(str(chat_str), []))
+    changed = False
+    for entry in bucket:
+        if isinstance(entry, dict) and entry.get("code") == code:
+            entry["ai"] = {
+                "provider": provider,
+                "answers": list(answers),
+                "ts": time.time(),
+            }
+            changed = True
+    if changed:
+        store[str(chat_str)] = bucket
+        save_json(PENDING_PROMPT_FILE, store)
+
+
+def ai_answer_keyboard(code, answers, submitted=None):
+    """One tap = submit that suggestion. `submitted` marks the chosen one."""
+    rows = []
+    for idx, answer in enumerate(answers):
+        prefix = "✅" if submitted is not None and idx == submitted else "💡"
+        rows.append([{
+            "text": f"{prefix} {answer}"[:60],
+            "callback_data": f"aians_{idx}_{code}",
+        }])
+    return {"inline_keyboard": rows} if rows else None
+
+
+async def assist_security_question(chat_id, chat_str, code, question):
+    """Background AI lookup for a live security question (never blocks a claim)."""
+    if not _ai_enabled():
+        return
+    try:
+        provider, answers = await asyncio.wait_for(
+            ai_answer_candidates(question), timeout=AI_TIMEOUT + 5.0
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] assist failed: {e}", flush=True)
+        return
+    if not answers:
+        return
+    set_pending_ai(chat_str, code, provider, answers)
+    label = _AI_PROVIDER_LABELS.get(provider, provider)
+    lines = [f"🤖 *AI answer assist* (via {label})", ""]
+    lines.append(f"Question: \"{question}\"")
+    lines.append("")
+    lines.append("Likely answers — *tap one* to submit it instantly:")
+    for idx, answer in enumerate(answers, 1):
+        lines.append(f"{idx}. `{answer}`")
+    lines.append("")
+    lines.append(
+        "_The AI is only a suggestion — type a different answer yourself at any "
+        "time and it will be submitted instead._"
+    )
+    await send_telegram(
+        chat_id, "\n".join(lines), reply_markup=ai_answer_keyboard(code, answers)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
 async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown"):
-    """Send a message. Retries once without parse_mode on formatting errors."""
+    """Send a message, paced through a shared token bucket. A multi-slot claim emits many reports in quick succession. Without pacing that burst trips Telegram flood control (HTTP 429) and messages are dropped silently. Here every send first takes a token, and a 429 is honoured using Telegram's ``retry_after`` before retrying, so no report is lost. Formatting errors still retry once with ``parse_mode`` removed. """
     if not chat_id or not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -569,18 +1662,31 @@ async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown")
         payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    for attempt in range(2):
+    tg_pacer = _pacer_for("tg:" + str(chat_id), TG_RATE, TG_RATE_BURST)
+    for attempt in range(3):
+        await tg_pacer.acquire()
         try:
             res = await _TG_CLIENT.post(url, json=payload)
             if res.status_code == 200:
                 return res.json().get("result", {}).get("message_id")
+            if res.status_code == 429:
+                wait = 1.0
+                try:
+                    wait = float(res.json().get("parameters", {}).get("retry_after", 1.0))
+                except Exception:  # noqa: BLE001
+                    pass
+                if attempt < 2:
+                    await asyncio.sleep(min(wait, 5.0) + 0.05)
+                    continue
+                print(f"[tg] flood control 429 persisting for {chat_id}", flush=True)
+                return None
             body = res.text.lower()
             if attempt == 0 and ("parse" in body or "entit" in body):
                 payload.pop("parse_mode", None)
                 continue
             return None
         except Exception as e:  # noqa: BLE001
-            if attempt == 0:
+            if attempt < 2:
                 continue
             print(f"[tg] send error to {chat_id}: {e}", flush=True)
             return None
@@ -701,6 +1807,10 @@ def build_control_keyboard(chat_str, is_admin):
             {"text": "💰 Portfolio", "callback_data": "btn_portfolio"},
         ],
         [
+            {"text": "🩺 Accounts Health", "callback_data": "btn_health"},
+            {"text": "🔐 Login (OTP)", "callback_data": "btn_login_help"},
+        ],
+        [
             {"text": "🔄 Refresh", "callback_data": "btn_status"},
             {"text": "📖 Guide / Help", "callback_data": "btn_guide"},
         ],
@@ -780,9 +1890,44 @@ def _safe_json(res):
         return {}
 
 
+def _retry_after_seconds(res, default=1.0):
+    """Parse a Retry-After header (delta-seconds or HTTP-date); else `default`."""
+    if res is None:
+        return default
+    raw = res.headers.get("Retry-After") or res.headers.get("retry-after")
+    if not raw:
+        return default
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+        if when is not None:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=datetime.timezone.utc)
+            delta = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            return max(0.0, delta)
+    except Exception:  # noqa: BLE001
+        pass
+    return default
+
+
 async def _raw_post(client, url, payload, headers, cookies):
+    # Paced before it leaves the process, per chat: this request draws only on
+    # its own chat's bucket so another user's fanout cannot slow it down.
+    await _acquire_claim(_CLAIM_SCOPE.get())
     async with _REQUEST_SEM:
         res = await client.post(url, json=payload, headers=headers, cookies=cookies or None)
+        if LOG_RAW_CLAIM:
+            try:
+                print(
+                    f"[claim-raw] {res.status_code} {url} -> {res.text[:500]}",
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return res, _safe_json(res)
 
 
@@ -837,10 +1982,14 @@ async def _apply_cart(client, headers, cookies, cart_info, code):
         return f"\nCart apply error: `{e}`"
 
 
-async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, lockouts_db, specific_answer=None, deadline=None):
+async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, lockouts_db, specific_answer=None, deadline=None, start_delay=0.0):
     """Claim `code` for one slot using burst/hedged requests. With no `specific_answer` the first request probes with an empty answer so the API reveals the security question (prompt mode). With a `specific_answer` the answer is submitted immediately. """
     chat_str = str(chat_id)
     slot_key = str(slot_id)
+
+    # Bind this task's claim requests to this chat's pacer for the whole fanout
+    # (slots and hedged sub-tasks inherit it when their tasks are created).
+    _CLAIM_SCOPE.set(chat_str)
 
     if not is_slot_active_state(chat_str, slot_key):
         return {"slot": slot_key, "status": 0, "response": {"message": "skipped (inactive)"}}
@@ -848,6 +1997,13 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     token = (token_data or {}).get("token")
     if not token:
         return {"slot": slot_key, "status": 0, "response": {"message": "skipped (no token)"}}
+
+    # Feature 1: if this slot's token is at or near expiry, refresh it in the
+    # BACKGROUND. The claim below still fires immediately with the current
+    # token, so a refresh can never add latency to a claim - it only means the
+    # next claim runs on a fresh token.
+    if _token_needs_refresh(token_data):
+        start_token_refresh(chat_str, slot_key, token_data)
 
     lockout_key = f"{chat_str}_{slot_key}"
     if not specific_answer and time.time() < lockouts_db.get(lockout_key, 0):
@@ -865,7 +2021,13 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     if deadline is None:
         deadline = time.time() + CLAIM_WINDOW_SECONDS
 
+    if start_delay and start_delay > 0:
+        # Stagger the fleet so N slots do not all hit Chowdeck on the same tick.
+        await asyncio.sleep(start_delay)
+
     last_res, last_json = None, {}
+    rate_limited = False
+    refreshed = False
     for attempt in range(CLAIM_MAX_ATTEMPTS):
         if time.time() >= deadline:
             break
@@ -878,9 +2040,29 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             last_res, last_json = res, body
             if res.status_code in (200, 201):
                 break
+            if res.status_code in (401, 403) and not refreshed and _refresh_allowed(token_data):
+                # Reactive refresh: the token was rejected as unauthenticated.
+                # Mint a replacement and retry this slot once, in place.
+                refreshed = True
+                new_token = await refresh_slot_token(chat_str, slot_key, token_data, force=True)
+                if new_token:
+                    token = new_token
+                    token_data = {**token_data, "token": new_token}
+                    headers = chow_headers(token)
+                    continue
             msg = str(body.get("message", "")).lower()
             data_obj = body.get("data", {}) if isinstance(body.get("data"), dict) else {}
             sub_code = str(data_obj.get("code", ""))
+            if res.status_code == 429:
+                rate_limited = True
+                wait = _retry_after_seconds(res)
+                # Only this chat honours the cooldown; other users keep their
+                # own pace (the optional global guard covers IP-wide limits).
+                await _claim_backoff(_CLAIM_SCOPE.get(), wait)
+                if wait >= 1.5:
+                    # Upstream asked for a real cooldown; retrying inside this
+                    # short claim window only deepens the throttle. Stop cleanly.
+                    break
             congested = (
                 res.status_code in (429, 500, 502, 503, 504)
                 or sub_code == "claim_busy"
@@ -937,6 +2119,7 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
         "response": last_json,
         "cart_str": cart_suffix,
         "needs_prompt": False,
+        "rate_limited": rate_limited,
     }
 
 
@@ -1103,7 +2286,7 @@ def _safe_resp_text(resp_data):
 
 
 async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mirror=False, ack_text=None, specific_answer=None, notify_empty=False, rearm_hint=None):
-    """Fire `code` at every enabled slot and stream old-repo style messages. Each slot is reported on its own line so a slow, expired, inactive or congested slot can never hide another slot's result: * ``status == 0`` (inactive / expired / no token) is skipped silently and never blocks or hooks the rest of the claim. * a security question is surfaced immediately, grouped across every slot that asked for it, with a single paste-in-chat answer flow. * 500 / "high demand" congestion is reported gracefully after the burst retries complete instead of surfacing as a bare error. Returns ``{"ok": bool, "prompted": bool, "results": [...]}``. """
+    """Fire `code` at every enabled slot and stream old-repo style messages. Each slot is reported on its own line so a slow, expired, inactive or congested slot can never hide another slot's result: * ``status == 0`` (inactive / expired / no token) is skipped silently and never blocks or hooks the rest of the claim. * a security question is surfaced immediately, grouped across every slot that asked for it, with a single paste-in-chat answer flow. * 500 / "high demand" congestion is collapsed into a single aggregated message after the burst retries complete, instead of one identical message per slot (which used to trip Telegram flood control). * The real response body is never masked: enable LOG_RAW_CLAIM to dump it. Returns ``{"ok": bool, "prompted": bool, "results": [...]}``. """
     chat_str = str(chat_str)
     chat_id = _to_int(chat_str)
     if chat_id is None:
@@ -1135,13 +2318,16 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
     tasks = [
         asyncio.create_task(
             claim_slot_worker(_CD_CLIENT, chat_id, sid, td, code, carts_db,
-                              lockouts_db, specific_answer, deadline)
+                              lockouts_db, specific_answer, deadline,
+                              start_delay=idx * SLOT_STAGGER_SECONDS)
         )
-        for sid, td in pending
+        for idx, (sid, td) in enumerate(pending)
     ]
 
     collected = []
     prompt_slots = []
+    congested_slots = []
+    auth_failed_slots = []
     question = None
     state = {"sent": False}
 
@@ -1165,6 +2351,10 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
             "ts": time.time(),
             "msg_id": msg_id,
         })
+        # Feature 2: fire the AI lookup *after* the question is already on the
+        # user's screen, in the background, so it can never delay the claim.
+        if _ai_enabled() and question:
+            spawn_bg(assist_security_question(chat_id, chat_str, code, str(question)))
 
     for fut in asyncio.as_completed(tasks):
         try:
@@ -1192,19 +2382,43 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
         resp_data = res.get("response", {})
         msg_lower = str(resp_data.get("message", "")).lower() if isinstance(resp_data, dict) else ""
         cart_suffix = res.get("cart_str", "")
+        if status in (401, 403):
+            # Token rejected as unauthenticated: report once, aggregated, and
+            # point the user at the phone-login path instead of per-slot noise.
+            auth_failed_slots.append(str(slot))
+            continue
         if status in (429, 500, 502, 503, 504) or "high demand" in msg_lower:
-            summary_msg = (
-                f"{head}⚠️ *{label}:* `{code}` (Slot {slot})\n"
-                f"Status: `{status} (Server congested)`\n"
-                f"💡 *Note:* Chowdeck throttled this claim — burst retries completed!"
-            )
-        else:
-            summary_msg = (
-                f"{head}🎯 *{label}:* `{code}` (Slot {slot})\n"
-                f"Status: `{status}`\n"
-                f"Response: `{_safe_resp_text(resp_data)}`{cart_suffix}"
-            )
+            # Collapse every congested slot into a single report: N identical
+            # "server congested" messages only add Telegram flood-control
+            # pressure and bury the slots that returned a real verdict.
+            congested_slots.append(str(slot))
+            continue
+        summary_msg = (
+            f"{head}🎯 *{label}:* `{code}` (Slot {slot})\n"
+            f"Status: `{status}`\n"
+            f"Response: `{_safe_resp_text(resp_data)}`{cart_suffix}"
+        )
         await send_telegram(chat_id, summary_msg)
+
+    if congested_slots:
+        slot_range_str = format_slot_range(congested_slots)
+        await send_telegram(
+            chat_id,
+            f"{head}⚠️ *{label}:* `{code}` — congested: {slot_range_str}\n"
+            f"Status: `429/5xx (Server congested)`\n"
+            f"💡 Chowdeck throttled those slots; burst retries already completed. "
+            f"Any slot that claimed successfully is reported above.",
+        )
+
+    if auth_failed_slots:
+        slot_range_str = format_slot_range(auth_failed_slots)
+        await send_telegram(
+            chat_id,
+            f"{head}🔑 *{label}:* `{code}` — not signed in: {slot_range_str}\n"
+            f"💡 Those slots need a fresh session. Sign in with `/login <phone>` "
+            f"(bot-owned token, auto-refreshed) or paste a new token with "
+            f"`/settoken`.",
+        )
 
     # A slow slot may have been the one holding the question: never leave it unshown.
     if prompt_slots and not state["sent"]:
@@ -1352,6 +2566,49 @@ async def handle_answer(chat_str, answer_text, pending_entry):
         )
 
 
+async def handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action):
+    """Feature 2: the user tapped an AI suggestion - submit it as the answer. `action` is `aians_<idx>_<code>`. A suggestion is only ever a shortcut for typing the same text, so it is funnelled through the exact same handle_answer() path the typed flow uses. The question must still be live (same code) or the tap is ignored, so a stale button can never fire a claim against a question the user is not looking at. """
+    chat_str = str(chat_str)
+    parts = action.split("_", 2)
+    if len(parts) < 3:
+        await answer_callback_query(cq_id, "That suggestion expired.")
+        return
+    try:
+        idx = int(parts[1])
+    except (TypeError, ValueError):
+        await answer_callback_query(cq_id, "That suggestion expired.")
+        return
+    code = parts[2]
+
+    entry = next(
+        (e for e in list_pending(chat_str) if (e or {}).get("code") == code),
+        None,
+    )
+    answers = list(((entry or {}).get("ai") or {}).get("answers") or [])
+    if not entry or idx < 0 or idx >= len(answers):
+        await answer_callback_query(cq_id, "That question is no longer open.")
+        return
+    answer = str(answers[idx]).strip()
+    if not answer:
+        await answer_callback_query(cq_id, "Empty suggestion.")
+        return
+
+    # Consume the prompt exactly like a typed answer does, then fire it.
+    entry = pop_pending(chat_str, code=code) or entry
+    await answer_callback_query(cq_id, f"Submitting: {answer[:40]}")
+    try:
+        await edit_message_text(
+            chat_id, msg_id,
+            f"🤖 *AI answer assist*\n\n"
+            f"Question: \"{entry.get('question', '')}\"\n\n"
+            f"✅ Submitting: `{answer}`",
+            reply_markup=ai_answer_keyboard(code, answers, submitted=idx),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    await handle_answer(chat_str, answer, entry)
+
+
 async def worker():
     while True:
         try:
@@ -1496,7 +2753,9 @@ def menu_text(chat_str):
         f"• Active Slot: `Slot {get_active_slot(chat_str)}`\n"
         f"• Configured Slots: `{len(tokens_db)} / {max_slots}`\n"
         f"• Enabled Slots: `{enabled}`\n"
-        f"• Mode: `PROMPT` — you supply the security answer on demand\n\n"
+        f"• Mode: `PROMPT` — you supply the security answer on demand\n"
+        f"• Phone login: `{'ON' if LOGIN_ENABLED else 'OFF'}` · "
+        f"AI assist: `{'ON' if _ai_enabled() else 'OFF'}`\n\n"
         "Pick an option below."
     )
 
@@ -1516,7 +2775,37 @@ GUIDE_TEXT = (
     "• `/cancel` — drop open questions\n"
     "• `/announce on|off` — toggle channel code broadcasts (admin)\n"
     "• `/portfolio` — your claim history\n"
-    "• `/setcart <cart_id> [vendor_id]` — auto-apply won codes to a cart"
+    "• `/setcart <cart_id> [vendor_id]` — auto-apply won codes to a cart\n"
+    "• `/accounts` — 🩺 live health of every slot (active / expired / empty)\n"
+    "• `/refresh` — force a token refresh now\n\n"
+    "*🔐 Sign in with a phone number (no more copy-pasting tokens)*\n"
+    "• `/login <phone>` — the bot requests a Chowdeck code for that number\n"
+    "• send the code back in the chat (or `/otp <code>`) — the bot signs in on "
+    "its own and links the token to the active slot, which is then ✅ enabled\n"
+    "• `/resendotp` — send a new code · `/cancelotp` — abort\n"
+    "• The session is the bot's own, so it never disturbs a login on your "
+    "browser, and it is refreshed automatically in the background.\n\n"
+    "*🤖 AI answer assist (real-time web search)*\n"
+    "• When a claim hits a security question, likely answers arrive in seconds "
+    "with *tap-to-submit* buttons (Perplexity / OpenAI / Gemini / Tavily).\n"
+    "• `/ai <question>` — look one up on demand\n"
+    "• It is only a suggestion: type your own answer any time and that is what "
+    "gets submitted."
+)
+
+LOGIN_HELP_TEXT = (
+    "🔐 *Sign in with a phone number*\n\n"
+    "1️⃣ Send `/login <phone>` (e.g. `/login 08031234567`).\n"
+    "2️⃣ Chowdeck texts you a code for the *active slot*.\n"
+    "3️⃣ Send that code here (a bare 4- or 6-digit message is enough, or "
+    "`/otp <code>`).\n"
+    "4️⃣ The account is linked, the slot is ✅ enabled, and the token is "
+    "refreshed automatically.\n\n"
+    "*Why this is safe*: the bot performs its *own* sign-in, exactly like a "
+    "second phone. You get an independent session token, so your browser login "
+    "is never disturbed and a browser login never kicks the bot out.\n\n"
+    "• `/resendotp` — new code · `/cancelotp` — abort\n"
+    "• `/accounts` — check which linked accounts are still active"
 )
 
 
@@ -1643,6 +2932,75 @@ async def handle_command(chat_id, chat_str, text, is_admin):
         await send_telegram(chat_id, "🔄 Reading profiles…")
         updated = await refresh_all_phones(chat_str)
         await send_telegram(chat_id, f"✅ Refreshed `{updated}` slot phone(s).")
+    elif cmd in ("/login", "/loginotp"):
+        await start_otp_login(chat_id, chat_str, arg)
+    elif cmd == "/otp":
+        if not arg:
+            await send_telegram(chat_id, "⚠️ Usage: `/otp <code>`")
+            return
+        flow = get_login_flow(chat_str)
+        if not flow:
+            await send_telegram(chat_id, "ℹ️ No login is waiting for a code. Start one with `/login <phone>`.")
+            return
+        await complete_otp_login(chat_id, chat_str, arg.strip(), flow)
+    elif cmd == "/resendotp":
+        await resend_login_otp(chat_id, chat_str)
+    elif cmd == "/cancelotp":
+        clear_login_flow(chat_str)
+        await send_telegram(chat_id, "🗑️ Login cancelled. Nothing was linked.")
+    elif cmd in ("/accounts", "/health"):
+        await send_telegram(chat_id, "🩺 Checking every slot against Chowdeck…")
+        results = await check_all_slots(chat_str)
+        await send_telegram(chat_id, format_accounts_health(results, chat_str))
+    elif cmd == "/refresh":
+        tokens_db = load_json(TOKENS_FILE)
+        user_slots = tokens_db.get(chat_str, {}) or {}
+        refreshed, failed, skipped = 0, 0, 0
+        for sid, td in list(user_slots.items()):
+            if not (td or {}).get("token"):
+                continue
+            if not _refresh_allowed(td):
+                skipped += 1
+                continue
+            new_token = await refresh_slot_token(chat_str, sid, td, force=True)
+            if new_token:
+                refreshed += 1
+            else:
+                failed += 1
+        note = ""
+        if skipped and not refreshed:
+            note = (
+                "\nℹ️ `CHOW_AUTO_REFRESH=safe` only refreshes tokens minted by "
+                "`/login`. Use `/login <phone>` for hands-free sessions."
+            )
+        tail = f" `{failed}` could not be refreshed." if failed else ""
+        await send_telegram(chat_id, f"🔄 Refreshed `{refreshed}` slot token(s).{tail}{note}")
+    elif cmd in ("/ai", "/ask"):
+        if not _ai_enabled():
+            await send_telegram(
+                chat_id,
+                "🤖 AI assist is off. Add a `PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
+                "`GEMINI_API_KEY` or `TAVILY_API_KEY` to enable it.",
+            )
+            return
+        if not arg:
+            await send_telegram(
+                chat_id,
+                "🤖 *AI answer assist is ON*\n\n"
+                "• `/ai <question>` — look up a security question right now\n"
+                "• It also runs automatically the moment a claim hits a security "
+                "question: the likely answers arrive with tap-to-submit buttons.",
+            )
+            return
+        await send_telegram(chat_id, "🔎 Searching the web…")
+        provider, answers = await ai_answer_candidates(arg)
+        if not answers:
+            await send_telegram(chat_id, "🤖 No suggestion came back. Answer manually as usual.")
+            return
+        label = _AI_PROVIDER_LABELS.get(provider, provider)
+        lines = [f"🤖 *AI suggestions* (via {label})", ""]
+        lines += [f"{i}. `{a}`" for i, a in enumerate(answers, 1)]
+        await send_telegram(chat_id, "\n".join(lines))
     elif cmd == "/setcart":
         if not arg:
             await send_telegram(chat_id, "⚠️ Usage: `/setcart <cart_id> [vendor_id]`")
@@ -1789,7 +3147,9 @@ async def handle_callback(update, tg_client):
         await answer_callback_query(cq_id, "Access denied: invite code required.")
         return
 
-    if action.startswith("slot_"):
+    if action.startswith("aians_"):
+        await handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action)
+    elif action.startswith("slot_"):
         slot_num = action.split("_", 1)[1]
         set_active_slot(chat_str, slot_num)
         await answer_callback_query(cq_id, f"Slot {slot_num} active")
@@ -1825,6 +3185,14 @@ async def handle_callback(update, tg_client):
     elif action == "btn_guide":
         await answer_callback_query(cq_id, "Guide")
         await send_telegram(chat_id, GUIDE_TEXT)
+    elif action == "btn_health":
+        await answer_callback_query(cq_id, "Checking slots…")
+        await send_telegram(chat_id, "🩺 Checking every slot against Chowdeck…")
+        results = await check_all_slots(chat_str)
+        await send_telegram(chat_id, format_accounts_health(results, chat_str))
+    elif action == "btn_login_help":
+        await answer_callback_query(cq_id, "Phone login")
+        await send_telegram(chat_id, LOGIN_HELP_TEXT)
     elif action == "btn_main_menu":
         await answer_callback_query(cq_id, "Main menu")
         await edit_message_text(chat_id, msg_id, menu_text(chat_str),
@@ -1958,6 +3326,11 @@ async def handle_text_update(update):
     pending = list_pending(chat_str)
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
 
+    # Feature 1: while an OTP login is open, a bare 4/6-digit message completes
+    # the sign-in. A reply to a security-question prompt is an answer, not an OTP.
+    if await maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
+        return
+
     if pending:
         if reply_to is not None and any(e.get("msg_id") == reply_to for e in pending):
             entry = pop_pending(chat_str, reply_to=reply_to)
@@ -2075,10 +3448,14 @@ async def main():
     finally:
         for w in workers:
             w.cancel()
+        # Background helpers (token refresh, AI lookups) are ours to stop.
+        for task in list(_bg_tasks) + list(_refresh_tasks.values()):
+            task.cancel()
         flush_store()
         try:
             await _CD_CLIENT.aclose()
             await _TG_CLIENT.aclose()
+            await _AI_CLIENT.aclose()
         except Exception:
             pass
 
