@@ -192,10 +192,20 @@ AI_MAX_ANSWERS = max(1, min(8, int(os.getenv("AI_MAX_ANSWERS", "4"))))
 # this is what keeps the suggestion inside the 2-3s window instead of waiting
 # for one slow provider to time out before trying the next.
 AI_RACE = os.getenv("AI_RACE", "true").strip().lower() not in ("0", "false", "no", "off")
-# Hard ceiling on the whole lookup, independent of AI_TIMEOUT. Kept tight so
-# the suggestion lands inside the 2-3s window: with AI_RACE the first provider
-# to answer wins, so this only ever cuts off a straggler.
+# Two passes, because one budget cannot serve both goals:
+# pass 1 (AI_DEADLINE) - fast: keeps a suggestion inside the 2-3s claim
+# window, which is what AI_RACE is for
+# pass 2 (AI_LATE_DEADLINE) - second chance: a web-search grounded model
+# routinely needs longer than a few seconds, and a
+# late suggestion is still useful because the
+# question stays open until it is answered
 AI_DEADLINE = float(os.getenv("AI_DEADLINE", "3.0"))
+AI_LATE_DEADLINE = float(os.getenv("AI_LATE_DEADLINE", "12.0"))
+# When both passes come back empty, say so - with the provider's own reason -
+# instead of staying silent. Silence is what makes a working feature look broken.
+AI_NOTIFY_FAILURE = os.getenv("AI_NOTIFY_FAILURE", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 AI_SHOW_LATENCY = os.getenv("AI_SHOW_LATENCY", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
@@ -203,6 +213,9 @@ PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
 # Codes / words that must never be treated as promo codes.
 _IGNORE_TOKENS = {
@@ -1629,16 +1642,55 @@ _AI_CLIENT = httpx.AsyncClient(
     proxy=PROXY_URL,
     limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
 )
+# The late pass gets its own client on purpose: a search-grounded answer often
+# needs longer than AI_TIMEOUT, and reusing the fast client would raise
+# ReadTimeout long before AI_LATE_DEADLINE was ever reached.
+_AI_CLIENT_LATE = httpx.AsyncClient(
+    timeout=httpx.Timeout(max(AI_LATE_DEADLINE, AI_TIMEOUT) + 2.0, connect=4.0),
+    proxy=PROXY_URL,
+    limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+)
+
+# Which client the current lookup should use. Set per lookup in
+# ai_answer_candidates() and inherited by its provider tasks, so the provider
+# functions keep the plain (question) signature the rest of the code expects.
+_AI_CLIENT_CTX = contextvars.ContextVar("ai_client", default=None)
+
+
+def _ai_client():
+    return _AI_CLIENT_CTX.get() or _AI_CLIENT
+
+
+_AI_MODEL_VARS = {
+    "perplexity": lambda: PERPLEXITY_MODEL,
+    "openai": lambda: OPENAI_MODEL,
+    "gemini": lambda: GEMINI_MODEL,
+}
+
+
+def _ai_model_for(provider):
+    """Model to call for `provider`. Per-provider vars win. `AI_MODEL` stays supported as a global override, but it is only applied to the provider it can plausibly belong to (the one pinned with AI_PROVIDER, or the only one configured): sending Gemini's model name to Perplexity is a guaranteed 400, which is exactly the kind of silent failure this feature must not have. """
+    override = (_AI_MODEL_VARS.get(provider) or (lambda: ""))()
+    if override:
+        return override
+    if AI_MODEL:
+        order = _ai_provider_order()
+        if AI_PROVIDER == provider or (
+            not AI_PROVIDER and order and order[0] == provider
+        ):
+            return AI_MODEL
+    return _AI_MODELS.get(provider, "")
 
 _AI_PROMPT = (
     "You answer Chowdeck promo-code security questions. Chowdeck is a Nigerian "
     "food-delivery app; its security questions are short factual questions about "
     "Chowdeck itself, its vendors or partners, Nigerian and world events, sports "
-    "clubs, or popular culture. Search the web and put the single most likely "
+    "clubs, or popular culture. Search the web, then put the single most likely "
     "answer first.\n"
-    "Reply with up to {n} candidate answers, one per line, most likely first. "
-    "Each answer must be under 40 characters, with no numbering, no bullets, no "
-    "explanation, no full sentences and no quotes.\n\n"
+    "Output rules: one answer per line and nothing else. No sentences, no "
+    "explanation, no citations, no quotes, no numbering, no bullets. Each line is "
+    "a bare value of 30 characters or fewer, for example `3500`, `Lagos` or "
+    "`May 2024`. Give up to {n} lines, most likely first.\n\n"
     "Question: {question}"
 )
 
@@ -1670,10 +1722,11 @@ def _ai_provider_order():
 
 
 def _parse_ai_answers(text, limit=None):
-    """Turn a line-per-answer model reply into a clean, de-duplicated list."""
+    """Turn a model reply into a clean, de-duplicated list of candidate answers. Two stages: the strict line-per-answer parse first, and - only when that yields nothing - the prose salvage (``_ai_prose_candidates``). A grounded model that answers in a full sentence is a good answer, not an empty one. """
     limit = int(limit or AI_MAX_ANSWERS)
+    text = str(text or "")
     out, seen = [], set()
-    for raw_line in str(text or "").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -1688,36 +1741,173 @@ def _parse_ai_answers(text, limit=None):
         out.append(line[:40])
         if len(out) >= limit:
             break
+    if not out:
+        out = _ai_prose_candidates(text, limit)
+    return out
+
+
+# --- Last-outcome bookkeeping -------------------------------------------------
+# A failed provider used to be swallowed completely: the lookup returned an
+# empty list and the chat heard nothing, so a missing key, a renamed model or a
+# grounding tool the model does not support looked exactly like a feature that
+# was never wired up. Every failure is now recorded here (and printed), so `/ai`
+# can name the reason and the chat can say why no suggestion arrived.
+_AI_LAST = {"provider": "", "kind": "", "detail": "", "ok": False, "ts": 0.0}
+
+
+def _ai_body_snippet(res, limit=160):
+    """First `limit` characters of a response body, for the failure record."""
+    try:
+        body = re.sub(r"\s+", " ", str(res.text or "")).strip()
+    except Exception:  # noqa: BLE001
+        body = ""
+    return body[:limit]
+
+
+def _ai_note_error(provider, kind, detail=""):
+    _AI_LAST.update({
+        "provider": str(provider), "kind": str(kind),
+        "detail": str(detail or ""), "ok": False, "ts": time.time(),
+    })
+    line = f"{provider}: {kind}"
+    if detail:
+        line += f" - {detail}"
+    print(f"[ai] {line}", flush=True)
+
+
+def _ai_note_ok(provider):
+    _AI_LAST.update({
+        "provider": str(provider), "kind": "", "detail": "",
+        "ok": True, "ts": time.time(),
+    })
+
+
+def _ai_failure_note():
+    """One short, Markdown-safe sentence describing the last lookup outcome."""
+    ts = float(_AI_LAST.get("ts") or 0.0)
+    if not ts:
+        return "no lookup recorded yet"
+    provider = str(_AI_LAST.get("provider") or "ai")
+    label = _AI_PROVIDER_LABELS.get(provider, provider)
+    kind = str(_AI_LAST.get("kind") or "").strip()
+    detail = re.sub(r"[*_\[\]`]", " ", str(_AI_LAST.get("detail") or "")).strip()
+    mins = int(max(0.0, time.time() - ts) // 60)
+    age = f", {mins}m ago" if mins else ", just now"
+    if _AI_LAST.get("ok"):
+        return f"{label} answered{age}"
+    if detail:
+        return f"{label} returned {kind or 'an error'} ({detail}){age}"
+    if kind:
+        return f"{label}: {kind}{age}"
+    return f"no usable answer{age}"
+
+
+def _pending_question_open(chat_str, code):
+    """True while the security question for `code` is still awaiting an answer. A second-pass suggestion is only worth posting while the question is still on screen: once the user has answered, the prompt has been consumed and a late result must be dropped instead of popping up a stale button. """
+    try:
+        return any(
+            str((entry or {}).get("code") or "") == str(code)
+            for entry in list_pending(str(chat_str))
+        )
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# --- Prose salvage ------------------------------------------------------------
+# The prompt asks for bare values, one per line, and most models comply. A
+# web-grounded model sometimes answers in a sentence anyway ("Based on the
+# search results, the answer is 3500 (source: chowdeck.com)."), and the strict
+# line parser dropped anything longer than 60 characters - which turned a
+# correct answer into no suggestion at all. These helpers recover the short
+# value out of that sentence, and are only used when the strict parse is empty.
+_AI_FILLER_RE = re.compile(
+    r"^(?:the\s+answer\s+is\s*|the\s+answer\s*[:=-]\s*|answer\s*[:=-]\s*|"
+    r"it\s+is\s+|it'?s\s+|i\s+(?:think|believe)\s+(?:the\s+answer\s+is\s+)?|"
+    r"(?:the\s+)?(?:most\s+)?likely\s+answer\s*[:=-]?\s*|"
+    r"based\s+on\s+[^,]{0,80},\s*(?:the\s+answer\s+is\s+)?|"
+    r"according\s+to\s+[^,]{0,80},\s*)",
+    re.IGNORECASE,
+)
+_AI_CITE_RE = re.compile(
+    r"(?:\[\d+\]|\((?:source|sources|ref)\s*:[^)]*\)|\bsources?\s*:[^\n]*|https?://\S+)",
+    re.IGNORECASE,
+)
+
+
+def _ai_clean_value(raw):
+    """Strip filler, citations and trailing punctuation from one candidate value."""
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    value = _AI_CITE_RE.sub(" ", value)
+    value = _AI_FILLER_RE.sub("", value).strip()
+    value = re.split(r"(?<=[.!?;])\s+|\s+[|\u2013\u2014]\s+", value, maxsplit=1)[0]
+    value = value.strip().strip("'\"`*_ ")
+    value = value.strip(" .;:,-")
+    value = re.sub(r"\s+", " ", value)
+    if not value or len(value) > 30:
+        return ""
+    return value
+
+
+def _ai_prose_candidates(text, limit=None):
+    """Recover short answer values from a prose reply (fallback only)."""
+    limit = int(limit or AI_MAX_ANSWERS)
+    out, seen = [], set()
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", raw_line).strip()
+        if not line:
+            continue
+        for piece in [line] + re.split(r"[;!?]\s+|\.\s+", line):
+            value = _ai_clean_value(piece)
+            if not value:
+                continue
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(value[:40])
+            if len(out) >= limit:
+                return out
     return out
 
 
 async def _ai_perplexity(question):
-    model = AI_MODEL or _AI_MODELS["perplexity"]
-    res = await _AI_CLIENT.post(
-        "https://api.perplexity.ai/chat/completions",
-        headers={
-            "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "temperature": 0.2,
-            "messages": [{
-                "role": "user",
-                "content": _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question),
-            }],
-        },
-    )
+    """Perplexity `sonar` is web-grounded by design: no extra tool needed."""
+    client = _ai_client()
+    model = _ai_model_for("perplexity")
+    try:
+        res = await client.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "temperature": 0.2,
+                "messages": [{
+                    "role": "user",
+                    "content": _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question),
+                }],
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        _ai_note_error("perplexity", type(e).__name__, str(e))
+        return []
     if res.status_code != 200:
+        _ai_note_error("perplexity", f"HTTP {res.status_code}", _ai_body_snippet(res))
         return []
     choices = res.json().get("choices") or []
     if not choices:
+        _ai_note_error("perplexity", "empty completion")
         return []
     return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
 
 
 async def _ai_openai(question):
-    model = AI_MODEL or _AI_MODELS["openai"]
+    model = _ai_model_for("openai")
+    client = _ai_client()
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
@@ -1725,7 +1915,7 @@ async def _ai_openai(question):
     prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
     # Preferred: the Responses API with the built-in web-search tool (live web).
     try:
-        res = await _AI_CLIENT.post(
+        res = await client.post(
             "https://api.openai.com/v1/responses",
             headers=headers,
             json={
@@ -1747,11 +1937,13 @@ async def _ai_openai(question):
             answers = _parse_ai_answers(text)
             if answers:
                 return answers
+        else:
+            _ai_note_error("openai", f"HTTP {res.status_code}", _ai_body_snippet(res))
     except Exception as e:  # noqa: BLE001
-        print(f"[ai] openai responses error: {e}", flush=True)
+        _ai_note_error("openai", type(e).__name__, str(e))
     # Fallback: classic chat completions (model knowledge, still useful).
     try:
-        res = await _AI_CLIENT.post(
+        res = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
             json={
@@ -1764,53 +1956,87 @@ async def _ai_openai(question):
             choices = res.json().get("choices") or []
             if choices:
                 return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
+        else:
+            _ai_note_error("openai", f"HTTP {res.status_code}", _ai_body_snippet(res))
     except Exception as e:  # noqa: BLE001
-        print(f"[ai] openai chat error: {e}", flush=True)
+        _ai_note_error("openai", type(e).__name__, str(e))
     return []
 
 
 async def _ai_gemini(question):
-    model = AI_MODEL or _AI_MODELS["gemini"]
-    res = await _AI_CLIENT.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent",
-        headers={
-            "x-goog-api-key": GEMINI_API_KEY,
-            "Content-Type": "application/json",
-        },
-        json={
-            "contents": [{
-                "parts": [{
-                    "text": _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question),
-                }],
-            }],
-            "tools": [{"google_search": {}}],
-        },
-    )
-    if res.status_code != 200:
-        return []
-    chunks = []
-    for cand in res.json().get("candidates") or []:
-        for part in ((cand or {}).get("content") or {}).get("parts") or []:
-            if isinstance(part, dict) and part.get("text"):
-                chunks.append(str(part["text"]))
-    return _parse_ai_answers("\n".join(chunks))
+    """Gemini with the Google Search tool (live web), model knowledge as backup."""
+    client = _ai_client()
+    model = _ai_model_for("gemini")
+    prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
+
+    async def ask(with_search):
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if with_search:
+            body["tools"] = [{"google_search": {}}]
+        try:
+            res = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent",
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+        except Exception as e:  # noqa: BLE001
+            _ai_note_error("gemini", type(e).__name__, str(e))
+            return None, []
+        if res.status_code != 200:
+            detail = _ai_body_snippet(res)
+            _ai_note_error("gemini", f"HTTP {res.status_code}", detail)
+            return detail, []
+        payload = res.json() or {}
+        chunks = []
+        finish = ""
+        for cand in payload.get("candidates") or []:
+            finish = str((cand or {}).get("finishReason") or finish)
+            for part in ((cand or {}).get("content") or {}).get("parts") or []:
+                if isinstance(part, dict) and part.get("text"):
+                    chunks.append(str(part["text"]))
+        answers = _parse_ai_answers("\n".join(chunks))
+        if not answers and finish:
+            _ai_note_error("gemini", f"no text (finishReason {finish})")
+        return finish, answers
+
+    note, answers = await ask(True)
+    if answers:
+        return answers
+    # Search grounding is not available on every model / API version (the API
+    # answers with a 400 saying so). Instead of reporting nothing at all, retry
+    # once without the tool so the model's own knowledge still gets a chance.
+    lowered = str(note or "").lower()
+    if lowered and any(w in lowered for w in ("ground", "tool", "not supported")):
+        fallback = (await ask(False))[1]
+        if fallback:
+            return fallback
+    return []
 
 
 async def _ai_tavily(question):
     """Tavily is a search API: its `answer` field is the grounded suggestion."""
-    res = await _AI_CLIENT.post(
-        "https://api.tavily.com/search",
-        headers={"Content-Type": "application/json"},
-        json={
-            "api_key": TAVILY_API_KEY,
-            "query": question,
-            "search_depth": "basic",
-            "include_answer": True,
-            "max_results": 5,
-        },
-    )
+    client = _ai_client()
+    try:
+        res = await client.post(
+            "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json"},
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": question,
+                "search_depth": "basic",
+                "include_answer": True,
+                "max_results": 5,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        _ai_note_error("tavily", type(e).__name__, str(e))
+        return []
     if res.status_code != 200:
+        _ai_note_error("tavily", f"HTTP {res.status_code}", _ai_body_snippet(res))
         return []
     body = res.json()
     lines = []
@@ -1838,20 +2064,29 @@ _AI_PROVIDER_LABELS = {
 }
 
 
-async def ai_answer_candidates(question):
-    """Return (provider, [candidate answers], elapsed_seconds). Providers are raced in parallel (``AI_RACE``, the default) and the first usable answer set wins, so one slow provider can no longer hold the whole lookup for its full timeout while the next one waits its turn. The whole lookup is bounded by ``AI_DEADLINE``, which is what keeps a suggestion inside the 2-3s window. """
-    question = str(question or "").strip()
-    if not question or not _ai_enabled():
-        return None, [], 0.0
+async def _ai_with_client(func, client, question):
+    """Run one provider function with `client` bound for the call. The provider functions keep their plain ``(question)`` signature; the client for the current pass is handed to them through a ContextVar so the fast and late passes can use different timeouts without touching every provider. """
+    token = _AI_CLIENT_CTX.set(client)
+    try:
+        return await func(question)
+    finally:
+        _AI_CLIENT_CTX.reset(token)
+
+
+async def _ai_lookup_once(question, deadline, client):
+    """One full lookup: ``(provider, [answers], elapsed_seconds)``. Providers are raced in parallel (``AI_RACE``, the default) and the first usable answer set wins, so one slow provider can no longer hold the whole lookup for its full timeout while the next one waits its turn. The lookup is bounded by ``deadline``, which is what keeps the fast pass inside the 2-3s window. """
     funcs = [(n, _AI_PROVIDER_FUNCS[n]) for n in _ai_provider_order()
              if _AI_PROVIDER_FUNCS.get(n)]
     if not funcs:
+        _ai_note_error("ai", "no provider configured")
         return None, [], 0.0
     started = time.monotonic()
 
     async def call(name, func):
         try:
-            return name, await asyncio.wait_for(func(question), timeout=AI_DEADLINE)
+            return name, await asyncio.wait_for(
+                _ai_with_client(func, client, question), timeout=deadline
+            )
         except Exception as e:  # noqa: BLE001
             print(f"[ai] {name} failed: {e}", flush=True)
             return name, []
@@ -1860,15 +2095,16 @@ async def ai_answer_candidates(question):
         for name, func in funcs:
             got_name, answers = await call(name, func)
             if answers:
+                _ai_note_ok(got_name)
                 return got_name, answers, time.monotonic() - started
         return None, [], time.monotonic() - started
 
     tasks = {asyncio.create_task(call(name, func)): name for name, func in funcs}
-    deadline = started + AI_DEADLINE
+    stop_at = started + deadline
     winner = (None, [])
     try:
         while tasks:
-            budget = deadline - time.monotonic()
+            budget = stop_at - time.monotonic()
             if budget <= 0:
                 break
             done, _ = await asyncio.wait(
@@ -1890,20 +2126,47 @@ async def ai_answer_candidates(question):
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+    if winner[0] is not None:
+        # Record the win: without this the last-outcome note (shown by `/ai`)
+        # would keep quoting a losing provider's error even though a suggestion
+        # was posted - exactly the "is this even wired up?" confusion this
+        # feature has to avoid.
+        _ai_note_ok(winner[0])
     return winner[0], winner[1], time.monotonic() - started
+
+
+async def ai_answer_candidates(question, late=False):
+    """Look one question up: ``(provider, [answers], elapsed_seconds)``. ``late=False`` is the fast pass (``AI_DEADLINE``, short-timeout client): it is what keeps a suggestion inside the 2-3s claim window. ``late=True`` is the second chance (``AI_LATE_DEADLINE``, long-timeout client): a web-search grounded model routinely needs longer than the fast budget, and a late answer still helps because the question stays open until it is answered. """
+    question = str(question or "").strip()
+    if not question or not _ai_enabled():
+        return None, [], 0.0
+    if late:
+        return await _ai_lookup_once(question, AI_LATE_DEADLINE, _AI_CLIENT_LATE)
+    return await _ai_lookup_once(question, AI_DEADLINE, _AI_CLIENT)
 
 
 def ai_status_text():
     """Read-only summary of the AI assist setup (for `/ai` with no argument)."""
     order = [n for n in _ai_provider_order() if _AI_PROVIDER_FUNCS.get(n)]
     labels = ", ".join(_AI_PROVIDER_LABELS.get(n, n) for n in order) or "*(none configured)*"
+    models = ", ".join(
+        f"{_AI_PROVIDER_LABELS.get(n, n)} `{_ai_model_for(n)}`"
+        for n in order if _ai_model_for(n)
+    ) or "*(provider default)*"
+    late = (
+        f"late pass `{AI_LATE_DEADLINE:g}s`"
+        if AI_LATE_DEADLINE > AI_DEADLINE else "late pass `off`"
+    )
     return (
         "🤖 *AI answer assist*\n\n"
         f"• Status: `{'ON' if _ai_enabled() else 'OFF'}`\n"
         f"• Providers: {labels}\n"
+        f"• Models: {models}\n"
         f"• Lookup: `{'parallel race' if AI_RACE else 'sequential'}` · "
-        f"deadline `{AI_DEADLINE:g}s` · per-call timeout `{AI_TIMEOUT:g}s`\n"
-        f"• Model override: `{AI_MODEL or 'provider default'}`\n\n"
+        f"fast pass `{AI_DEADLINE:g}s` · {late} · per-call cap `{AI_TIMEOUT:g}s`\n"
+        f"• `AI_MODEL` override: `{AI_MODEL or 'not set'}`\n"
+        f"• Failure notice: `{'ON' if AI_NOTIFY_FAILURE else 'OFF'}`\n"
+        f"• Last lookup: {_ai_failure_note()}\n\n"
         "• It runs automatically the moment a claim hits a security question: "
         "the likely answers arrive with tap-to-submit buttons.\n"
         "• `/ai <question>` — look one up right now.\n\n"
@@ -1943,36 +2206,74 @@ def ai_answer_keyboard(code, answers, submitted=None):
     return {"inline_keyboard": rows} if rows else None
 
 
+async def _ai_post_suggestions(chat_id, chat_str, code, question, provider, answers, elapsed):
+    """Attach suggestions to the live prompt and post the tap-to-submit message."""
+    set_pending_ai(chat_str, code, provider, answers)
+    label = _AI_PROVIDER_LABELS.get(provider, provider)
+    tail = f" · {elapsed:.1f}s" if AI_SHOW_LATENCY else ""
+    lines = [
+        f"🤖 *AI answer assist* (via {label}{tail})",
+        "",
+        f"Question: \"{question}\"",
+        "",
+        "Likely answers — *tap one* to submit it instantly:",
+    ]
+    lines += [f"{idx}. `{answer}`" for idx, answer in enumerate(answers, 1)]
+    lines += [
+        "",
+        "_The AI is only a suggestion — type a different answer yourself at any "
+        "time and it will be submitted instead._",
+    ]
+    await send_telegram(
+        chat_id, "\n".join(lines), reply_markup=ai_answer_keyboard(code, answers)
+    )
+
+
 async def assist_security_question(chat_id, chat_str, code, question):
-    """Background AI lookup for a live security question (never blocks a claim)."""
+    """Background AI lookup for a live security question (never blocks a claim). Two passes, because one budget cannot serve both goals: * pass 1 (``AI_DEADLINE``) — fast enough to land beside the claim prompt; * pass 2 (``AI_LATE_DEADLINE``) — the second chance for a web-search grounded model, which routinely needs longer than a few seconds. The prompt stays open until it is answered, so a late suggestion is still useful; if the user has answered meanwhile the late result is dropped rather than posting a stale button. When both passes come back empty the chat is told why (unless ``AI_NOTIFY_FAILURE`` is off). Staying silent is what made a wired-up feature look like a broken one. """
     if not _ai_enabled():
         return
+    question = str(question or "").strip()
+    if not question:
+        return
+
+    provider, answers, elapsed = None, [], 0.0
     try:
         provider, answers, elapsed = await asyncio.wait_for(
             ai_answer_candidates(question), timeout=AI_DEADLINE + 2.0
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[ai] assist failed: {e}", flush=True)
+        print(f"[ai] fast pass failed: {e}", flush=True)
+    if answers:
+        await _ai_post_suggestions(
+            chat_id, chat_str, code, question, provider, answers, elapsed
+        )
         return
-    if not answers:
-        return
-    set_pending_ai(chat_str, code, provider, answers)
-    label = _AI_PROVIDER_LABELS.get(provider, provider)
-    tail = f" · {elapsed:.1f}s" if AI_SHOW_LATENCY else ""
-    lines = [f"🤖 *AI answer assist* (via {label}{tail})", ""]
-    lines.append(f"Question: \"{question}\"")
-    lines.append("")
-    lines.append("Likely answers — *tap one* to submit it instantly:")
-    for idx, answer in enumerate(answers, 1):
-        lines.append(f"{idx}. `{answer}`")
-    lines.append("")
-    lines.append(
-        "_The AI is only a suggestion — type a different answer yourself at any "
-        "time and it will be submitted instead._"
-    )
-    await send_telegram(
-        chat_id, "\n".join(lines), reply_markup=ai_answer_keyboard(code, answers)
-    )
+
+    if AI_LATE_DEADLINE > AI_DEADLINE:
+        try:
+            provider, answers, elapsed = await asyncio.wait_for(
+                ai_answer_candidates(question, late=True),
+                timeout=AI_LATE_DEADLINE + 2.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[ai] late pass failed: {e}", flush=True)
+            provider, answers, elapsed = None, [], 0.0
+        if answers:
+            if _pending_question_open(chat_str, code):
+                await _ai_post_suggestions(
+                    chat_id, chat_str, code, question, provider, answers, elapsed
+                )
+            return
+
+    if AI_NOTIFY_FAILURE and _pending_question_open(chat_str, code):
+        await send_telegram(
+            chat_id,
+            "🤖 *AI answer assist* — no suggestion came back.\n\n"
+            f"• Last lookup: {_ai_failure_note()}\n"
+            f"• Budgets: fast `{AI_DEADLINE:g}s`, late `{AI_LATE_DEADLINE:g}s`.\n\n"
+            "_The question is still open — answer it as usual._",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3112,10 +3413,15 @@ GUIDE_TEXT = (
     "• The session is the bot's own, so it never disturbs a login on your "
     "browser, and it is refreshed automatically in the background.\n\n"
     "*🤖 AI answer assist (real-time web search)*\n"
-    "• When a claim hits a security question, likely answers arrive within "
-    "seconds with *tap-to-submit* buttons (Perplexity / OpenAI / Gemini / Tavily).\n"
-    "• `/ai` — show the AI status (on/off, providers, latency setting)\n"
-    "• `/ai <question>` — look one up on demand\n"
+    "• When a claim hits a security question, likely answers arrive with "
+    "*tap-to-submit* buttons (Perplexity / OpenAI / Gemini / Tavily).\n"
+    "• Two passes: a fast one (3s, lands with the prompt) and, when that is "
+    "empty, a longer web-grounded pass (12s) — a late suggestion is still "
+    "useful because the question stays open until you answer it.\n"
+    "• If both passes come back empty the bot says so, quoting the provider's "
+    "own reason, instead of staying silent.\n"
+    "• `/ai` — show the AI status (on/off, providers, models, last lookup)\n"
+    "• `/ai <question>` — look one up on demand (runs both passes)\n"
     "• It needs one provider key (`PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
     "`GEMINI_API_KEY` or `TAVILY_API_KEY`); with no key it simply stays off.\n"
     "• It is only a suggestion: type your own answer any time and that is what "
@@ -3321,10 +3627,21 @@ async def handle_command(chat_id, chat_str, text, is_admin):
             return
         await send_telegram(chat_id, "🔎 Searching the web…")
         provider, answers, elapsed = await ai_answer_candidates(arg)
+        if not answers and AI_LATE_DEADLINE > AI_DEADLINE:
+            # Interactive lookup: the user is right here waiting, so give a
+            # search-grounded model its longer budget before reporting nothing.
+            await send_telegram(
+                chat_id,
+                "⏳ Still searching — a web-grounded model can take up to "
+                f"`{AI_LATE_DEADLINE:g}s`…",
+            )
+            provider, answers, elapsed = await ai_answer_candidates(arg, late=True)
         if not answers:
             await send_telegram(
                 chat_id,
-                f"🤖 No suggestion came back within `{AI_DEADLINE:g}s`. "
+                "🤖 *No suggestion came back.*\n\n"
+                f"• Last lookup: {_ai_failure_note()}\n"
+                f"• Budgets: fast `{AI_DEADLINE:g}s`, late `{AI_LATE_DEADLINE:g}s`.\n\n"
                 "Answer manually as usual.",
             )
             return
@@ -3788,6 +4105,7 @@ async def main():
             await _CD_CLIENT.aclose()
             await _TG_CLIENT.aclose()
             await _AI_CLIENT.aclose()
+            await _AI_CLIENT_LATE.aclose()
         except Exception:
             pass
 
