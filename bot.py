@@ -1631,11 +1631,30 @@ async def maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
 # existing prompt is sent immediately and this lookup is spawned in the
 # BACKGROUND: its answer is only ever a suggestion, so a slow or failing AI can
 # never delay a claim, and the user still decides what gets submitted.
+# Built-in model defaults, used only when the matching *_MODEL var is unset.
+# `gemini` is a starting point, not the last word: _gemini_discover() replaces it
+# with whatever Flash model the key can actually use today.
 _AI_MODELS = {
     "perplexity": "sonar",
     "openai": "gpt-4o-mini",
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-3.8-flash",
 }
+
+# Safety net for Gemini, best-first, used when live discovery is unavailable.
+# Google retires Flash models on a schedule - `gemini-2.0-flash` was shut down
+# on 2026-06-01 - so a hardcoded name is a time bomb. A retired model still
+# answers in milliseconds; it just answers 400 with no text, which is
+# indistinguishable from "the AI is silent". Discovery first, then this list.
+_GEMINI_MODEL_CANDIDATES = (
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+)
+
+# Resolved at runtime: {"model": best found, "available": [...], "ts": when}.
+_GEMINI_STATE = {"model": "", "available": [], "ts": 0.0}
+# Budget for the one-off model-list call, so discovery can never eat a lookup.
+_AI_MODEL_DISCOVER_TIMEOUT = float(os.getenv("AI_MODEL_DISCOVER_TIMEOUT", "2.0"))
 
 _AI_CLIENT = httpx.AsyncClient(
     timeout=httpx.Timeout(AI_TIMEOUT, connect=4.0),
@@ -1679,6 +1698,9 @@ def _ai_model_for(provider):
             not AI_PROVIDER and order and order[0] == provider
         ):
             return AI_MODEL
+    if provider == "gemini" and _GEMINI_STATE.get("model"):
+        # Whatever discovery last confirmed this key can call.
+        return str(_GEMINI_STATE["model"])
     return _AI_MODELS.get(provider, "")
 
 _AI_PROMPT = (
@@ -1963,13 +1985,144 @@ async def _ai_openai(question):
     return []
 
 
+# Words that mean "this model name is dead", as opposed to "your key is bad" or
+# "you are rate-limited". Kept separate from grounding errors, which also read
+# as "not supported" but are about the tool, not the model.
+_AI_MODEL_GONE_WORDS = (
+    "no longer available", "not found", "does not exist", "deprecated",
+    "update your code", "has been shut down", "decommissioned", "not available",
+)
+_AI_GROUNDING_WORDS = ("google_search", "search tool", "grounding", "grounded")
+
+
+def _gemini_model_gone(text):
+    """True when the message says the model name itself is unusable."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if any(w in lowered for w in _AI_GROUNDING_WORDS):
+        return False
+    return any(w in lowered for w in _AI_MODEL_GONE_WORDS)
+
+
+def _gemini_error_model(detail):
+    """Pull the replacement model out of Gemini's own error message. A retired model does not fail silently: it answers 400 with "This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.8-flash". The message names the fix, so the lookup can follow it instead of reporting nothing. """
+    text = str(detail or "")
+    if not _gemini_model_gone(text):
+        return ""
+    for name in re.findall(r"models/([A-Za-z0-9][A-Za-z0-9._\-]*)", text):
+        if name != "models":
+            return name
+    return ""
+
+
+def _gemini_rank(name):
+    """Rank a model name for this task. Higher is better; <0 means unusable. The goal is a real-time web-search answer, so: newest generation wins, plain Flash beats Flash-Lite (better at factual questions) but stays close (still fast), and anything audio/image/video/embedding is excluded outright. """
+    lowered = str(name or "").lower()
+    if not lowered:
+        return -1
+    for bad in ("tts", "image", "imagen", "veo", "live", "native-audio",
+                "transcribe", "embedding", "embed", "aqa", "robotics",
+                "omni", "gemma", "learnlm", "thinking"):
+        if bad in lowered:
+            return -1
+    nums = re.findall(r"(\d+)\.(\d+)", lowered)
+    major, minor = (int(nums[0][0]), int(nums[0][1])) if nums else (0, 0)
+    score = major * 100 + minor * 10
+    if "flash-lite" in lowered:
+        score += 4          # fastest of the family
+    elif "flash" in lowered:
+        score += 6          # best speed/accuracy balance for a factual lookup
+    else:
+        score -= 25         # pro and friends: slower than this task wants
+    if "preview" in lowered or "exp" in lowered:
+        score -= 10         # previews get retired without notice
+    if "latest" in lowered:
+        score += 1          # rolling alias: works, but unpredictable behind it
+    return score
+
+
+async def _gemini_discover(client):
+    """Ask Gemini which models this key can use; cache the best Flash model. One call per process (re-checked every 30 minutes), so the bot learns about a model retirement instead of hammering a dead name forever. """
+    now = time.time()
+    if _GEMINI_STATE.get("available") and now - float(_GEMINI_STATE.get("ts") or 0) < 1800:
+        return list(_GEMINI_STATE["available"])
+    try:
+        res = await client.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] gemini model list failed: {type(e).__name__}: {e}", flush=True)
+        return []
+    if res.status_code != 200:
+        _ai_note_error("gemini", f"HTTP {res.status_code} listing models",
+                       _ai_body_snippet(res))
+        return []
+    names = []
+    for entry in (res.json() or {}).get("models") or []:
+        if not isinstance(entry, dict):
+            continue
+        methods = entry.get("supportedGenerationMethods")
+        if isinstance(methods, list) and methods and "generateContent" not in methods:
+            continue
+        raw = str(entry.get("name") or "")
+        if raw.startswith("models/"):
+            raw = raw[len("models/"):]
+        if raw and _gemini_rank(raw) >= 0:
+            names.append(raw)
+    names = sorted(set(names), key=_gemini_rank, reverse=True)
+    _GEMINI_STATE.update({"available": names, "ts": now})
+    if names:
+        _GEMINI_STATE["model"] = names[0]
+        print(f"[ai] gemini models available: {', '.join(names[:5])}", flush=True)
+    else:
+        print("[ai] gemini returned no usable generateContent model", flush=True)
+    return names
+
+
+def _gemini_candidates():
+    """Best-first models to try for one lookup (pinned -> resolved -> known)."""
+    out = []
+
+    def add(name):
+        name = str(name or "").strip()
+        if name and name not in out:
+            out.append(name)
+
+    add(_ai_model_for("gemini"))
+    add(_GEMINI_STATE.get("model"))
+    for name in _GEMINI_STATE.get("available") or []:
+        add(name)
+    for name in _GEMINI_MODEL_CANDIDATES:
+        add(name)
+    return out[:4]
+
+
+async def _ai_warm_models():
+    """Resolve the Gemini model list at boot so the first live lookup is fast."""
+    if not GEMINI_API_KEY:
+        return
+    try:
+        await _gemini_discover(_AI_CLIENT_LATE)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ai] model warmup failed: {e}", flush=True)
+
+
 async def _ai_gemini(question):
-    """Gemini with the Google Search tool (live web), model knowledge as backup."""
+    """Gemini with the Google Search tool (live web), model knowledge as backup. The model name is resolved at runtime, never assumed. A retired model (the reason this feature appeared dead: `gemini-2.0-flash` was shut down on 2026-06-01 and answered 400 immediately) is detected and stepped over, using Google's own suggested replacement when the message names one. """
     client = _ai_client()
-    model = _ai_model_for("gemini")
     prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
 
-    async def ask(with_search):
+    if not _GEMINI_STATE.get("available"):
+        try:
+            await asyncio.wait_for(
+                _gemini_discover(client), timeout=_AI_MODEL_DISCOVER_TIMEOUT
+            )
+        except Exception:  # noqa: BLE001
+            pass  # discovery is an optimisation; the candidate list still stands
+
+    async def ask(model, with_search):
         body = {"contents": [{"parts": [{"text": prompt}]}]}
         if with_search:
             body["tools"] = [{"google_search": {}}]
@@ -1984,11 +2137,11 @@ async def _ai_gemini(question):
                 json=body,
             )
         except Exception as e:  # noqa: BLE001
-            _ai_note_error("gemini", type(e).__name__, str(e))
-            return None, []
+            _ai_note_error("gemini", f"{type(e).__name__} on {model}", str(e))
+            return "", []
         if res.status_code != 200:
             detail = _ai_body_snippet(res)
-            _ai_note_error("gemini", f"HTTP {res.status_code}", detail)
+            _ai_note_error("gemini", f"HTTP {res.status_code} on {model}", detail)
             return detail, []
         payload = res.json() or {}
         chunks = []
@@ -2000,20 +2153,45 @@ async def _ai_gemini(question):
                     chunks.append(str(part["text"]))
         answers = _parse_ai_answers("\n".join(chunks))
         if not answers and finish:
-            _ai_note_error("gemini", f"no text (finishReason {finish})")
+            _ai_note_error("gemini", f"no text on {model} (finishReason {finish})")
         return finish, answers
 
-    note, answers = await ask(True)
-    if answers:
-        return answers
-    # Search grounding is not available on every model / API version (the API
-    # answers with a 400 saying so). Instead of reporting nothing at all, retry
-    # once without the tool so the model's own knowledge still gets a chance.
-    lowered = str(note or "").lower()
-    if lowered and any(w in lowered for w in ("ground", "tool", "not supported")):
-        fallback = (await ask(False))[1]
-        if fallback:
-            return fallback
+    def _remember(model):
+        _GEMINI_STATE["model"] = model
+        print(f"[ai] gemini model in use: {model}", flush=True)
+
+    tried = []
+    for model in _gemini_candidates():
+        if len(tried) >= 3:
+            break
+        tried.append(model)
+        note, answers = await ask(model, True)
+        if answers:
+            _remember(model)
+            return answers
+
+        # Retired or renamed: Google's message names the replacement, so take it.
+        replacement = _gemini_error_model(note)
+        if replacement and replacement not in tried:
+            tried.append(replacement)
+            replacement_answers = (await ask(replacement, True))[1]
+            if replacement_answers:
+                _remember(replacement)
+                return replacement_answers
+            continue
+        if _gemini_model_gone(note):
+            continue  # dead name: the next candidate may still work
+
+        # Grounding tool unsupported on this model: answer from model knowledge.
+        lowered = str(note or "").lower()
+        if lowered and any(w in lowered for w in ("ground", "tool", "not supported")):
+            fallback = (await ask(model, False))[1]
+            if fallback:
+                _remember(model)
+                return fallback
+            continue
+
+        break  # a real error (bad key, quota, billing): stop guessing
     return []
 
 
@@ -2166,7 +2344,13 @@ def ai_status_text():
         f"fast pass `{AI_DEADLINE:g}s` · {late} · per-call cap `{AI_TIMEOUT:g}s`\n"
         f"• `AI_MODEL` override: `{AI_MODEL or 'not set'}`\n"
         f"• Failure notice: `{'ON' if AI_NOTIFY_FAILURE else 'OFF'}`\n"
-        f"• Last lookup: {_ai_failure_note()}\n\n"
+        f"• Last lookup: {_ai_failure_note()}\n"
+        + (
+            f"• Gemini models seen: "
+            f"{', '.join(_GEMINI_STATE.get('available') or [])[:120] or 'not resolved yet'}\n"
+            if GEMINI_API_KEY else ""
+        )
+        + "\n"
         "• It runs automatically the moment a claim hits a security question: "
         "the likely answers arrive with tap-to-submit buttons.\n"
         "• `/ai <question>` — look one up right now.\n\n"
@@ -4090,6 +4274,11 @@ async def main():
         print("[boot] WARNING: TELEGRAM_BOT_TOKEN is not set.", flush=True)
     if not ADMIN_CHAT_ID:
         print("[boot] WARNING: ADMIN_CHAT_ID is not set - no user will have admin rights.", flush=True)
+
+    # Resolve the Gemini model list now, in the background, so the first live
+    # security question is not delayed by model discovery.
+    if _ai_enabled():
+        spawn_bg(_ai_warm_models())
 
     workers = [asyncio.create_task(worker()) for _ in range(WORKER_COUNT)]
     try:
