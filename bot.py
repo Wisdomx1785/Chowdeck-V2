@@ -104,6 +104,67 @@ LOGIN_FLOW_FILE = _data_file("login_flows.json")
 CHOW_API_BASE = os.getenv("CHOW_API_BASE", "https://api.chowdeck.com").strip().rstrip("/")
 CHOW_AUTH_ROLE = os.getenv("CHOW_AUTH_ROLE", "customer").strip() or "customer"
 CHOW_COUNTRY_CODE = os.getenv("CHOW_COUNTRY_CODE", "NG").strip().upper() or "NG"
+
+# --- international phone numbers -------------------------------------------
+# The API wants an ISO-3166 alpha-2 `country_code`, not a dial code. Verified
+# live against POST /auth/phone/validate:
+# {"phone":"9138972820","country_code":"NG"} -> is_valid true
+# {"phone":"2125551234","country_code":"US"} -> is_valid true
+# {"phone":"2125551234","country_code":"1"} -> is_valid false (dial code rejected)
+# {"phone":"4387985720","country_code":"US"} -> is_valid true (NANP, 10-digit national)
+# {"phone":"14387985720","country_code":"US"} -> is_valid true (11-digit with trunk 1)
+# So a "+"/"00" prefix (or an explicit US/CA/NG hint) is resolved to its ISO
+# code here, which is what makes US/CA accounts linkable like Nigerian ones.
+_DIAL_TO_ISO = {
+    "1": "US", "7": "RU", "20": "EG", "27": "ZA", "30": "GR", "31": "NL",
+    "32": "BE", "33": "FR", "34": "ES", "39": "IT", "40": "RO", "41": "CH",
+    "43": "AT", "44": "GB", "45": "DK", "46": "SE", "47": "NO", "48": "PL",
+    "49": "DE", "51": "PE", "52": "MX", "54": "AR", "55": "BR", "56": "CL",
+    "57": "CO", "60": "MY", "61": "AU", "62": "ID", "63": "PH", "64": "NZ",
+    "65": "SG", "66": "TH", "81": "JP", "82": "KR", "84": "VN", "86": "CN",
+    "90": "TR", "91": "IN", "92": "PK", "94": "LK", "98": "IR",
+    "212": "MA", "213": "DZ", "216": "TN", "218": "LY", "220": "GM",
+    "221": "SN", "225": "CI", "226": "BF", "227": "NE", "228": "TG",
+    "229": "BJ", "230": "MU", "233": "GH", "234": "NG", "235": "TD",
+    "237": "CM", "240": "GQ", "241": "GA", "242": "CG", "243": "CD",
+    "244": "AO", "249": "SD", "250": "RW", "251": "ET", "254": "KE",
+    "255": "TZ", "256": "UG", "257": "BI", "258": "MZ", "260": "ZM",
+    "263": "ZW", "264": "NA", "265": "MW", "266": "LS", "267": "BW",
+    "268": "SZ", "351": "PT", "353": "IE", "358": "FI", "359": "BG",
+    "370": "LT", "371": "LV", "372": "EE", "380": "UA", "381": "RS",
+    "385": "HR", "420": "CZ", "421": "SK", "880": "BD", "961": "LB",
+    "962": "JO", "964": "IQ", "965": "KW", "966": "SA", "971": "AE",
+    "972": "IL", "973": "BH", "974": "QA", "977": "NP",
+}
+# Dial code -> ISO, longest prefix first ("1" vs "12", "234" vs "23").
+_DIAL_PREFIXES = sorted(_DIAL_TO_ISO, key=len, reverse=True)
+# Countries whose national format drops a single leading trunk "0".
+_TRUNK_ZERO_CC = {
+    "NG", "GH", "KE", "GB", "IE", "ZA", "AU", "IN", "DE", "NL", "BE",
+    "IT", "ES", "FR", "ID", "MY", "PK", "BD", "EG", "MA", "TR", "RU",
+    "UA", "RO", "CH", "AT", "DK", "SE", "NO", "PL", "PT", "FI", "CZ",
+    "SK", "HR", "RS", "BG", "LT", "LV", "EE", "VN", "TH", "GR", "IL",
+}
+# NANP: the same +1 country code is shared by the US and Canada, and the API
+# validator accepts either (verified: 4387985720 is valid as both US and CA),
+# so the alternate is tried when the first verdict is invalid.
+_NANP_CC = ("US", "CA")
+# ISO -> dial code, for stripping a redundant dial prefix off a national number.
+_DIAL_BY_ISO = {}
+for _dial, _iso in _DIAL_TO_ISO.items():
+    _DIAL_BY_ISO.setdefault(_iso, _dial)
+_DIAL_BY_ISO["CA"] = "1"
+
+# Health probe: paths tried in order until one answers definitively. The first
+# is the storefront's own endpoint; the rest are harmless fallbacks so a
+# rename on Chowdeck's side degrades to a clear message instead of a mystery.
+HEALTH_PROBE_PATHS = [
+    p.strip() for p in os.getenv(
+        "HEALTH_PROBE_PATH", "/customer/profile,/customer,/customer/me,/profile"
+    ).split(",") if p.strip()
+]
+HEALTH_PROBE_CONCURRENCY = max(1, min(8, int(os.getenv("HEALTH_PROBE_CONCURRENCY", "3"))))
+HEALTH_PROBE_STAGGER = max(0.0, float(os.getenv("HEALTH_PROBE_STAGGER", "0.2")))
 LOGIN_ENABLED = os.getenv("LOGIN_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -125,8 +186,19 @@ LOG_RAW_AUTH = os.getenv("LOG_RAW_AUTH", "").strip().lower() in (
 AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "auto").strip().lower()
 AI_PROVIDER = os.getenv("AI_PROVIDER", "").strip().lower()
 AI_MODEL = os.getenv("AI_MODEL", "").strip()
-AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "25.0"))
+AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "8.0"))
 AI_MAX_ANSWERS = max(1, min(8, int(os.getenv("AI_MAX_ANSWERS", "4"))))
+# Race every configured provider at once and post the first usable answer set:
+# this is what keeps the suggestion inside the 2-3s window instead of waiting
+# for one slow provider to time out before trying the next.
+AI_RACE = os.getenv("AI_RACE", "true").strip().lower() not in ("0", "false", "no", "off")
+# Hard ceiling on the whole lookup, independent of AI_TIMEOUT. Kept tight so
+# the suggestion lands inside the 2-3s window: with AI_RACE the first provider
+# to answer wins, so this only ever cuts off a straggler.
+AI_DEADLINE = float(os.getenv("AI_DEADLINE", "3.0"))
+AI_SHOW_LATENCY = os.getenv("AI_SHOW_LATENCY", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -771,16 +843,101 @@ def _failure_reason(body):
     return ""
 
 
+def _iso_from_dial(digits):
+    """Split a dial code off `digits`. Returns (iso|None, national digits)."""
+    for pref in _DIAL_PREFIXES:
+        if digits.startswith(pref):
+            rest = digits[len(pref):]
+            # A dial code only counts when a plausible national part remains.
+            if 6 <= len(rest) <= 12:
+                return _DIAL_TO_ISO[pref], rest
+    return None, digits
+
+
 def _normalise_phone(raw, country_code=None):
-    """Return (ISO country_code, national digits) for a user-typed phone number."""
-    digits = re.sub(r"\D", "", str(raw or ""))
-    cc = (country_code or CHOW_COUNTRY_CODE).upper()
-    if cc == "NG":
-        if len(digits) == 11 and digits.startswith("0"):
+    """Return (ISO country_code, national digits) for a user-typed phone number. Every shape a user may paste is accepted, so US/Canadian accounts link exactly like Nigerian ones: ``+12125551234`` / ``0012125551234`` / ``1 212 555 1234`` -> ("US", "2125551234") ``2125551234 US`` / ``US 2125551234`` -> ("US", "2125551234") ``12125551234`` (11-digit NANP, unambiguous) -> ("US", "2125551234") ``08031234567`` / ``2348031234567`` -> ("NG", "8031234567") The API wants an ISO alpha-2 code plus the *national* number, which is exactly what this returns. """
+    text = str(raw or "").strip()
+    digits = re.sub(r"\D", "", text)
+
+    cc = (country_code or "").strip().upper() or None
+    if cc and not re.fullmatch(r"[A-Z]{2}", cc):
+        cc = None
+
+    # An explicit "+" or "00" prefix always wins: it is the least ambiguous
+    # thing the user can type.
+    if text.startswith("+") or digits.startswith("00"):
+        probe = digits[2:] if digits.startswith("00") else digits
+        iso, rest = _iso_from_dial(probe)
+        if iso:
+            cc, digits = iso, rest
+        elif digits.startswith("00"):
+            digits = digits[2:]
+    if cc is None:
+        cc = CHOW_COUNTRY_CODE
+
+    # A leading "1" on an 11-digit number can only be NANP: no national number
+    # of a non-NANP country looks like that, so this guess is safe.
+    if country_code is None and len(digits) == 11 and digits.startswith("1"):
+        cc, digits = "US", digits[1:]
+
+    if cc in _NANP_CC:
+        if len(digits) == 11 and digits.startswith("1"):
             digits = digits[1:]
-        elif len(digits) == 13 and digits.startswith("234"):
-            digits = digits[3:]
+    else:
+        dial = _DIAL_BY_ISO.get(cc)
+        if len(digits) > 11 and dial and digits.startswith(dial):
+            digits = digits[len(dial):]
+        if cc in _TRUNK_ZERO_CC and len(digits) >= 8 and digits.startswith("0"):
+            digits = digits[1:]
     return cc, digits
+
+
+def _alt_national_form(cc, digits):
+    """The dial-prefixed form (``1`` + national) used as a login fallback."""
+    dial = _DIAL_BY_ISO.get(str(cc or "").upper())
+    if not dial or str(digits).startswith(dial):
+        return None
+    return f"{dial}{digits}"
+
+
+def _parse_login_arg(arg):
+    """Parse `/login` arguments into (ISO cc, national digits, error). Accepts the country code before or after the number, with or without a "+", e.g. ``/login us 2125551234``, ``/login 2125551234 us``. """
+    parts = [p for p in re.split(r"[\s,]+", str(arg or "").strip()) if p]
+    cc_hint, nums = None, []
+    for token in parts:
+        if re.fullmatch(r"[A-Za-z]{2}", token):
+            cc_hint = token.upper()
+        elif re.fullmatch(r"\+?[\d()\- .]+", token) and re.search(r"\d", token):
+            nums.append(token)
+    if not nums:
+        return cc_hint or CHOW_COUNTRY_CODE, "", "no number"
+    cc, national = _normalise_phone(" ".join(nums), cc_hint)
+    return cc, national, ""
+
+
+_COUNTRY_LABELS = {
+    "NG": "Nigeria", "US": "United States", "CA": "Canada", "GB": "United Kingdom",
+    "GH": "Ghana", "KE": "Kenya", "ZA": "South Africa", "IN": "India",
+}
+
+
+def country_label(cc):
+    """Human label for an ISO alpha-2 code (falls back to the code itself)."""
+    cc = str(cc or "").upper()
+    return _COUNTRY_LABELS.get(cc, cc or "?")
+
+
+def phone_label(cc, digits):
+    """`+1 212****234`-style label: shows the country, never the whole number."""
+    dial = _DIAL_BY_ISO.get(str(cc or "").upper(), "")
+    return f"+{dial} {mask_phone_mid(digits)}" if dial else mask_phone_mid(digits)
+
+
+def mask_phone_mid(digits):
+    d = re.sub(r"\D", "", str(digits or ""))
+    if len(d) <= 4:
+        return d
+    return f"{d[:3]}****{d[-3:]}"
 
 
 def mask_phone(digits):
@@ -856,15 +1013,17 @@ def set_slot_active_state(chat_str, slot_id, value):
     return bool(value)
 
 
-def set_slot_phone(chat_str, slot_id, phone):
+def set_slot_phone(chat_str, slot_id, phone, country_code=None):
     tokens_db = load_json(TOKENS_FILE)
     entry = (tokens_db.get(str(chat_str)) or {}).get(str(slot_id))
     if isinstance(entry, dict) and phone:
         entry["phone"] = str(phone)[:15]
+        if country_code:
+            entry["country_code"] = str(country_code).upper()[:2]
         save_json(TOKENS_FILE, tokens_db)
 
 
-def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin="login"):
+def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin="login", country_code=None):
     """Write a slot's session token (+ metadata) without touching other slots. `origin` records where the token came from: "login" for a token this bot minted with its own OTP sign-in, "paste" for a token the user copied out of their browser. `CHOW_AUTO_REFRESH=safe` (the default) only ever refreshes bot-owned tokens, so a live browser session can never be rotated away. """
     tokens_db = load_json(TOKENS_FILE)
     user_slots = tokens_db.setdefault(str(chat_str), {})
@@ -876,6 +1035,8 @@ def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin=
         entry["cookies"] = cookies
     if phone:
         entry["phone"] = str(phone)[:15]
+    if country_code:
+        entry["country_code"] = str(country_code).upper()[:2]
     entry["origin"] = origin
     entry["token_exp"] = token_exp_ts(token)
     entry["linked_at"] = time.time()
@@ -914,12 +1075,12 @@ async def chow_request_otp(phone, country_code):
     return False, msg or f"Request rejected (HTTP {res.status_code}).", reason
 
 
-async def chow_validate_otp(phone, otp):
-    """Submit the OTP. Returns (ok, message, data)."""
-    res, body = await _auth_post(
-        "/auth/login/validate-otp",
-        {"otp": str(otp).strip(), "phone": phone, "role": CHOW_AUTH_ROLE},
-    )
+async def chow_validate_otp(phone, otp, country_code=None):
+    """Submit the OTP. Returns (ok, message, data). `country_code` is optional and only sent when known: the endpoint is keyed on the phone, but passing the ISO-2 code keeps US/Canada +1 numbers unambiguous, exactly like the request that produced the OTP. """
+    payload = {"otp": str(otp).strip(), "phone": phone, "role": CHOW_AUTH_ROLE}
+    if country_code:
+        payload["country_code"] = str(country_code).upper()
+    res, body = await _auth_post("/auth/login/validate-otp", payload)
     if res is None:
         return False, "Could not reach Chowdeck. Please try again.", {}
     data = body.get("data") if isinstance(body.get("data"), dict) else {}
@@ -1036,25 +1197,87 @@ def start_token_refresh(chat_str, slot, entry):
 
 
 # --- health check ----------------------------------------------------------
-async def chow_profile(token, cookies=None):
-    """GET /customer/profile. Returns (status|None, phone, data)."""
-    if not token:
-        return None, None, {}
+def _probe_definitive(status):
+    """A status that settles the auth question, so no other path need be tried."""
+    return status is not None and (200 <= status < 300 or status in (401, 403))
+
+
+def _probe_note(status, body, path, err=""):
+    """Short human diagnosis of a probe result — always shows the real status."""
+    msg = ""
+    if isinstance(body, dict):
+        for key in ("message", "error", "detail"):
+            if body.get(key):
+                msg = str(body[key]).strip()
+                break
+        if not msg:
+            msg = _failure_reason(body)
+    if status is None:
+        return f"`{path}` → no response ({err or 'timeout'})"
+    tail = f" — {msg}" if msg else ""
+    return f"`{path}` → HTTP {status}{tail}"
+
+
+async def _probe_path(path, token, cookies=None):
+    """GET one candidate profile path. Never raises."""
     try:
         res = await _CD_CLIENT.get(
-            f"{CHOW_API_BASE}/customer/profile",
+            f"{CHOW_API_BASE}{path}",
             headers=chow_headers(token),
             cookies=cookies or None,
             timeout=AUTH_TIMEOUT,
         )
-    except Exception:  # noqa: BLE001
-        return None, None, {}
-    body = _safe_json(res)
+    except Exception as e:  # noqa: BLE001
+        return {"path": path, "status": None, "body": {}, "err": str(e)}
+    return {"path": path, "status": res.status_code, "body": _safe_json(res), "err": ""}
+
+
+async def chow_profile(token, cookies=None):
+    """Probe the account profile, trying ``HEALTH_PROBE_PATHS`` in order. Returns ``(status|None, phone, data, note)``. Requests are staggered and the first *decisive* answer (2xx / 401 / 403) wins, so a renamed or missing first path falls through quickly instead of yielding a mystery result. The returned ``note`` carries the path, the HTTP status and the API message, so the health view never reduces a failure to "unexpected response". """
+    if not token:
+        return None, None, {}, "no token stored"
+    paths = list(HEALTH_PROBE_PATHS) or ["/customer/profile"]
+    sem = asyncio.Semaphore(HEALTH_PROBE_CONCURRENCY)
+    tasks, winner = [], None
+
+    async def run(path):
+        async with sem:
+            return await _probe_path(path, token, cookies)
+
+    for idx, path in enumerate(paths):
+        tasks.append(asyncio.create_task(run(path)))
+        if idx < len(paths) - 1 and HEALTH_PROBE_STAGGER:
+            await asyncio.sleep(HEALTH_PROBE_STAGGER)
+        for task in tasks:
+            if task.done() and _probe_definitive(task.result()["status"]):
+                winner = task.result()
+                break
+        if winner:
+            break
+    if winner is None:
+        settled = await asyncio.gather(*tasks)
+        for result in settled:
+            if _probe_definitive(result["status"]):
+                winner = result
+                break
+        if winner is None:
+            winner = settled[-1] if settled else {
+                "path": paths[0], "status": None, "body": {}, "err": ""
+            }
+    pending = [t for t in tasks if not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    body = winner["body"] if isinstance(winner.get("body"), dict) else {}
     data = body.get("data") if isinstance(body.get("data"), dict) else body
     if not isinstance(data, dict):
         data = {}
     phone = extract_phone_from_data(data) or extract_phone_from_data(body)
-    return res.status_code, phone, data
+    note = _probe_note(winner.get("status"), body, winner.get("path") or paths[0],
+                       winner.get("err") or "")
+    return winner.get("status"), phone, data, note
 
 
 async def probe_slot_token(chat_str, slot, allow_refresh=True):
@@ -1063,19 +1286,20 @@ async def probe_slot_token(chat_str, slot, allow_refresh=True):
     entry = ((load_json(TOKENS_FILE).get(chat_str) or {}).get(slot)) or {}
     token = (entry or {}).get("token")
     if not token:
-        return {"slot": slot, "state": "empty", "status": None, "entry": entry}
+        return {"slot": slot, "state": "empty", "status": None, "note": "not linked",
+                "entry": entry}
     if allow_refresh and _token_needs_refresh(entry):
         new_token = await refresh_slot_token(chat_str, slot, entry, force=True)
         if new_token:
             entry = {**entry, "token": new_token}
             token = new_token
-    status, phone, _data = await chow_profile(token, (entry or {}).get("cookies"))
+    status, phone, _data, note = await chow_profile(token, (entry or {}).get("cookies"))
     if status in (401, 403) and allow_refresh and _refresh_allowed(entry):
         new_token = await refresh_slot_token(chat_str, slot, entry, force=True)
         if new_token:
             entry = {**entry, "token": new_token}
             token = new_token
-            status, phone, _data = await chow_profile(token, (entry or {}).get("cookies"))
+            status, phone, _data, note = await chow_profile(token, (entry or {}).get("cookies"))
     if phone and str(phone) != str((entry or {}).get("phone") or ""):
         set_slot_phone(chat_str, slot, phone)
         entry = {**entry, "phone": str(phone)[:15]}
@@ -1088,7 +1312,7 @@ async def probe_slot_token(chat_str, slot, allow_refresh=True):
     else:
         state = "error"
     return {
-        "slot": slot, "state": state, "status": status,
+        "slot": slot, "state": state, "status": status, "note": note,
         "phone": phone or (entry or {}).get("phone"), "entry": entry,
     }
 
@@ -1141,10 +1365,15 @@ def format_accounts_health(results, chat_str=None):
             "unreachable": "no response",
             "error": "unexpected response",
         }.get(state, state or "unknown")
+        note = r.get("note")
         if state == "active":
             left = token_seconds_left((r.get("entry") or {}).get("token"))
             if left is not None:
                 detail += f" · {human_seconds(left)} left"
+        elif note and state != "empty":
+            # Show the path, HTTP status and API message: a failure must be
+            # diagnosable from the health view alone.
+            detail += f" · {note}"
         if chat_str is not None and state != "empty" and not is_slot_active_state(chat_str, r.get("slot")):
             detail += " · ⏸️ disabled"
         lines.append(f"{label} — {detail}")
@@ -1154,16 +1383,22 @@ def format_accounts_health(results, chat_str=None):
 
 
 # --- phone -> OTP login flow ----------------------------------------------
-def _phone_taken_by_other_slot(chat_str, phone, slot):
-    """Return the other slot id already linked to `phone`, else None. One account can only claim a code once, so the same phone must not be linked to two slots of the same user. """
+def _phone_taken_by_other_slot(chat_str, phone, slot, country_code=None):
+    """Return the other slot id already linked to `phone`, else None. One account can only claim a code once, so the same phone must not be linked to two slots of the same user. The match is country-aware: identical national digits in two different countries are two different accounts, so a US number never blocks an identical-looking number elsewhere. """
     tokens_db = load_json(TOKENS_FILE).get(str(chat_str), {}) or {}
     target = re.sub(r"\D", "", str(phone or ""))
+    target_cc = str(country_code or "").upper() or None
     for sid, td in tokens_db.items():
         if str(sid) == str(slot):
             continue
         other = re.sub(r"\D", "", str((td or {}).get("phone") or ""))
-        if target and other == target:
-            return str(sid)
+        if not target or other != target:
+            continue
+        other_cc = str((td or {}).get("country_code") or "").upper() or None
+        # Only a known, different country clears the duplicate.
+        if target_cc and other_cc and other_cc != target_cc:
+            continue
+        return str(sid)
     return None
 
 
@@ -1184,12 +1419,19 @@ async def start_otp_login(chat_id, chat_str, arg):
             "the active slot.",
         )
         return
-    country_code, phone = _normalise_phone(arg)
-    if len(phone) < 7:
-        await send_telegram(chat_id, "⚠️ That phone number does not look valid. Usage: `/login <phone>`")
+    country_code, phone, parse_err = _parse_login_arg(arg)
+    if parse_err or len(phone) < 7:
+        await send_telegram(
+            chat_id,
+            "⚠️ That does not look like a phone number.\n\n"
+            "Usage: `/login <phone>` — e.g. `/login 08031234567` (NG), "
+            "`/login 2125551234 US` or `/login +12125551234`.\n"
+            "A country code (ISO-2 like `US`, or `+1`) is optional; without one "
+            f"the default is `{CHOW_COUNTRY_CODE}`.",
+        )
         return
     slot = get_active_slot(chat_str)
-    dup = _phone_taken_by_other_slot(chat_str, phone, slot)
+    dup = _phone_taken_by_other_slot(chat_str, phone, slot, country_code)
     if dup:
         await send_telegram(
             chat_id,
@@ -1198,17 +1440,37 @@ async def start_otp_login(chat_id, chat_str, arg):
             f"re-linking it here.",
         )
         return
-    # A pre-check is only a courtesy: a false answer must never block a login.
-    plausible = await chow_validate_phone(phone, country_code)
+    # The pre-check is only a courtesy: a false verdict must never block a
+    # login. The US and Canada share +1, so the sibling code is tried before a
+    # number is declared unknown.
+    cc_try = [country_code]
+    if country_code in _NANP_CC:
+        cc_try += [c for c in _NANP_CC if c != country_code]
+    plausible = await chow_validate_phone(phone, cc_try[0])
+    if plausible is False and len(cc_try) > 1:
+        if await chow_validate_phone(phone, cc_try[1]):
+            plausible, cc_try = True, [cc_try[1]]
     if plausible is False:
         await send_telegram(
             chat_id,
-            f"⚠️ Chowdeck does not recognise `{mask_phone(phone)}`. Check the "
-            f"number and try `/login <phone>` again.",
+            f"⚠️ Chowdeck does not recognise `{phone_label(country_code, phone)}` "
+            f"({country_label(country_code)}).\n\n"
+            "Check the number, or state the country explicitly — e.g. "
+            "`/login 2125551234 US`, `/login +442079460000`.",
         )
         return
-    await send_telegram(chat_id, f"📲 Requesting a Chowdeck verification code for `{mask_phone(phone)}`…")
-    ok, message, reason = await chow_request_otp(phone, country_code)
+    await send_telegram(
+        chat_id,
+        f"📲 Requesting a Chowdeck verification code for "
+        f"`{phone_label(cc_try[0], phone)}` ({country_label(cc_try[0])})…",
+    )
+    ok, message, reason = await chow_request_otp(phone, cc_try[0])
+    if not ok and len(cc_try) > 1:
+        low = f"{message} {reason}".lower()
+        if any(w in low for w in ("invalid", "exist", "not found", "recognis", "recogniz")):
+            ok, message, reason = await chow_request_otp(phone, cc_try[1])
+            if ok:
+                cc_try = [cc_try[1]]
     if not ok:
         hint = ""
         low = f"{message} {reason}".lower()
@@ -1216,6 +1478,7 @@ async def start_otp_login(chat_id, chat_str, arg):
             hint = "\n\nCheck the number and try again with `/login <phone>`."
         await send_telegram(chat_id, f"❌ {message}{hint}")
         return
+    country_code = cc_try[0]
     set_login_flow(chat_str, {
         "phone": phone,
         "country_code": country_code,
@@ -1243,7 +1506,9 @@ async def complete_otp_login(chat_id, chat_str, code, flow):
     flow = dict(flow or {})
     phone = flow.get("phone")
     slot = str(flow.get("slot") or get_active_slot(chat_str))
-    ok, message, data = await chow_validate_otp(phone, code)
+    ok, message, data = await chow_validate_otp(
+        phone, code, flow.get("country_code")
+    )
     if not ok:
         flow["attempts"] = int(flow.get("attempts") or 0) + 1
         if flow["attempts"] >= 5:
@@ -1264,7 +1529,10 @@ async def complete_otp_login(chat_id, chat_str, code, flow):
         return False
     token = str(data.get("token"))
     linked_phone = data.get("phone") or phone
-    store_slot_token(chat_str, slot, token, phone=linked_phone, origin="login")
+    store_slot_token(
+        chat_str, slot, token, phone=linked_phone, origin="login",
+        country_code=flow.get("country_code"),
+    )
     set_slot_active_state(chat_str, slot, True)
     set_active_slot(chat_str, slot)
     clear_login_flow(chat_str)
@@ -1272,7 +1540,8 @@ async def complete_otp_login(chat_id, chat_str, code, flow):
     left = token_seconds_left(token)
     name_bits = [str(data.get(k) or "").strip() for k in ("first_name", "last_name")]
     name = " ".join(b for b in name_bits if b)
-    masked = mask_phone(re.sub(r"\D", "", str(linked_phone or "")))
+    linked_cc = flow.get("country_code") or CHOW_COUNTRY_CODE
+    masked = phone_label(linked_cc, re.sub(r"\D", "", str(linked_phone or "")))
     expiry_txt = f"\n• Token valid for: `{human_seconds(left)}`" if left is not None else ""
     refresh_txt = (
         "\n• Auto-refresh: `ON` (bot-owned session)"
@@ -1356,7 +1625,7 @@ _AI_MODELS = {
 }
 
 _AI_CLIENT = httpx.AsyncClient(
-    timeout=httpx.Timeout(AI_TIMEOUT, connect=8.0),
+    timeout=httpx.Timeout(AI_TIMEOUT, connect=4.0),
     proxy=PROXY_URL,
     limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
 )
@@ -1570,22 +1839,78 @@ _AI_PROVIDER_LABELS = {
 
 
 async def ai_answer_candidates(question):
-    """Return (provider, [candidate answers]) from the first working provider."""
+    """Return (provider, [candidate answers], elapsed_seconds). Providers are raced in parallel (``AI_RACE``, the default) and the first usable answer set wins, so one slow provider can no longer hold the whole lookup for its full timeout while the next one waits its turn. The whole lookup is bounded by ``AI_DEADLINE``, which is what keeps a suggestion inside the 2-3s window. """
     question = str(question or "").strip()
     if not question or not _ai_enabled():
-        return None, []
-    for name in _ai_provider_order():
-        func = _AI_PROVIDER_FUNCS.get(name)
-        if func is None:
-            continue
+        return None, [], 0.0
+    funcs = [(n, _AI_PROVIDER_FUNCS[n]) for n in _ai_provider_order()
+             if _AI_PROVIDER_FUNCS.get(n)]
+    if not funcs:
+        return None, [], 0.0
+    started = time.monotonic()
+
+    async def call(name, func):
         try:
-            answers = await func(question)
+            return name, await asyncio.wait_for(func(question), timeout=AI_DEADLINE)
         except Exception as e:  # noqa: BLE001
             print(f"[ai] {name} failed: {e}", flush=True)
-            answers = []
-        if answers:
-            return name, answers
-    return None, []
+            return name, []
+
+    if not AI_RACE or len(funcs) == 1:
+        for name, func in funcs:
+            got_name, answers = await call(name, func)
+            if answers:
+                return got_name, answers, time.monotonic() - started
+        return None, [], time.monotonic() - started
+
+    tasks = {asyncio.create_task(call(name, func)): name for name, func in funcs}
+    deadline = started + AI_DEADLINE
+    winner = (None, [])
+    try:
+        while tasks:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                break
+            done, _ = await asyncio.wait(
+                set(tasks), timeout=budget, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for task in done:
+                tasks.pop(task, None)
+                if winner[0] is None:
+                    name, answers = task.result()
+                    if answers:
+                        winner = (name, answers)
+            if winner[0] is not None:
+                break
+    finally:
+        pending = [t for t in tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return winner[0], winner[1], time.monotonic() - started
+
+
+def ai_status_text():
+    """Read-only summary of the AI assist setup (for `/ai` with no argument)."""
+    order = [n for n in _ai_provider_order() if _AI_PROVIDER_FUNCS.get(n)]
+    labels = ", ".join(_AI_PROVIDER_LABELS.get(n, n) for n in order) or "*(none configured)*"
+    return (
+        "🤖 *AI answer assist*\n\n"
+        f"• Status: `{'ON' if _ai_enabled() else 'OFF'}`\n"
+        f"• Providers: {labels}\n"
+        f"• Lookup: `{'parallel race' if AI_RACE else 'sequential'}` · "
+        f"deadline `{AI_DEADLINE:g}s` · per-call timeout `{AI_TIMEOUT:g}s`\n"
+        f"• Model override: `{AI_MODEL or 'provider default'}`\n\n"
+        "• It runs automatically the moment a claim hits a security question: "
+        "the likely answers arrive with tap-to-submit buttons.\n"
+        "• `/ai <question>` — look one up right now.\n\n"
+        "_A provider key is required (`PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
+        "`GEMINI_API_KEY` or `TAVILY_API_KEY`). With none set the assist stays "
+        "off and the bot behaves exactly as before._"
+    )
 
 
 def set_pending_ai(chat_str, code, provider, answers):
@@ -1623,8 +1948,8 @@ async def assist_security_question(chat_id, chat_str, code, question):
     if not _ai_enabled():
         return
     try:
-        provider, answers = await asyncio.wait_for(
-            ai_answer_candidates(question), timeout=AI_TIMEOUT + 5.0
+        provider, answers, elapsed = await asyncio.wait_for(
+            ai_answer_candidates(question), timeout=AI_DEADLINE + 2.0
         )
     except Exception as e:  # noqa: BLE001
         print(f"[ai] assist failed: {e}", flush=True)
@@ -1633,7 +1958,8 @@ async def assist_security_question(chat_id, chat_str, code, question):
         return
     set_pending_ai(chat_str, code, provider, answers)
     label = _AI_PROVIDER_LABELS.get(provider, provider)
-    lines = [f"🤖 *AI answer assist* (via {label})", ""]
+    tail = f" · {elapsed:.1f}s" if AI_SHOW_LATENCY else ""
+    lines = [f"🤖 *AI answer assist* (via {label}{tail})", ""]
     lines.append(f"Question: \"{question}\"")
     lines.append("")
     lines.append("Likely answers — *tap one* to submit it instantly:")
@@ -2786,9 +3112,12 @@ GUIDE_TEXT = (
     "• The session is the bot's own, so it never disturbs a login on your "
     "browser, and it is refreshed automatically in the background.\n\n"
     "*🤖 AI answer assist (real-time web search)*\n"
-    "• When a claim hits a security question, likely answers arrive in seconds "
-    "with *tap-to-submit* buttons (Perplexity / OpenAI / Gemini / Tavily).\n"
+    "• When a claim hits a security question, likely answers arrive within "
+    "seconds with *tap-to-submit* buttons (Perplexity / OpenAI / Gemini / Tavily).\n"
+    "• `/ai` — show the AI status (on/off, providers, latency setting)\n"
     "• `/ai <question>` — look one up on demand\n"
+    "• It needs one provider key (`PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
+    "`GEMINI_API_KEY` or `TAVILY_API_KEY`); with no key it simply stays off.\n"
     "• It is only a suggestion: type your own answer any time and that is what "
     "gets submitted."
 )
@@ -2979,26 +3308,29 @@ async def handle_command(chat_id, chat_str, text, is_admin):
         if not _ai_enabled():
             await send_telegram(
                 chat_id,
-                "🤖 AI assist is off. Add a `PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
-                "`GEMINI_API_KEY` or `TAVILY_API_KEY` to enable it.",
+                "🤖 *AI assist is OFF* — no provider key is configured.\n\n"
+                "Set one of `PERPLEXITY_API_KEY`, `OPENAI_API_KEY`, "
+                "`GEMINI_API_KEY` or `TAVILY_API_KEY` on the deployment and it "
+                "turns on by itself (`AI_ASSIST_ENABLED=auto`).\n\n"
+                "Without a key the bot is otherwise unaffected: you still get the "
+                "security question and answer it yourself.",
             )
             return
         if not arg:
-            await send_telegram(
-                chat_id,
-                "🤖 *AI answer assist is ON*\n\n"
-                "• `/ai <question>` — look up a security question right now\n"
-                "• It also runs automatically the moment a claim hits a security "
-                "question: the likely answers arrive with tap-to-submit buttons.",
-            )
+            await send_telegram(chat_id, ai_status_text())
             return
         await send_telegram(chat_id, "🔎 Searching the web…")
-        provider, answers = await ai_answer_candidates(arg)
+        provider, answers, elapsed = await ai_answer_candidates(arg)
         if not answers:
-            await send_telegram(chat_id, "🤖 No suggestion came back. Answer manually as usual.")
+            await send_telegram(
+                chat_id,
+                f"🤖 No suggestion came back within `{AI_DEADLINE:g}s`. "
+                "Answer manually as usual.",
+            )
             return
         label = _AI_PROVIDER_LABELS.get(provider, provider)
-        lines = [f"🤖 *AI suggestions* (via {label})", ""]
+        tail = f" · {elapsed:.1f}s" if AI_SHOW_LATENCY else ""
+        lines = [f"🤖 *AI suggestions* (via {label}{tail})", ""]
         lines += [f"{i}. `{a}`" for i, a in enumerate(answers, 1)]
         await send_telegram(chat_id, "\n".join(lines))
     elif cmd == "/setcart":
